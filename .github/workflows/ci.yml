@@ -80,9 +80,9 @@ jobs:
     
     - name: Publish to crates.io
       if: steps.version-check.outputs.version_exists == 'false'
-      run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+      run: cargo publish
       env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     
     - name: Create GitHub release
       if: steps.version-check.outputs.version_exists == 'false'
