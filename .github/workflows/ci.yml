@@ -100,7 +100,7 @@ jobs:
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add Cargo.toml
+        git add Cargo.toml Cargo.lock
         git commit -m "Bump version to ${{ steps.version-check.outputs.current_version }} [skip ci]"
         git push
     
