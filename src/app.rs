@@ -1,6 +1,6 @@
+use ratatui::widgets::TableState;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
-use ratatui::widgets::TableState;
 
 #[derive(Debug, Clone)]
 pub struct JsonRpcMessage {
@@ -45,18 +45,19 @@ pub enum InputMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
-    Normal,           // Regular proxy mode
-    Paused,          // All requests paused
-    Intercepting,    // Inspecting a specific request
+    Normal,       // Regular proxy mode
+    Paused,       // All requests paused
+    Intercepting, // Inspecting a specific request
 }
 
 #[derive(Debug)]
 pub enum ProxyDecision {
     Allow(Option<serde_json::Value>, Option<HashMap<String, String>>), // Allow with optional modified JSON and headers
-    Block,                            // Block the request
-    Complete(serde_json::Value),      // Complete with custom response
+    Block,                                                             // Block the request
+    Complete(serde_json::Value), // Complete with custom response
 }
 
+#[allow(dead_code)]
 pub struct PendingRequest {
     pub id: String,
     pub original_request: JsonRpcMessage,
@@ -65,36 +66,43 @@ pub struct PendingRequest {
     pub decision_sender: oneshot::Sender<ProxyDecision>,
 }
 
+#[allow(dead_code)]
 pub struct App {
     pub exchanges: Vec<JsonRpcExchange>,
     pub selected_exchange: usize,
     pub table_state: TableState,
     pub details_scroll: usize,
-    pub intercept_details_scroll: usize,      // New field for intercept details scrolling
+    pub intercept_details_scroll: usize, // New field for intercept details scrolling
     pub proxy_config: ProxyConfig,
     pub is_running: bool,
     pub message_receiver: Option<mpsc::UnboundedReceiver<JsonRpcMessage>>,
     pub input_mode: InputMode,
     pub input_buffer: String,
-    pub app_mode: AppMode,                    // New field
+    pub app_mode: AppMode,                     // New field
     pub pending_requests: Vec<PendingRequest>, // New field
-    pub selected_pending: usize,              // New field
-    pub request_editor_buffer: String,        // New field
-    pub decision_sender: Option<mpsc::UnboundedSender<(String, ProxyDecision)>>, // New field
+    pub selected_pending: usize,               // New field
+    pub request_editor_buffer: String,         // New field
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ProxyConfig {
     pub listen_port: u16,
     pub target_url: String,
     pub transport: TransportType,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
-        
+
         Self {
             exchanges: Vec::new(),
             selected_exchange: 0,
@@ -114,14 +122,13 @@ impl App {
             pending_requests: Vec::new(),
             selected_pending: 0,
             request_editor_buffer: String::new(),
-            decision_sender: None,
         }
     }
 
     pub fn new_with_receiver(receiver: mpsc::UnboundedReceiver<JsonRpcMessage>) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
-        
+
         Self {
             exchanges: Vec::new(),
             selected_exchange: 0,
@@ -141,7 +148,6 @@ impl App {
             pending_requests: Vec::new(),
             selected_pending: 0,
             request_editor_buffer: String::new(),
-            decision_sender: None,
         }
     }
 
@@ -171,7 +177,7 @@ impl App {
                 }
             }
         }
-        
+
         match message.direction {
             MessageDirection::Request => {
                 // Create a new exchange for the request
@@ -187,9 +193,12 @@ impl App {
             }
             MessageDirection::Response => {
                 // Find matching request by ID and add response
-                if let Some(exchange) = self.exchanges.iter_mut().rev().find(|e| {
-                    e.id == message.id && e.response.is_none()
-                }) {
+                if let Some(exchange) = self
+                    .exchanges
+                    .iter_mut()
+                    .rev()
+                    .find(|e| e.id == message.id && e.response.is_none())
+                {
                     exchange.response = Some(message);
                 } else {
                     // No matching request found, create exchange with just response
@@ -292,45 +301,7 @@ impl App {
         }
     }
 
-    // Vim-style navigation methods
-    pub fn page_down_exchanges(&mut self) {
-        if !self.exchanges.is_empty() {
-            let page_size = 10; // Half page jump
-            self.selected_exchange = std::cmp::min(
-                self.selected_exchange + page_size,
-                self.exchanges.len() - 1
-            );
-            self.table_state.select(Some(self.selected_exchange));
-            self.reset_details_scroll();
-        }
-    }
 
-    pub fn page_up_exchanges(&mut self) {
-        let page_size = 10; // Half page jump
-        self.selected_exchange = if self.selected_exchange >= page_size {
-            self.selected_exchange - page_size
-        } else {
-            0
-        };
-        self.table_state.select(Some(self.selected_exchange));
-        self.reset_details_scroll();
-    }
-
-    pub fn goto_first_exchange(&mut self) {
-        if !self.exchanges.is_empty() {
-            self.selected_exchange = 0;
-            self.table_state.select(Some(self.selected_exchange));
-            self.reset_details_scroll();
-        }
-    }
-
-    pub fn goto_last_exchange(&mut self) {
-        if !self.exchanges.is_empty() {
-            self.selected_exchange = self.exchanges.len() - 1;
-            self.table_state.select(Some(self.selected_exchange));
-            self.reset_details_scroll();
-        }
-    }
 
     // Enhanced details scrolling with vim-style page jumps
     pub fn page_down_details(&mut self, visible_lines: usize) {
@@ -392,53 +363,64 @@ impl App {
     pub fn get_details_content_lines(&self) -> usize {
         if let Some(exchange) = self.get_selected_exchange() {
             let mut line_count = 0;
-            
+
             // Basic info lines
             line_count += 3; // Transport, Method, ID
-            
+
             // Request section
             if let Some(request) = &exchange.request {
                 line_count += 2; // Empty line + "REQUEST:" header
-                
+
                 if let Some(headers) = &request.headers {
                     line_count += 2; // Empty line + "HTTP Headers:"
                     line_count += headers.len();
                 }
-                
+
                 line_count += 2; // Empty line + "JSON-RPC Request:"
-                
+
                 // Estimate JSON lines (rough calculation)
                 let mut request_json = serde_json::Map::new();
-                request_json.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
+                request_json.insert(
+                    "jsonrpc".to_string(),
+                    serde_json::Value::String("2.0".to_string()),
+                );
                 if let Some(id) = &request.id {
                     request_json.insert("id".to_string(), id.clone());
                 }
                 if let Some(method) = &request.method {
-                    request_json.insert("method".to_string(), serde_json::Value::String(method.clone()));
+                    request_json.insert(
+                        "method".to_string(),
+                        serde_json::Value::String(method.clone()),
+                    );
                 }
                 if let Some(params) = &request.params {
                     request_json.insert("params".to_string(), params.clone());
                 }
-                
-                if let Ok(json_str) = serde_json::to_string_pretty(&serde_json::Value::Object(request_json)) {
+
+                if let Ok(json_str) =
+                    serde_json::to_string_pretty(&serde_json::Value::Object(request_json))
+                {
                     line_count += json_str.lines().count();
                 }
             }
-            
+
             // Response section
             if let Some(response) = &exchange.response {
                 line_count += 2; // Empty line + "RESPONSE:" header
-                
+
                 if let Some(headers) = &response.headers {
                     line_count += 2; // Empty line + "HTTP Headers:"
                     line_count += headers.len();
                 }
-                
+
                 line_count += 2; // Empty line + "JSON-RPC Response:"
-                
+
                 // Estimate JSON lines
                 let mut response_json = serde_json::Map::new();
-                response_json.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
+                response_json.insert(
+                    "jsonrpc".to_string(),
+                    serde_json::Value::String("2.0".to_string()),
+                );
                 if let Some(id) = &response.id {
                     response_json.insert("id".to_string(), id.clone());
                 }
@@ -448,14 +430,16 @@ impl App {
                 if let Some(error) = &response.error {
                     response_json.insert("error".to_string(), error.clone());
                 }
-                
-                if let Ok(json_str) = serde_json::to_string_pretty(&serde_json::Value::Object(response_json)) {
+
+                if let Ok(json_str) =
+                    serde_json::to_string_pretty(&serde_json::Value::Object(response_json))
+                {
                     line_count += json_str.lines().count();
                 }
             } else {
                 line_count += 2; // Empty line + "RESPONSE: Pending..."
             }
-            
+
             line_count
         } else {
             1 // "No exchange selected"
@@ -471,21 +455,7 @@ impl App {
         };
     }
 
-    pub fn add_pending_request(&mut self, request: JsonRpcMessage) {
-        let id = format!("req_{}", self.pending_requests.len() + 1);
-        let pending = PendingRequest {
-            id,
-            original_request: request,
-            modified_request: None,
-            modified_headers: None,
-            decision_sender: oneshot::channel().0,
-        };
-        self.pending_requests.push(pending);
-        
-        if self.app_mode == AppMode::Paused {
-            self.app_mode = AppMode::Intercepting;
-        }
-    }
+
 
     pub fn select_next_pending(&mut self) {
         if !self.pending_requests.is_empty() {
@@ -515,18 +485,19 @@ impl App {
             if self.selected_pending > 0 && self.selected_pending >= self.pending_requests.len() {
                 self.selected_pending -= 1;
             }
-            
+
             // Send decision to proxy
             let decision = if let Some(ref modified_json) = pending.modified_request {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(modified_json) {
                     ProxyDecision::Allow(Some(parsed), pending.modified_headers.clone())
                 } else {
-                    ProxyDecision::Allow(None, pending.modified_headers.clone()) // Fallback to original if modified JSON is invalid
+                    ProxyDecision::Allow(None, pending.modified_headers.clone())
+                    // Fallback to original if modified JSON is invalid
                 }
             } else {
                 ProxyDecision::Allow(None, pending.modified_headers.clone()) // Use original request
             };
-            
+
             let _ = pending.decision_sender.send(decision);
         }
     }
@@ -537,7 +508,7 @@ impl App {
             if self.selected_pending > 0 && self.selected_pending >= self.pending_requests.len() {
                 self.selected_pending -= 1;
             }
-            
+
             // Send block decision to proxy
             let _ = pending.decision_sender.send(ProxyDecision::Block);
         }
@@ -545,7 +516,9 @@ impl App {
 
     pub fn resume_all_requests(&mut self) {
         for pending in self.pending_requests.drain(..) {
-            let _ = pending.decision_sender.send(ProxyDecision::Allow(None, None));
+            let _ = pending
+                .decision_sender
+                .send(ProxyDecision::Allow(None, None));
         }
         self.selected_pending = 0;
         self.app_mode = AppMode::Normal;
@@ -560,7 +533,7 @@ impl App {
                 "params": pending.original_request.params,
                 "id": pending.original_request.id
             });
-            
+
             // Pretty print the JSON for editing
             serde_json::to_string_pretty(&json_value).ok()
         } else {
@@ -574,8 +547,8 @@ impl App {
         }
 
         // Parse the edited JSON
-        let parsed: serde_json::Value = serde_json::from_str(&edited_json)
-            .map_err(|e| format!("Invalid JSON: {}", e))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&edited_json).map_err(|e| format!("Invalid JSON: {}", e))?;
 
         // Validate it's a proper JSON-RPC request
         if parsed.get("jsonrpc") != Some(&serde_json::Value::String("2.0".to_string())) {
@@ -588,55 +561,20 @@ impl App {
 
         // Store the modified request
         self.pending_requests[self.selected_pending].modified_request = Some(edited_json);
-        
+
         Ok(())
     }
 
-    pub fn get_modified_request(&mut self) -> Option<JsonRpcMessage> {
-        if self.selected_pending >= self.pending_requests.len() {
-            return None;
-        }
 
-        let pending = self.pending_requests.remove(self.selected_pending);
-        if self.selected_pending > 0 && self.selected_pending >= self.pending_requests.len() {
-            self.selected_pending -= 1;
-        }
-
-        // If there's a modified request, use it; otherwise use the original
-        if let Some(modified_json) = pending.modified_request {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&modified_json) {
-                // Create a new JsonRpcMessage from the modified JSON
-                let mut modified_request = pending.original_request.clone();
-                
-                if let Some(id) = parsed.get("id") {
-                    modified_request.id = Some(id.clone());
-                }
-                if let Some(method) = parsed.get("method").and_then(|v| v.as_str()) {
-                    modified_request.method = Some(method.to_string());
-                }
-                if let Some(params) = parsed.get("params") {
-                    modified_request.params = Some(params.clone());
-                }
-                
-                // Apply modified headers if they exist
-                if let Some(modified_headers) = pending.modified_headers {
-                    modified_request.headers = Some(modified_headers);
-                }
-                
-                return Some(modified_request);
-            }
-        }
-        
-        // Fallback to original request
-        Some(pending.original_request)
-    }
 
     pub fn get_pending_request_headers(&self) -> Option<String> {
         if let Some(pending) = self.get_selected_pending() {
             // Get headers (modified if available, otherwise original)
-            let headers = pending.modified_headers.as_ref()
+            let headers = pending
+                .modified_headers
+                .as_ref()
                 .or(pending.original_request.headers.as_ref());
-            
+
             if let Some(headers) = headers {
                 // Format headers as key: value pairs for editing
                 let mut header_lines = Vec::new();
@@ -645,7 +583,10 @@ impl App {
                 }
                 Some(header_lines.join("\n"))
             } else {
-                Some("# No headers\n# Add headers in the format:\n# header-name: header-value".to_string())
+                Some(
+                    "# No headers\n# Add headers in the format:\n# header-name: header-value"
+                        .to_string(),
+                )
             }
         } else {
             None
@@ -658,31 +599,34 @@ impl App {
         }
 
         let mut headers = HashMap::new();
-        
+
         for line in edited_headers.lines() {
             let line = line.trim();
-            
+
             // Skip empty lines and comments
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            
+
             // Parse header line (key: value)
             if let Some(colon_pos) = line.find(':') {
                 let key = line[..colon_pos].trim().to_string();
                 let value = line[colon_pos + 1..].trim().to_string();
-                
+
                 if !key.is_empty() {
                     headers.insert(key, value);
                 }
             } else {
-                return Err(format!("Invalid header format: '{}'. Use 'key: value' format.", line));
+                return Err(format!(
+                    "Invalid header format: '{}'. Use 'key: value' format.",
+                    line
+                ));
             }
         }
 
         // Store the modified headers
         self.pending_requests[self.selected_pending].modified_headers = Some(headers);
-        
+
         Ok(())
     }
 
@@ -694,7 +638,7 @@ impl App {
                 "id": pending.original_request.id,
                 "result": "custom response"
             });
-            
+
             // Pretty print the JSON for editing
             serde_json::to_string_pretty(&response_template).ok()
         } else {
@@ -708,8 +652,8 @@ impl App {
         }
 
         // Parse the response JSON
-        let parsed: serde_json::Value = serde_json::from_str(&response_json)
-            .map_err(|e| format!("Invalid JSON: {}", e))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response_json).map_err(|e| format!("Invalid JSON: {}", e))?;
 
         // Validate it's a proper JSON-RPC response
         if parsed.get("jsonrpc") != Some(&serde_json::Value::String("2.0".to_string())) {
@@ -723,11 +667,11 @@ impl App {
         // Must have either result or error, but not both
         let has_result = parsed.get("result").is_some();
         let has_error = parsed.get("error").is_some();
-        
+
         if !has_result && !has_error {
             return Err("Response must have either 'result' or 'error' field".to_string());
         }
-        
+
         if has_result && has_error {
             return Err("Response cannot have both 'result' and 'error' fields".to_string());
         }
@@ -738,15 +682,17 @@ impl App {
             self.selected_pending -= 1;
         }
 
-        let _ = pending.decision_sender.send(ProxyDecision::Complete(parsed));
-        
+        let _ = pending
+            .decision_sender
+            .send(ProxyDecision::Complete(parsed));
+
         Ok(())
     }
 
     pub async fn send_new_request(&self, request_json: String) -> Result<(), String> {
         // Parse the request JSON
-        let parsed: serde_json::Value = serde_json::from_str(&request_json)
-            .map_err(|e| format!("Invalid JSON: {}", e))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&request_json).map_err(|e| format!("Invalid JSON: {}", e))?;
 
         // Validate it's a proper JSON-RPC request
         if parsed.get("jsonrpc") != Some(&serde_json::Value::String("2.0".to_string())) {
@@ -763,7 +709,7 @@ impl App {
         }
 
         let client = reqwest::Client::new();
-        
+
         // If we're in paused mode, send directly to target to avoid interception
         // Otherwise, send through proxy for normal logging
         let url = if matches!(self.app_mode, AppMode::Paused | AppMode::Intercepting) {
@@ -772,7 +718,7 @@ impl App {
             // Send through proxy for normal logging
             &format!("http://localhost:{}", self.proxy_config.listen_port)
         };
-        
+
         let response = client
             .post(url)
             .header("Content-Type", "application/json")
@@ -787,4 +733,4 @@ impl App {
 
         Ok(())
     }
-} 
+}

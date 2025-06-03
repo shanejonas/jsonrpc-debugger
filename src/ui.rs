@@ -2,12 +2,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap, Table, Row, Cell, TableState},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Wrap,
+    },
     Frame,
 };
 
-use crate::app::{App, TransportType, InputMode, AppMode};
-use serde::Serialize;
+use crate::app::{App, AppMode, InputMode, TransportType};
 
 // Helper function to format JSON with syntax highlighting and 2-space indentation
 fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'static>> {
@@ -16,16 +17,19 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
         Ok(s) => s,
         Err(_) => return vec![Line::from("Failed to format JSON")],
     };
-    
+
     let mut lines = Vec::new();
-    
+
     for (line_num, line) in json_str.lines().enumerate() {
         // Limit total lines to prevent UI issues
         if line_num > 1000 {
-            lines.push(Line::from(Span::styled("... (content truncated)", Style::default().fg(Color::Gray))));
+            lines.push(Line::from(Span::styled(
+                "... (content truncated)",
+                Style::default().fg(Color::Gray),
+            )));
             break;
         }
-        
+
         // Don't trim the line - work with it as-is to preserve indentation
         let mut spans = Vec::new();
         let mut chars = line.chars().peekable();
@@ -39,20 +43,20 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
                         spans.push(Span::raw(current_token.clone()));
                         current_token.clear();
                     }
-                    
+
                     // Collect the entire string
                     let mut string_content = String::from("\"");
-                    while let Some(string_ch) = chars.next() {
+                    for string_ch in chars.by_ref() {
                         string_content.push(string_ch);
                         if string_ch == '"' && !string_content.ends_with("\\\"") {
                             break;
                         }
                     }
-                    
+
                     // Check if this is a key (followed by colon)
-                    let mut peek_chars = chars.clone();
+                    let peek_chars = chars.clone();
                     let mut found_colon = false;
-                    while let Some(peek_ch) = peek_chars.next() {
+                    for peek_ch in peek_chars {
                         if peek_ch == ':' {
                             found_colon = true;
                             break;
@@ -60,13 +64,21 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
                             break;
                         }
                     }
-                    
+
                     if found_colon {
                         // This is a key
-                        spans.push(Span::styled(string_content, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+                        spans.push(Span::styled(
+                            string_content,
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ));
                     } else {
                         // This is a string value
-                        spans.push(Span::styled(string_content, Style::default().fg(Color::Green)));
+                        spans.push(Span::styled(
+                            string_content,
+                            Style::default().fg(Color::Green),
+                        ));
                     }
                 }
                 ':' => {
@@ -88,7 +100,12 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
                         spans.push(Span::raw(current_token.clone()));
                         current_token.clear();
                     }
-                    spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
                 }
                 _ => {
                     // Accumulate all other characters including spaces
@@ -96,25 +113,31 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
                 }
             }
         }
-        
+
         // Handle any remaining token (including trailing spaces)
         if !current_token.is_empty() {
             let trimmed_token = current_token.trim();
             if trimmed_token == "true" || trimmed_token == "false" {
-                spans.push(Span::styled(current_token, Style::default().fg(Color::Magenta)));
+                spans.push(Span::styled(
+                    current_token,
+                    Style::default().fg(Color::Magenta),
+                ));
             } else if trimmed_token == "null" {
                 spans.push(Span::styled(current_token, Style::default().fg(Color::Red)));
             } else if trimmed_token.parse::<f64>().is_ok() {
-                spans.push(Span::styled(current_token, Style::default().fg(Color::Blue)));
+                spans.push(Span::styled(
+                    current_token,
+                    Style::default().fg(Color::Blue),
+                ));
             } else {
                 // This includes spaces and other whitespace - preserve as-is
                 spans.push(Span::raw(current_token));
             }
         }
-        
+
         lines.push(Line::from(spans));
     }
-    
+
     lines
 }
 
@@ -122,14 +145,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header
-            Constraint::Min(10),    // Main content
-            Constraint::Length(3),  // Footer
+            Constraint::Length(3), // Header
+            Constraint::Min(10),   // Main content
+            Constraint::Length(3), // Footer
         ])
         .split(f.size());
 
     draw_header(f, chunks[0], app);
-    
+
     // Choose layout based on app mode
     match app.app_mode {
         AppMode::Normal => {
@@ -139,47 +162,58 @@ pub fn draw(f: &mut Frame, app: &App) {
             draw_intercept_content(f, chunks[1], app);
         }
     }
-    
+
     draw_footer(f, chunks[2], app);
 
     // Draw input dialogs
-    match app.input_mode {
-        InputMode::EditingTarget => draw_input_dialog(f, app),
-
-        _ => {}
+    if app.input_mode == InputMode::EditingTarget {
+        draw_input_dialog(f, app);
     }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let status = if app.is_running { "RUNNING" } else { "STOPPED" };
-    let status_color = if app.is_running { Color::Green } else { Color::Red };
-    
+    let status_color = if app.is_running {
+        Color::Green
+    } else {
+        Color::Red
+    };
+
     let mode_text = match app.app_mode {
         AppMode::Normal => String::new(),
         AppMode::Paused => " | Mode: PAUSED".to_string(),
-        AppMode::Intercepting => format!(" | Mode: INTERCEPTING ({} pending)", app.pending_requests.len()),
+        AppMode::Intercepting => format!(
+            " | Mode: INTERCEPTING ({} pending)",
+            app.pending_requests.len()
+        ),
     };
     let mode_color = match app.app_mode {
         AppMode::Normal => Color::White,
         AppMode::Paused => Color::Yellow,
         AppMode::Intercepting => Color::Red,
     };
-    
-    let header_text = vec![
-        Line::from(vec![
-            Span::raw("JSON-RPC Debugger | Status: "),
-            Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" | Port: {} | Target: {}", 
-                app.proxy_config.listen_port, 
-                app.proxy_config.target_url
-            )),
-            Span::styled(mode_text, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
-        ])
-    ];
 
-    let header = Paragraph::new(header_text)
-        .block(Block::default().borders(Borders::ALL).title("Status"));
-    
+    let header_text = vec![Line::from(vec![
+        Span::raw("JSON-RPC Debugger | Status: "),
+        Span::styled(
+            status,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            " | Port: {} | Target: {}",
+            app.proxy_config.listen_port, app.proxy_config.target_url
+        )),
+        Span::styled(
+            mode_text,
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ),
+    ])];
+
+    let header =
+        Paragraph::new(header_text).block(Block::default().borders(Borders::ALL).title("Status"));
+
     f.render_widget(header, area);
 }
 
@@ -199,16 +233,19 @@ fn draw_main_content(f: &mut Frame, area: Rect, app: &App) {
 fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
     if app.exchanges.is_empty() {
         let empty_message = if app.is_running {
-            format!("Proxy is running on port {}. Waiting for JSON-RPC requests...", app.proxy_config.listen_port)
+            format!(
+                "Proxy is running on port {}. Waiting for JSON-RPC requests...",
+                app.proxy_config.listen_port
+            )
         } else {
             "Press 's' to start the proxy and begin capturing messages".to_string()
         };
-        
+
         let paragraph = Paragraph::new(empty_message.as_str())
             .block(Block::default().borders(Borders::ALL).title("JSON-RPC"))
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: true });
-        
+
         f.render_widget(paragraph, area);
         return;
     }
@@ -236,7 +273,9 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
             };
 
             let method = exchange.method.as_deref().unwrap_or("unknown");
-            let id = exchange.id.as_ref()
+            let id = exchange
+                .id
+                .as_ref()
                 .map(|v| match v {
                     serde_json::Value::String(s) => s.clone(),
                     serde_json::Value::Number(n) => n.to_string(),
@@ -258,24 +297,28 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
             };
 
             // Calculate duration if we have both request and response
-            let duration_text = if let (Some(request), Some(response)) = (&exchange.request, &exchange.response) {
-                match response.timestamp.duration_since(request.timestamp) {
-                    Ok(duration) => {
-                        let millis = duration.as_millis();
-                        if millis < 1000 {
-                            format!("{}ms", millis)
-                        } else {
-                            format!("{:.2}s", duration.as_secs_f64())
+            let duration_text =
+                if let (Some(request), Some(response)) = (&exchange.request, &exchange.response) {
+                    match response.timestamp.duration_since(request.timestamp) {
+                        Ok(duration) => {
+                            let millis = duration.as_millis();
+                            if millis < 1000 {
+                                format!("{}ms", millis)
+                            } else {
+                                format!("{:.2}s", duration.as_secs_f64())
+                            }
                         }
+                        Err(_) => "-".to_string(),
                     }
-                    Err(_) => "-".to_string(),
-                }
-            } else {
-                "-".to_string()
-            };
+                } else {
+                    "-".to_string()
+                };
 
             let style = if i == app.selected_exchange {
-                Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -292,16 +335,24 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let table = Table::new(rows, [
-        Constraint::Length(12), // Status
-        Constraint::Length(9),  // Transport
-        Constraint::Min(15),    // Method (flexible)
-        Constraint::Length(12), // ID
-        Constraint::Length(10), // Duration
-    ])
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(12), // Status
+            Constraint::Length(9),  // Transport
+            Constraint::Min(15),    // Method (flexible)
+            Constraint::Length(12), // ID
+            Constraint::Length(10), // Duration
+        ],
+    )
     .header(header)
     .block(Block::default().borders(Borders::ALL).title("JSON-RPC"))
-    .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+    .highlight_style(
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    )
     .highlight_symbol("→ ");
 
     let mut table_state = TableState::default();
@@ -312,7 +363,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
 fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
     let content = if let Some(exchange) = app.get_selected_exchange() {
         let mut lines = Vec::new();
-        
+
         // Basic exchange info
         lines.push(Line::from(vec![
             Span::styled("Transport: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -336,8 +387,13 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
         // Request details
         if let Some(request) = &exchange.request {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("REQUEST:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Green))));
-            
+            lines.push(Line::from(Span::styled(
+                "REQUEST:",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Green),
+            )));
+
             // Show HTTP headers if available
             if let Some(headers) = &request.headers {
                 lines.push(Line::from(""));
@@ -346,24 +402,35 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
                     lines.push(Line::from(format!("  {}: {}", key, value)));
                 }
             }
-            
+
             // Build and show the complete JSON-RPC request object
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("JSON-RPC Request:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
+            lines.push(Line::from(Span::styled(
+                "JSON-RPC Request:",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
             lines.push(Line::from(""));
             let mut request_json = serde_json::Map::new();
-            request_json.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
-            
+            request_json.insert(
+                "jsonrpc".to_string(),
+                serde_json::Value::String("2.0".to_string()),
+            );
+
             if let Some(id) = &request.id {
                 request_json.insert("id".to_string(), id.clone());
             }
             if let Some(method) = &request.method {
-                request_json.insert("method".to_string(), serde_json::Value::String(method.clone()));
+                request_json.insert(
+                    "method".to_string(),
+                    serde_json::Value::String(method.clone()),
+                );
             }
             if let Some(params) = &request.params {
                 request_json.insert("params".to_string(), params.clone());
             }
-            
+
             let request_json_value = serde_json::Value::Object(request_json);
             let request_json_lines = format_json_with_highlighting(&request_json_value);
             for line in request_json_lines {
@@ -374,8 +441,13 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
         // Response details
         if let Some(response) = &exchange.response {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("RESPONSE:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Blue))));
-            
+            lines.push(Line::from(Span::styled(
+                "RESPONSE:",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Blue),
+            )));
+
             // Show HTTP headers if available
             if let Some(headers) = &response.headers {
                 lines.push(Line::from(""));
@@ -384,14 +456,22 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
                     lines.push(Line::from(format!("  {}: {}", key, value)));
                 }
             }
-            
+
             // Build and show the complete JSON-RPC response object
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("JSON-RPC Response:", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))));
+            lines.push(Line::from(Span::styled(
+                "JSON-RPC Response:",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            )));
             lines.push(Line::from(""));
             let mut response_json = serde_json::Map::new();
-            response_json.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
-            
+            response_json.insert(
+                "jsonrpc".to_string(),
+                serde_json::Value::String("2.0".to_string()),
+            );
+
             if let Some(id) = &response.id {
                 response_json.insert("id".to_string(), id.clone());
             }
@@ -401,7 +481,7 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
             if let Some(error) = &response.error {
                 response_json.insert("error".to_string(), error.clone());
             }
-            
+
             let response_json_value = serde_json::Value::Object(response_json);
             let response_json_lines = format_json_with_highlighting(&response_json_value);
             for line in response_json_lines {
@@ -409,7 +489,12 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
             }
         } else {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("RESPONSE: Pending...", Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))));
+            lines.push(Line::from(Span::styled(
+                "RESPONSE: Pending...",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Yellow),
+            )));
         }
 
         lines
@@ -418,10 +503,13 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Calculate visible area for scrolling
-    let inner_area = area.inner(&Margin { vertical: 1, horizontal: 1 });
+    let inner_area = area.inner(&Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
     let visible_lines = inner_area.height as usize;
     let total_lines = content.len();
-    
+
     // Apply scrolling offset
     let start_line = app.details_scroll;
     let end_line = std::cmp::min(start_line + visible_lines, total_lines);
@@ -433,7 +521,8 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
 
     // Create title with scroll indicator
     let scroll_info = if total_lines > visible_lines {
-        let progress = ((app.details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
+        let progress =
+            ((app.details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
         format!("Details ({}% - vim: j/k/d/u/G/g)", progress)
     } else {
         "Details".to_string()
@@ -448,19 +537,54 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut footer_spans = vec![
-        Span::styled("q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "q",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" quit | "),
-        Span::styled("↑↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("/"),
-        Span::styled("^n/^p", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "^n/^p",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" navigate | "),
-        Span::styled("j/k/d/u/G/g", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "j/k/d/u/G/g",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" scroll details | "),
-        Span::styled("s", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "s",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" start/stop proxy | "),
-        Span::styled("t", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "t",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" edit target | "),
-        Span::styled("p", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "p",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" pause"),
     ];
 
@@ -469,14 +593,24 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         AppMode::Paused | AppMode::Intercepting => {
             footer_spans.extend(vec![
                 Span::raw(" | "),
-                Span::styled("a/e/h/c/b/r", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "a/e/h/c/b/r",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" allow/edit/headers/complete/block/resume"),
             ]);
         }
         AppMode::Normal => {
             footer_spans.extend(vec![
                 Span::raw(" | "),
-                Span::styled("c", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "c",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" create request"),
             ]);
         }
@@ -484,15 +618,15 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 
     let footer_text = vec![Line::from(footer_spans)];
 
-    let footer = Paragraph::new(footer_text)
-        .block(Block::default().borders(Borders::ALL).title("Controls"));
-    
+    let footer =
+        Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL).title("Controls"));
+
     f.render_widget(footer, area);
 }
 
 fn draw_input_dialog(f: &mut Frame, app: &App) {
     let area = f.size();
-    
+
     // Create a centered popup
     let popup_area = Rect {
         x: area.width / 4,
@@ -503,10 +637,9 @@ fn draw_input_dialog(f: &mut Frame, app: &App) {
 
     // Clear the entire screen first
     f.render_widget(Clear, area);
-    
+
     // Render a black background
-    let background = Block::default()
-        .style(Style::default().bg(Color::Black));
+    let background = Block::default().style(Style::default().bg(Color::Black));
     f.render_widget(background, area);
 
     // Clear the popup area specifically
@@ -519,15 +652,20 @@ fn draw_input_dialog(f: &mut Frame, app: &App) {
             Span::styled(&app.input_buffer, Style::default().fg(Color::Green)),
         ]),
         Line::from(""),
-        Line::from(Span::styled("Press Enter to confirm, Esc to cancel", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(
+            "Press Enter to confirm, Esc to cancel",
+            Style::default().fg(Color::Gray),
+        )),
         Line::from(""),
     ];
 
     let input_dialog = Paragraph::new(input_text)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title("Edit Target URL")
-            .style(Style::default().fg(Color::White).bg(Color::DarkGray)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Edit Target URL")
+                .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+        )
         .wrap(Wrap { trim: true });
 
     f.render_widget(input_dialog, popup_area);
@@ -552,12 +690,16 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
             AppMode::Paused => "Pause mode active. New requests will be intercepted.",
             _ => "No pending requests.",
         };
-        
+
         let paragraph = Paragraph::new(mode_text)
-            .block(Block::default().borders(Borders::ALL).title("Pending Requests"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Pending Requests"),
+            )
             .style(Style::default().fg(Color::Yellow))
             .wrap(Wrap { trim: true });
-        
+
         f.render_widget(paragraph, area);
         return;
     }
@@ -567,23 +709,34 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, pending)| {
-            let method = pending.original_request.method.as_deref().unwrap_or("unknown");
-            let id = pending.original_request.id.as_ref()
+            let method = pending
+                .original_request
+                .method
+                .as_deref()
+                .unwrap_or("unknown");
+            let id = pending
+                .original_request
+                .id
+                .as_ref()
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string());
 
             let style = if i == app.selected_pending {
-                Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
 
             // Show different icon if request has been modified
-            let (icon, icon_color) = if pending.modified_request.is_some() || pending.modified_headers.is_some() {
-                ("✏ ", Color::Blue) // Modified
-            } else {
-                ("⏸ ", Color::Red)  // Paused/Intercepted
-            };
+            let (icon, icon_color) =
+                if pending.modified_request.is_some() || pending.modified_headers.is_some() {
+                    ("✏ ", Color::Blue) // Modified
+                } else {
+                    ("⏸ ", Color::Red) // Paused/Intercepted
+                };
 
             let mut modification_labels = Vec::new();
             if pending.modified_request.is_some() {
@@ -603,17 +756,32 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{} ", method), Style::default().fg(Color::Red)),
                 Span::styled(format!("(id: {})", id), Style::default().fg(Color::Gray)),
                 if !modification_text.is_empty() {
-                    Span::styled(modification_text, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+                    Span::styled(
+                        modification_text,
+                        Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
                     Span::raw("")
                 },
-            ])).style(style)
+            ]))
+            .style(style)
         })
         .collect();
 
     let requests_list = List::new(requests)
-        .block(Block::default().borders(Borders::ALL).title(format!("Pending Requests ({})", app.pending_requests.len())))
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Pending Requests ({})", app.pending_requests.len())),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
 
     f.render_widget(requests_list, area);
 }
@@ -621,34 +789,59 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
 fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     let content = if let Some(pending) = app.get_selected_pending() {
         let mut lines = Vec::new();
-        
+
         if pending.modified_request.is_some() || pending.modified_headers.is_some() {
-            lines.push(Line::from(Span::styled("MODIFIED REQUEST:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Blue))));
+            lines.push(Line::from(Span::styled(
+                "MODIFIED REQUEST:",
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Blue),
+            )));
         } else {
-            lines.push(Line::from(Span::styled("INTERCEPTED REQUEST:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Red))));
+            lines.push(Line::from(Span::styled(
+                "INTERCEPTED REQUEST:",
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+            )));
         }
         lines.push(Line::from(""));
-        
+
         // Show headers section
-        lines.push(Line::from(Span::styled("HTTP Headers:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Green))));
-        let headers_to_show = pending.modified_headers.as_ref()
+        lines.push(Line::from(Span::styled(
+            "HTTP Headers:",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Green),
+        )));
+        let headers_to_show = pending
+            .modified_headers
+            .as_ref()
             .or(pending.original_request.headers.as_ref());
-        
+
         if let Some(headers) = headers_to_show {
             for (key, value) in headers {
                 lines.push(Line::from(format!("  {}: {}", key, value)));
             }
             if pending.modified_headers.is_some() {
-                lines.push(Line::from(Span::styled("  [Headers have been modified]", Style::default().fg(Color::Blue).add_modifier(Modifier::ITALIC))));
+                lines.push(Line::from(Span::styled(
+                    "  [Headers have been modified]",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::ITALIC),
+                )));
             }
         } else {
             lines.push(Line::from("  No headers"));
         }
         lines.push(Line::from(""));
-        
+
         // Show JSON-RPC body section
-        lines.push(Line::from(Span::styled("JSON-RPC Request:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Green))));
-        
+        lines.push(Line::from(Span::styled(
+            "JSON-RPC Request:",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Green),
+        )));
+
         // Show the modified request if available, otherwise show original
         let json_to_show = if let Some(ref modified_json) = pending.modified_request {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(modified_json) {
@@ -656,45 +849,60 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 // Fallback to original if modified JSON is invalid
                 let mut request_json = serde_json::Map::new();
-                request_json.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
-                
+                request_json.insert(
+                    "jsonrpc".to_string(),
+                    serde_json::Value::String("2.0".to_string()),
+                );
+
                 if let Some(id) = &pending.original_request.id {
                     request_json.insert("id".to_string(), id.clone());
                 }
                 if let Some(method) = &pending.original_request.method {
-                    request_json.insert("method".to_string(), serde_json::Value::String(method.clone()));
+                    request_json.insert(
+                        "method".to_string(),
+                        serde_json::Value::String(method.clone()),
+                    );
                 }
                 if let Some(params) = &pending.original_request.params {
                     request_json.insert("params".to_string(), params.clone());
                 }
-                
+
                 serde_json::Value::Object(request_json)
             }
         } else {
             // Show original request
             let mut request_json = serde_json::Map::new();
-            request_json.insert("jsonrpc".to_string(), serde_json::Value::String("2.0".to_string()));
-            
+            request_json.insert(
+                "jsonrpc".to_string(),
+                serde_json::Value::String("2.0".to_string()),
+            );
+
             if let Some(id) = &pending.original_request.id {
                 request_json.insert("id".to_string(), id.clone());
             }
             if let Some(method) = &pending.original_request.method {
-                request_json.insert("method".to_string(), serde_json::Value::String(method.clone()));
+                request_json.insert(
+                    "method".to_string(),
+                    serde_json::Value::String(method.clone()),
+                );
             }
             if let Some(params) = &pending.original_request.params {
                 request_json.insert("params".to_string(), params.clone());
             }
-            
+
             serde_json::Value::Object(request_json)
         };
-        
+
         let request_json_lines = format_json_with_highlighting(&json_to_show);
         for line in request_json_lines {
             lines.push(line);
         }
-        
+
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Actions:", Style::default().add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            "Actions:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         lines.push(Line::from("• Press 'a' to Allow request"));
         lines.push(Line::from("• Press 'e' to Edit request body"));
         lines.push(Line::from("• Press 'h' to Edit headers"));
@@ -708,10 +916,13 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Calculate visible area for scrolling
-    let inner_area = area.inner(&Margin { vertical: 1, horizontal: 1 });
+    let inner_area = area.inner(&Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
     let visible_lines = inner_area.height as usize;
     let total_lines = content.len();
-    
+
     // Apply scrolling offset
     let start_line = app.intercept_details_scroll;
     let end_line = std::cmp::min(start_line + visible_lines, total_lines);
@@ -723,7 +934,9 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
 
     // Create title with scroll indicator
     let scroll_info = if total_lines > visible_lines {
-        let progress = ((app.intercept_details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
+        let progress = ((app.intercept_details_scroll as f32
+            / (total_lines - visible_lines) as f32)
+            * 100.0) as u8;
         format!("Request Details ({}% - vim: j/k/d/u/G/g)", progress)
     } else {
         "Request Details".to_string()
@@ -735,5 +948,3 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
 
     f.render_widget(details, area);
 }
-
- 

@@ -5,10 +5,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::io::Write;
 use std::process::Command;
@@ -18,8 +15,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 mod app;
-mod ui;
 mod proxy;
+mod ui;
 
 use app::{App, AppMode};
 use proxy::{ProxyServer, ProxyState};
@@ -31,7 +28,7 @@ struct Cli {
     /// Port to listen on for incoming requests
     #[arg(short, long, default_value = "8080")]
     port: u16,
-    
+
     /// Target URL to proxy requests to
     #[arg(short, long)]
     target: Option<String>,
@@ -58,9 +55,7 @@ fn launch_external_editor(content: &str) -> Result<String> {
         });
 
     // Launch the editor
-    let status = Command::new(&editor)
-        .arg(&temp_path)
-        .status()?;
+    let status = Command::new(&editor).arg(&temp_path).status()?;
 
     if !status.success() {
         return Err(anyhow::anyhow!("Editor exited with non-zero status"));
@@ -68,7 +63,7 @@ fn launch_external_editor(content: &str) -> Result<String> {
 
     // Read the modified content
     let modified_content = std::fs::read_to_string(&temp_path)?;
-    
+
     Ok(modified_content)
 }
 
@@ -90,40 +85,45 @@ async fn main() -> Result<()> {
     // Create pending request channel for pause/intercept functionality
     let (pending_sender, pending_receiver) = mpsc::unbounded_channel();
 
-    // Create decision channel for sending decisions back to proxy
-    let (decision_sender, decision_receiver) = mpsc::unbounded_channel();
-
     // Create shared state for pause/intercept
     let shared_app_mode = Arc::new(Mutex::new(AppMode::Normal));
     let proxy_state = ProxyState {
         app_mode: shared_app_mode.clone(),
         pending_sender,
-        decision_receiver: Arc::new(Mutex::new(decision_receiver)),
     };
 
-    // Create app with receiver and decision sender, using CLI arguments
+    // Create app with receiver, using CLI arguments
     let mut app = App::new_with_receiver(message_receiver);
-    app.decision_sender = Some(decision_sender);
-    
+
     // Override default config with CLI arguments
     app.proxy_config.listen_port = cli.port;
     if let Some(target) = cli.target {
         app.proxy_config.target_url = target;
     }
-    
+
     // Start the proxy server immediately since app.is_running is true by default
     let initial_server = ProxyServer::new(
         app.proxy_config.listen_port,
         app.proxy_config.target_url.clone(),
         message_sender.clone(),
-    ).with_state(proxy_state.clone());
+    )
+    .with_state(proxy_state.clone());
     let initial_proxy_handle = tokio::spawn(async move {
         if let Err(_e) = initial_server.start().await {
             // Silent error handling
         }
     });
-    
-    let res = run_app(&mut terminal, app, message_sender, shared_app_mode, pending_receiver, proxy_state, Some(initial_proxy_handle)).await;
+
+    let res = run_app(
+        &mut terminal,
+        app,
+        message_sender,
+        shared_app_mode,
+        pending_receiver,
+        proxy_state,
+        Some(initial_proxy_handle),
+    )
+    .await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, 
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut app: App,
     message_sender: mpsc::UnboundedSender<app::JsonRpcMessage>,
     shared_app_mode: Arc<Mutex<AppMode>>,
@@ -170,10 +170,11 @@ async fn run_app(
         terminal.draw(|f| ui::draw(f, &app))?;
 
         // Use timeout to avoid blocking indefinitely
-        if let Ok(has_event) = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            async { event::poll(std::time::Duration::from_millis(0)) }
-        ).await {
+        if let Ok(has_event) = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            event::poll(std::time::Duration::from_millis(0))
+        })
+        .await
+        {
             if has_event? {
                 if let Event::Key(key) = event::read()? {
                     // Handle input modes first
@@ -184,15 +185,19 @@ async fn run_app(
                                     app.confirm_target_edit();
                                     // If proxy is running, restart it with new target
                                     if app.is_running {
-                                                                            if let Some(handle) = proxy_server.take() {
-                                        handle.abort();
-                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                    }
-                                    let server = ProxyServer::new(
-                                        app.proxy_config.listen_port,
-                                        app.proxy_config.target_url.clone(),
-                                        message_sender.clone(),
-                                    ).with_state(proxy_state.clone());
+                                        if let Some(handle) = proxy_server.take() {
+                                            handle.abort();
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                100,
+                                            ))
+                                            .await;
+                                        }
+                                        let server = ProxyServer::new(
+                                            app.proxy_config.listen_port,
+                                            app.proxy_config.target_url.clone(),
+                                            message_sender.clone(),
+                                        )
+                                        .with_state(proxy_state.clone());
                                         proxy_server = Some(tokio::spawn(async move {
                                             if let Err(_e) = server.start().await {
                                                 // Silent error handling
@@ -231,7 +236,9 @@ async fn run_app(
                             }
                             return Ok(());
                         }
-                        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        KeyCode::Char('c')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
                             // Clean shutdown
                             if let Some(handle) = proxy_server.take() {
                                 handle.abort();
@@ -239,29 +246,29 @@ async fn run_app(
                             }
                             return Ok(());
                         }
-                        KeyCode::Up => {
-                            match app.app_mode {
-                                app::AppMode::Normal => app.select_previous(),
-                                app::AppMode::Paused | app::AppMode::Intercepting => app.select_previous_pending(),
+                        KeyCode::Up => match app.app_mode {
+                            app::AppMode::Normal => app.select_previous(),
+                            app::AppMode::Paused | app::AppMode::Intercepting => {
+                                app.select_previous_pending()
                             }
-                        }
-                        KeyCode::Down => {
-                            match app.app_mode {
-                                app::AppMode::Normal => app.select_next(),
-                                app::AppMode::Paused | app::AppMode::Intercepting => app.select_next_pending(),
+                        },
+                        KeyCode::Down => match app.app_mode {
+                            app::AppMode::Normal => app.select_next(),
+                            app::AppMode::Paused | app::AppMode::Intercepting => {
+                                app.select_next_pending()
                             }
-                        }
-                        KeyCode::Char('k') => {
-                            match app.app_mode {
-                                app::AppMode::Normal => app.scroll_details_up(),
-                                app::AppMode::Paused | app::AppMode::Intercepting => app.scroll_intercept_details_up(),
+                        },
+                        KeyCode::Char('k') => match app.app_mode {
+                            app::AppMode::Normal => app.scroll_details_up(),
+                            app::AppMode::Paused | app::AppMode::Intercepting => {
+                                app.scroll_intercept_details_up()
                             }
-                        }
+                        },
                         KeyCode::Char('j') => {
                             match app.app_mode {
                                 app::AppMode::Normal => {
                                     // Calculate proper max lines for scrolling
-                                    if let Some(_) = app.get_selected_exchange() {
+                                    if app.get_selected_exchange().is_some() {
                                         let max_lines = app.get_details_content_lines();
                                         app.scroll_details_down(max_lines, 20); // 20 is rough visible lines estimate
                                     }
@@ -274,30 +281,38 @@ async fn run_app(
                             }
                         }
                         // Vim-style page navigation for details
-                        KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        KeyCode::Char('d')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
                             match app.app_mode {
                                 app::AppMode::Normal => app.page_down_details(20),
-                                app::AppMode::Paused | app::AppMode::Intercepting => app.page_down_intercept_details(20),
+                                app::AppMode::Paused | app::AppMode::Intercepting => {
+                                    app.page_down_intercept_details(20)
+                                }
                             }
                         }
-                        KeyCode::Char('u') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        KeyCode::Char('u')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
                             match app.app_mode {
                                 app::AppMode::Normal => app.page_up_details(),
-                                app::AppMode::Paused | app::AppMode::Intercepting => app.page_up_intercept_details(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => {
+                                    app.page_up_intercept_details()
+                                }
                             }
                         }
-                        KeyCode::Char('d') => {
-                            match app.app_mode {
-                                app::AppMode::Normal => app.page_down_details(20),
-                                app::AppMode::Paused | app::AppMode::Intercepting => app.page_down_intercept_details(20),
+                        KeyCode::Char('d') => match app.app_mode {
+                            app::AppMode::Normal => app.page_down_details(20),
+                            app::AppMode::Paused | app::AppMode::Intercepting => {
+                                app.page_down_intercept_details(20)
                             }
-                        }
-                        KeyCode::Char('u') => {
-                            match app.app_mode {
-                                app::AppMode::Normal => app.page_up_details(),
-                                app::AppMode::Paused | app::AppMode::Intercepting => app.page_up_intercept_details(),
+                        },
+                        KeyCode::Char('u') => match app.app_mode {
+                            app::AppMode::Normal => app.page_up_details(),
+                            app::AppMode::Paused | app::AppMode::Intercepting => {
+                                app.page_up_intercept_details()
                             }
-                        }
+                        },
                         KeyCode::Char('G') => {
                             match app.app_mode {
                                 app::AppMode::Normal => {
@@ -310,18 +325,26 @@ async fn run_app(
                                 }
                             }
                         }
-                        KeyCode::Char('g') => {
-                            match app.app_mode {
-                                app::AppMode::Normal => app.goto_top_details(),
-                                app::AppMode::Paused | app::AppMode::Intercepting => app.goto_top_intercept_details(),
+                        KeyCode::Char('g') => match app.app_mode {
+                            app::AppMode::Normal => app.goto_top_details(),
+                            app::AppMode::Paused | app::AppMode::Intercepting => {
+                                app.goto_top_intercept_details()
                             }
-                        }
+                        },
                         KeyCode::Char('t') => {
                             // Edit target URL
                             app.start_editing_target();
                         }
-                        KeyCode::Char('n') if key.modifiers.contains(event::KeyModifiers::CONTROL) => app.select_next(),
-                        KeyCode::Char('p') if key.modifiers.contains(event::KeyModifiers::CONTROL) => app.select_previous(),
+                        KeyCode::Char('n')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            app.select_next()
+                        }
+                        KeyCode::Char('p')
+                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                        {
+                            app.select_previous()
+                        }
                         KeyCode::Char('s') => {
                             if app.is_running {
                                 // Stop proxy server first
@@ -338,14 +361,15 @@ async fn run_app(
                                     app.proxy_config.listen_port,
                                     app.proxy_config.target_url.clone(),
                                     message_sender.clone(),
-                                ).with_state(proxy_state.clone());
+                                )
+                                .with_state(proxy_state.clone());
                                 proxy_server = Some(tokio::spawn(async move {
                                     if let Err(e) = server.start().await {
                                         eprintln!("Proxy server error: {}", e);
                                     }
                                 }));
                             }
-                            
+
                             // Clear and force a redraw after state change
                             terminal.clear()?;
                             terminal.draw(|f| ui::draw(f, &app))?;
@@ -369,9 +393,9 @@ async fn run_app(
                                     LeaveAlternateScreen,
                                     DisableMouseCapture
                                 )?;
-                                
+
                                 // Launch external editor
-                                                                    match launch_external_editor(&json_content) {
+                                match launch_external_editor(&json_content) {
                                     Ok(edited_content) => {
                                         // Apply the edited JSON
                                         if let Err(e) = app.apply_edited_json(edited_content) {
@@ -386,7 +410,7 @@ async fn run_app(
                                         let _ = std::io::stdin().read_line(&mut String::new());
                                     }
                                 }
-                                
+
                                 // Re-enter TUI mode
                                 enable_raw_mode()?;
                                 execute!(
@@ -407,7 +431,7 @@ async fn run_app(
                                     LeaveAlternateScreen,
                                     DisableMouseCapture
                                 )?;
-                                
+
                                 // Launch external editor for headers
                                 match launch_external_editor(&headers_content) {
                                     Ok(edited_content) => {
@@ -424,7 +448,7 @@ async fn run_app(
                                         let _ = std::io::stdin().read_line(&mut String::new());
                                     }
                                 }
-                                
+
                                 // Re-enter TUI mode
                                 enable_raw_mode()?;
                                 execute!(
@@ -437,9 +461,13 @@ async fn run_app(
                         }
                         KeyCode::Char('c') => {
                             // Check if we have a selected pending request (in either Paused or Intercepting mode)
-                            if (app.app_mode == AppMode::Paused || app.app_mode == AppMode::Intercepting) && !app.pending_requests.is_empty() {
+                            if (app.app_mode == AppMode::Paused
+                                || app.app_mode == AppMode::Intercepting)
+                                && !app.pending_requests.is_empty()
+                            {
                                 // Complete selected pending request with custom response
-                                if let Some(response_template) = app.get_pending_response_template() {
+                                if let Some(response_template) = app.get_pending_response_template()
+                                {
                                     // Temporarily exit TUI mode
                                     disable_raw_mode()?;
                                     execute!(
@@ -447,15 +475,18 @@ async fn run_app(
                                         LeaveAlternateScreen,
                                         DisableMouseCapture
                                     )?;
-                                    
+
                                     // Launch external editor for response
                                     match launch_external_editor(&response_template) {
                                         Ok(edited_content) => {
                                             // Complete the request with the custom response
-                                            if let Err(e) = app.complete_selected_request(edited_content) {
+                                            if let Err(e) =
+                                                app.complete_selected_request(edited_content)
+                                            {
                                                 println!("Error completing request: {}", e);
                                                 println!("Press Enter to continue...");
-                                                let _ = std::io::stdin().read_line(&mut String::new());
+                                                let _ =
+                                                    std::io::stdin().read_line(&mut String::new());
                                             }
                                         }
                                         Err(e) => {
@@ -464,7 +495,7 @@ async fn run_app(
                                             let _ = std::io::stdin().read_line(&mut String::new());
                                         }
                                     }
-                                    
+
                                     // Re-enter TUI mode
                                     enable_raw_mode()?;
                                     execute!(
@@ -482,7 +513,7 @@ async fn run_app(
   "params": [],
   "id": 1
 }"#;
-                                
+
                                 // Temporarily exit TUI mode
                                 disable_raw_mode()?;
                                 execute!(
@@ -490,7 +521,7 @@ async fn run_app(
                                     LeaveAlternateScreen,
                                     DisableMouseCapture
                                 )?;
-                                
+
                                 // Launch external editor for new request
                                 match launch_external_editor(new_request_template) {
                                     Ok(edited_content) => {
@@ -507,7 +538,7 @@ async fn run_app(
                                         let _ = std::io::stdin().read_line(&mut String::new());
                                     }
                                 }
-                                
+
                                 // Re-enter TUI mode
                                 enable_raw_mode()?;
                                 execute!(
@@ -533,7 +564,7 @@ async fn run_app(
                 }
             }
         }
-        
+
         // Check if proxy server has died unexpectedly
         if let Some(handle) = &proxy_server {
             if handle.is_finished() {

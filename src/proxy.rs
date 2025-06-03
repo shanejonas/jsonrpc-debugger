@@ -1,4 +1,6 @@
-use crate::app::{JsonRpcMessage, MessageDirection, TransportType, AppMode, PendingRequest, ProxyDecision};
+use crate::app::{
+    AppMode, JsonRpcMessage, MessageDirection, PendingRequest, ProxyDecision, TransportType,
+};
 use anyhow::Result;
 use reqwest::Client;
 use serde_json::Value;
@@ -14,7 +16,6 @@ use warp::Filter;
 pub struct ProxyState {
     pub app_mode: Arc<Mutex<AppMode>>,
     pub pending_sender: mpsc::UnboundedSender<PendingRequest>,
-    pub decision_receiver: Arc<Mutex<mpsc::UnboundedReceiver<(String, crate::app::ProxyDecision)>>>,
 }
 
 pub struct ProxyServer {
@@ -45,13 +46,7 @@ impl ProxyServer {
         self
     }
 
-    pub fn listen_port(&self) -> u16 {
-        self.listen_port
-    }
 
-    pub fn target_url(&self) -> &str {
-        &self.target_url
-    }
 
     pub async fn start(&self) -> Result<()> {
         let target_url = self.target_url.clone();
@@ -68,9 +63,17 @@ impl ProxyServer {
                 let client = client.clone();
                 let message_sender = message_sender.clone();
                 let proxy_state = proxy_state.clone();
-                
+
                 async move {
-                    handle_proxy_request(headers, body, target_url, client, message_sender, proxy_state).await
+                    handle_proxy_request(
+                        headers,
+                        body,
+                        target_url,
+                        client,
+                        message_sender,
+                        proxy_state,
+                    )
+                    .await
                 }
             });
 
@@ -110,7 +113,10 @@ async fn handle_proxy_request(
     // Log the incoming request
     let request_message = JsonRpcMessage {
         id: body.get("id").cloned(),
-        method: body.get("method").and_then(|m| m.as_str()).map(String::from),
+        method: body
+            .get("method")
+            .and_then(|m| m.as_str())
+            .map(String::from),
         params: body.get("params").cloned(),
         result: None,
         error: None,
@@ -129,107 +135,115 @@ async fn handle_proxy_request(
         } else {
             false
         };
-        
+
         if should_intercept {
-                // Create oneshot channel for decision
-                let (decision_sender, decision_receiver) = oneshot::channel();
-                
-                // Create a pending request
-                let pending_request = PendingRequest {
-                    id: Uuid::new_v4().to_string(),
-                    original_request: request_message,
-                    modified_request: None,
-                    modified_headers: None,
-                    decision_sender,
-                };
+            // Create oneshot channel for decision
+            let (decision_sender, decision_receiver) = oneshot::channel();
 
-                // Send to app for interception
-                let _ = state.pending_sender.send(pending_request);
+            // Create a pending request
+            let pending_request = PendingRequest {
+                id: Uuid::new_v4().to_string(),
+                original_request: request_message,
+                modified_request: None,
+                modified_headers: None,
+                decision_sender,
+            };
 
-                // Wait for user decision with timeout
-                let decision = tokio::time::timeout(
-                    std::time::Duration::from_secs(300), // 5 minute timeout
-                    decision_receiver
-                ).await;
+            // Send to app for interception
+            let _ = state.pending_sender.send(pending_request);
 
-                return match decision {
-                    Ok(Ok(ProxyDecision::Allow(modified_json, modified_headers))) => {
-                        // Use modified JSON if provided, otherwise use original body
-                        let request_body = modified_json.unwrap_or(body);
-                        
-                        // Use modified headers if provided, otherwise use original headers
-                        let final_headers = if let Some(mod_headers) = modified_headers {
-                            // Convert HashMap to HeaderMap
-                            let mut header_map = warp::http::HeaderMap::new();
-                            for (key, value) in mod_headers {
-                                if let (Ok(header_name), Ok(header_value)) = (
-                                    warp::http::header::HeaderName::from_bytes(key.as_bytes()),
-                                    warp::http::header::HeaderValue::from_str(&value)
-                                ) {
-                                    header_map.insert(header_name, header_value);
-                                }
+            // Wait for user decision with timeout
+            let decision = tokio::time::timeout(
+                std::time::Duration::from_secs(300), // 5 minute timeout
+                decision_receiver,
+            )
+            .await;
+
+            return match decision {
+                Ok(Ok(ProxyDecision::Allow(modified_json, modified_headers))) => {
+                    // Use modified JSON if provided, otherwise use original body
+                    let request_body = modified_json.unwrap_or(body);
+
+                    // Use modified headers if provided, otherwise use original headers
+                    let final_headers = if let Some(mod_headers) = modified_headers {
+                        // Convert HashMap to HeaderMap
+                        let mut header_map = warp::http::HeaderMap::new();
+                        for (key, value) in mod_headers {
+                            if let (Ok(header_name), Ok(header_value)) = (
+                                warp::http::header::HeaderName::from_bytes(key.as_bytes()),
+                                warp::http::header::HeaderValue::from_str(&value),
+                            ) {
+                                header_map.insert(header_name, header_value);
                             }
-                            header_map
-                        } else {
-                            headers
-                        };
-                        
-                        forward_request(final_headers, request_body, target_url, client, message_sender).await
-                    }
-                    Ok(Ok(ProxyDecision::Block)) => {
-                        // Return blocked response
-                        Ok(Box::new(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": body.get("id"),
-                                "error": {
-                                    "code": -32603,
-                                    "message": "Request blocked by user"
-                                }
-                            })),
-                            warp::http::StatusCode::OK,
-                        )))
-                    }
-                    Ok(Ok(ProxyDecision::Complete(response_json))) => {
-                        // Log the custom response
-                        let response_message = JsonRpcMessage {
-                            id: response_json.get("id").cloned(),
-                            method: None,
-                            params: None,
-                            result: response_json.get("result").cloned(),
-                            error: response_json.get("error").cloned(),
-                            timestamp: std::time::SystemTime::now(),
-                            direction: MessageDirection::Response,
-                            transport: TransportType::Http,
-                            headers: Some(HashMap::from([
-                                ("content-type".to_string(), "application/json".to_string()),
-                                ("x-proxy-completed".to_string(), "true".to_string()),
-                            ])),
-                        };
+                        }
+                        header_map
+                    } else {
+                        headers
+                    };
 
-                        let _ = message_sender.send(response_message);
+                    forward_request(
+                        final_headers,
+                        request_body,
+                        target_url,
+                        client,
+                        message_sender,
+                    )
+                    .await
+                }
+                Ok(Ok(ProxyDecision::Block)) => {
+                    // Return blocked response
+                    Ok(Box::new(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body.get("id"),
+                            "error": {
+                                "code": -32603,
+                                "message": "Request blocked by user"
+                            }
+                        })),
+                        warp::http::StatusCode::OK,
+                    )))
+                }
+                Ok(Ok(ProxyDecision::Complete(response_json))) => {
+                    // Log the custom response
+                    let response_message = JsonRpcMessage {
+                        id: response_json.get("id").cloned(),
+                        method: None,
+                        params: None,
+                        result: response_json.get("result").cloned(),
+                        error: response_json.get("error").cloned(),
+                        timestamp: std::time::SystemTime::now(),
+                        direction: MessageDirection::Response,
+                        transport: TransportType::Http,
+                        headers: Some(HashMap::from([
+                            ("content-type".to_string(), "application/json".to_string()),
+                            ("x-proxy-completed".to_string(), "true".to_string()),
+                        ])),
+                    };
 
-                        // Return the custom response
-                        Ok(Box::new(warp::reply::with_status(
-                            warp::reply::json(&response_json),
-                            warp::http::StatusCode::OK,
-                        )))
-                    }
-                    Ok(Err(_)) | Err(_) => {
-                        // Timeout or channel error - return timeout response
-                        Ok(Box::new(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": body.get("id"),
-                                "error": {
-                                    "code": -32603,
-                                    "message": "Request timed out waiting for user decision"
-                                }
-                            })),
-                            warp::http::StatusCode::REQUEST_TIMEOUT,
-                        )))
-                    }
-                };
+                    let _ = message_sender.send(response_message);
+
+                    // Return the custom response
+                    Ok(Box::new(warp::reply::with_status(
+                        warp::reply::json(&response_json),
+                        warp::http::StatusCode::OK,
+                    )))
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // Timeout or channel error - return timeout response
+                    Ok(Box::new(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body.get("id"),
+                            "error": {
+                                "code": -32603,
+                                "message": "Request timed out waiting for user decision"
+                            }
+                        })),
+                        warp::http::StatusCode::REQUEST_TIMEOUT,
+                    )))
+                }
+            };
         }
     }
 
@@ -246,7 +260,7 @@ async fn forward_request(
 ) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
     // Forward the request to the target
     let mut request_builder = client.post(&target_url).json(&body);
-    
+
     // Forward relevant headers
     for (name, value) in headers.iter() {
         if should_forward_header(name.as_str()) {
@@ -258,7 +272,7 @@ async fn forward_request(
         Ok(response) => {
             let status = response.status();
             let response_headers = response.headers().clone();
-            
+
             // Convert response headers
             let mut response_header_map = HashMap::new();
             for (name, value) in response_headers.iter() {
@@ -297,7 +311,10 @@ async fn forward_request(
                         Err(_) => {
                             // Not valid JSON - could be HTML error page, plain text, etc.
                             // Don't include the raw response content in the UI - just log the error
-                            let content_type = response_header_map.get("content-type").unwrap_or(&"unknown".to_string()).clone();
+                            let content_type = response_header_map
+                                .get("content-type")
+                                .unwrap_or(&"unknown".to_string())
+                                .clone();
                             let error_message = JsonRpcMessage {
                                 id: body.get("id").cloned(),
                                 method: None,
@@ -400,8 +417,8 @@ async fn forward_request(
 }
 
 fn should_forward_header(header_name: &str) -> bool {
-    match header_name.to_lowercase().as_str() {
-        "host" | "content-length" | "transfer-encoding" | "connection" => false,
-        _ => true,
-    }
-} 
+    !matches!(
+        header_name.to_lowercase().as_str(),
+        "host" | "content-length" | "transfer-encoding" | "connection"
+    )
+}
