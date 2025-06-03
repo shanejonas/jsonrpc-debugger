@@ -6,17 +6,17 @@ fn test_app_new_creates_empty() {
     let app = App::new();
     
     // Should start empty
-    assert!(app.messages.is_empty());
-    assert_eq!(app.selected_message, 0);
-    assert!(!app.is_running);
+    assert!(app.exchanges.is_empty());
+    assert_eq!(app.selected_exchange, 0);
+    assert!(app.is_running);
     assert_eq!(app.proxy_config.listen_port, 8080);
-    assert_eq!(app.proxy_config.target_url, "https://eth-mainnet.g.alchemy.com/v2/demo");
+    assert_eq!(app.proxy_config.target_url, "https://mock.open-rpc.org");
 }
 
 #[test]
 fn test_add_message() {
     let mut app = App::new();
-    let initial_count = app.messages.len();
+    let initial_count = app.exchanges.len();
     
     let test_message = JsonRpcMessage {
         id: Some(serde_json::Value::Number(serde_json::Number::from(999))),
@@ -32,17 +32,19 @@ fn test_add_message() {
     
     app.add_message(test_message);
     
-    assert_eq!(app.messages.len(), initial_count + 1);
-    let last_message = app.messages.last().unwrap();
-    assert_eq!(last_message.method, Some("test_method".to_string()));
-    assert_eq!(last_message.id, Some(serde_json::Value::Number(serde_json::Number::from(999))));
+    assert_eq!(app.exchanges.len(), initial_count + 1);
+    let last_exchange = app.exchanges.last().unwrap();
+    assert_eq!(last_exchange.method, Some("test_method".to_string()));
+    assert_eq!(last_exchange.id, Some(serde_json::Value::Number(serde_json::Number::from(999))));
+    assert!(last_exchange.request.is_some());
+    assert!(last_exchange.response.is_none());
 }
 
 #[test]
 fn test_navigation() {
     let mut app = App::new();
     
-    // Add some test messages first
+    // Add some test request messages first
     for i in 0..3 {
         let test_message = JsonRpcMessage {
             id: Some(serde_json::Value::Number(serde_json::Number::from(i))),
@@ -58,33 +60,33 @@ fn test_navigation() {
         app.add_message(test_message);
     }
     
-    let message_count = app.messages.len();
+    let exchange_count = app.exchanges.len();
     
     // Test selecting next
     app.select_next();
-    assert_eq!(app.selected_message, 1);
+    assert_eq!(app.selected_exchange, 1);
     
     // Test wrapping around at end
-    app.selected_message = message_count - 1;
+    app.selected_exchange = exchange_count - 1;
     app.select_next();
-    assert_eq!(app.selected_message, 0);
+    assert_eq!(app.selected_exchange, 0);
     
     // Test selecting previous
-    app.selected_message = 1;
+    app.selected_exchange = 1;
     app.select_previous();
-    assert_eq!(app.selected_message, 0);
+    assert_eq!(app.selected_exchange, 0);
     
     // Test wrapping around at beginning
     app.select_previous();
-    assert_eq!(app.selected_message, message_count - 1);
+    assert_eq!(app.selected_exchange, exchange_count - 1);
 }
 
 #[test]
-fn test_get_selected_message() {
+fn test_get_selected_exchange() {
     let mut app = App::new();
     
     // Test with empty app
-    assert!(app.get_selected_message().is_none());
+    assert!(app.get_selected_exchange().is_none());
     
     // Add a message and test selection
     let test_message = JsonRpcMessage {
@@ -100,7 +102,7 @@ fn test_get_selected_message() {
     };
     app.add_message(test_message);
     
-    let selected = app.get_selected_message();
+    let selected = app.get_selected_exchange();
     assert!(selected.is_some());
     assert_eq!(selected.unwrap().method, Some("test_method".to_string()));
 }
@@ -109,15 +111,15 @@ fn test_get_selected_message() {
 fn test_toggle_proxy() {
     let mut app = App::new();
     
-    assert!(!app.is_running);
-    app.toggle_proxy();
     assert!(app.is_running);
     app.toggle_proxy();
     assert!(!app.is_running);
+    app.toggle_proxy();
+    assert!(app.is_running);
 }
 
 #[test]
-fn test_message_types() {
+fn test_request_response_pairing() {
     let mut app = App::new();
     
     // Test HTTP request message
@@ -138,7 +140,7 @@ fn test_message_types() {
     };
     app.add_message(http_request);
     
-    // Test HTTP response message
+    // Test HTTP response message with matching ID
     let http_response = JsonRpcMessage {
         id: Some(serde_json::Value::Number(serde_json::Number::from(1))),
         method: None,
@@ -170,9 +172,9 @@ fn test_message_types() {
     };
     app.add_message(ws_request);
     
-    // Test error response message
+    // Test error response message with matching ID
     let error_response = JsonRpcMessage {
-        id: Some(serde_json::Value::Number(serde_json::Number::from(2))),
+        id: Some(serde_json::Value::String("ws-123".to_string())),
         method: None,
         params: None,
         result: None,
@@ -182,51 +184,38 @@ fn test_message_types() {
         })),
         timestamp: std::time::SystemTime::now(),
         direction: MessageDirection::Response,
-        transport: TransportType::Http,
+        transport: TransportType::WebSocket,
         headers: None,
     };
     app.add_message(error_response);
     
-    // Verify we have all 4 messages
-    assert_eq!(app.messages.len(), 4);
+    // Verify we have 2 exchanges (request-response pairs)
+    assert_eq!(app.exchanges.len(), 2);
     
-    // Check first message is HTTP request
-    let first_msg = &app.messages[0];
-    assert!(matches!(first_msg.direction, MessageDirection::Request));
-    assert!(matches!(first_msg.transport, TransportType::Http));
-    assert_eq!(first_msg.method, Some("eth_getBalance".to_string()));
-    assert!(first_msg.headers.is_some());
+    // Check first exchange is HTTP request-response pair
+    let first_exchange = &app.exchanges[0];
+    assert!(first_exchange.request.is_some());
+    assert!(first_exchange.response.is_some());
+    assert_eq!(first_exchange.method, Some("eth_getBalance".to_string()));
+    assert!(matches!(first_exchange.transport, TransportType::Http));
     
-    // Check second message is HTTP response
-    let second_msg = &app.messages[1];
-    assert!(matches!(second_msg.direction, MessageDirection::Response));
-    assert!(matches!(second_msg.transport, TransportType::Http));
-    assert!(second_msg.result.is_some());
+    // Check second exchange is WebSocket request-response pair
+    let second_exchange = &app.exchanges[1];
+    assert!(second_exchange.request.is_some());
+    assert!(second_exchange.response.is_some());
+    assert_eq!(second_exchange.method, Some("eth_subscribe".to_string()));
+    assert!(matches!(second_exchange.transport, TransportType::WebSocket));
     
-    // Check third message is WebSocket request
-    let third_msg = &app.messages[2];
-    assert!(matches!(third_msg.direction, MessageDirection::Request));
-    assert!(matches!(third_msg.transport, TransportType::WebSocket));
-    assert_eq!(third_msg.method, Some("eth_subscribe".to_string()));
-    assert!(third_msg.headers.is_none()); // WebSocket shouldn't have headers
-    
-    // Check fourth message is error response
-    let fourth_msg = &app.messages[3];
-    assert!(matches!(fourth_msg.direction, MessageDirection::Response));
-    assert!(fourth_msg.error.is_some());
-    assert!(fourth_msg.result.is_none());
+    // Verify the response has error
+    let ws_response = second_exchange.response.as_ref().unwrap();
+    assert!(ws_response.error.is_some());
+    assert!(ws_response.result.is_none());
 }
 
 #[test]
 fn test_json_rpc_message_creation() {
-    let headers = {
-        let mut h = HashMap::new();
-        h.insert("Content-Type".to_string(), "application/json".to_string());
-        h
-    };
-    
     let message = JsonRpcMessage {
-        id: Some(serde_json::Value::String("test-id".to_string())),
+        id: Some(serde_json::Value::Number(serde_json::Number::from(42))),
         method: Some("test_method".to_string()),
         params: Some(serde_json::json!({"param1": "value1"})),
         result: None,
@@ -234,11 +223,11 @@ fn test_json_rpc_message_creation() {
         timestamp: std::time::SystemTime::now(),
         direction: MessageDirection::Request,
         transport: TransportType::Http,
-        headers: Some(headers),
+        headers: None,
     };
     
+    assert_eq!(message.id, Some(serde_json::Value::Number(serde_json::Number::from(42))));
     assert_eq!(message.method, Some("test_method".to_string()));
-    assert!(message.headers.is_some());
     assert!(matches!(message.direction, MessageDirection::Request));
     assert!(matches!(message.transport, TransportType::Http));
 }
@@ -247,11 +236,11 @@ fn test_json_rpc_message_creation() {
 fn test_proxy_config() {
     let config = ProxyConfig {
         listen_port: 9090,
-        target_url: "ws://localhost:8545".to_string(),
-        transport: TransportType::WebSocket,
+        target_url: "https://example.com".to_string(),
+        transport: TransportType::Http,
     };
     
     assert_eq!(config.listen_port, 9090);
-    assert_eq!(config.target_url, "ws://localhost:8545");
-    assert!(matches!(config.transport, TransportType::WebSocket));
+    assert_eq!(config.target_url, "https://example.com");
+    assert!(matches!(config.transport, TransportType::Http));
 } 

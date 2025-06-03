@@ -9,14 +9,14 @@ async fn test_proxy_server_creation() {
     
     let proxy = ProxyServer::new(
         8080,
-        "https://eth-mainnet.g.alchemy.com/v2/demo".to_string(),
+        "https://mock.open-rpc.org".to_string(),
         sender,
     );
     
     // Just test that we can create the proxy server
     // We can't easily test the actual server functionality without setting up a real target
     assert_eq!(proxy.listen_port(), 8080);
-    assert_eq!(proxy.target_url(), "https://eth-mainnet.g.alchemy.com/v2/demo");
+    assert_eq!(proxy.target_url(), "https://mock.open-rpc.org");
 }
 
 #[test]
@@ -48,10 +48,13 @@ fn test_message_channel_integration() {
     // Check for new messages
     app.check_for_new_messages();
     
-    // Should have the original sample messages plus our new one
-    let last_message = app.messages.last().unwrap();
-    assert_eq!(last_message.method, Some("test_method".to_string()));
-    assert_eq!(last_message.id, Some(serde_json::Value::Number(serde_json::Number::from(123))));
+    // Should have one exchange with our request
+    assert_eq!(app.exchanges.len(), 1);
+    let last_exchange = app.exchanges.last().unwrap();
+    assert_eq!(last_exchange.method, Some("test_method".to_string()));
+    assert_eq!(last_exchange.id, Some(serde_json::Value::Number(serde_json::Number::from(123))));
+    assert!(last_exchange.request.is_some());
+    assert!(last_exchange.response.is_none()); // No response yet
 }
 
 #[test]
@@ -61,9 +64,9 @@ fn test_app_with_receiver() {
     let app = App::new_with_receiver(receiver);
     
     // Should start empty
-    assert!(app.messages.is_empty());
-    assert_eq!(app.selected_message, 0);
-    assert!(!app.is_running);
+    assert!(app.exchanges.is_empty());
+    assert_eq!(app.selected_exchange, 0);
+    assert!(app.is_running);
     assert!(app.message_receiver.is_some());
 }
 
@@ -72,9 +75,9 @@ fn test_multiple_message_handling() {
     let (sender, receiver) = mpsc::unbounded_channel();
     let mut app = App::new_with_receiver(receiver);
     
-    let initial_count = app.messages.len();
+    let initial_count = app.exchanges.len();
     
-    // Send multiple messages
+    // Send multiple request messages
     for i in 1..=5 {
         let message = JsonRpcMessage {
             id: Some(serde_json::Value::Number(serde_json::Number::from(i))),
@@ -93,11 +96,13 @@ fn test_multiple_message_handling() {
     // Check for new messages
     app.check_for_new_messages();
     
-    // Should have all the new messages
-    assert_eq!(app.messages.len(), initial_count + 5);
+    // Should have all the new exchanges (one per request)
+    assert_eq!(app.exchanges.len(), initial_count + 5);
     
-    // Check the last message
-    let last_message = app.messages.last().unwrap();
-    assert_eq!(last_message.method, Some("method_5".to_string()));
-    assert_eq!(last_message.id, Some(serde_json::Value::Number(serde_json::Number::from(5))));
+    // Check the last exchange
+    let last_exchange = app.exchanges.last().unwrap();
+    assert_eq!(last_exchange.method, Some("method_5".to_string()));
+    assert_eq!(last_exchange.id, Some(serde_json::Value::Number(serde_json::Number::from(5))));
+    assert!(last_exchange.request.is_some());
+    assert!(last_exchange.response.is_none()); // No responses yet
 } 

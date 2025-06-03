@@ -2,9 +2,9 @@ use jsonrpc_proxy_tui::app::*;
 use std::collections::HashMap;
 
 #[test]
-fn test_full_message_flow() {
+fn test_full_exchange_flow() {
     let mut app = App::new();
-    let initial_count = app.messages.len();
+    let initial_count = app.exchanges.len();
     
     // Add a request message
     let request = JsonRpcMessage {
@@ -45,33 +45,38 @@ fn test_full_message_flow() {
     
     app.add_message(response);
     
-    assert_eq!(app.messages.len(), initial_count + 2);
+    // Should have 1 exchange (request-response pair)
+    assert_eq!(app.exchanges.len(), initial_count + 1);
     
-    // Navigate to the new messages
-    let request_idx = app.messages.len() - 2;
-    let response_idx = app.messages.len() - 1;
+    // Navigate to the exchange
+    app.selected_exchange = app.exchanges.len() - 1;
+    let selected_exchange = app.get_selected_exchange().unwrap();
     
-    app.selected_message = request_idx;
-    let selected_request = app.get_selected_message().unwrap();
-    assert_eq!(selected_request.method, Some("eth_blockNumber".to_string()));
-    assert!(matches!(selected_request.direction, MessageDirection::Request));
-    let request_id = selected_request.id.clone();
+    // Verify the exchange has both request and response
+    assert!(selected_exchange.request.is_some());
+    assert!(selected_exchange.response.is_some());
+    assert_eq!(selected_exchange.method, Some("eth_blockNumber".to_string()));
     
-    app.selected_message = response_idx;
-    let selected_response = app.get_selected_message().unwrap();
-    assert!(selected_response.result.is_some());
-    assert!(matches!(selected_response.direction, MessageDirection::Response));
+    // Verify request details
+    let request_msg = selected_exchange.request.as_ref().unwrap();
+    assert_eq!(request_msg.method, Some("eth_blockNumber".to_string()));
+    assert!(matches!(request_msg.direction, MessageDirection::Request));
+    
+    // Verify response details
+    let response_msg = selected_exchange.response.as_ref().unwrap();
+    assert!(response_msg.result.is_some());
+    assert!(matches!(response_msg.direction, MessageDirection::Response));
     
     // Both should have the same ID
-    assert_eq!(request_id, selected_response.id);
+    assert_eq!(request_msg.id, response_msg.id);
 }
 
 #[test]
-fn test_websocket_vs_http_messages() {
+fn test_websocket_vs_http_exchanges() {
     let mut app = App::new();
     
-    // Add HTTP message
-    let http_msg = JsonRpcMessage {
+    // Add HTTP request
+    let http_request = JsonRpcMessage {
         id: Some(serde_json::Value::Number(serde_json::Number::from(1))),
         method: Some("eth_getBalance".to_string()),
         params: Some(serde_json::json!(["0x123", "latest"])),
@@ -87,8 +92,8 @@ fn test_websocket_vs_http_messages() {
         }),
     };
     
-    // Add WebSocket message
-    let ws_msg = JsonRpcMessage {
+    // Add WebSocket request
+    let ws_request = JsonRpcMessage {
         id: Some(serde_json::Value::String("ws-456".to_string())),
         method: Some("eth_subscribe".to_string()),
         params: Some(serde_json::json!(["newHeads"])),
@@ -100,27 +105,45 @@ fn test_websocket_vs_http_messages() {
         headers: None, // WebSocket messages shouldn't have HTTP headers
     };
     
-    app.add_message(http_msg);
-    app.add_message(ws_msg);
+    app.add_message(http_request);
+    app.add_message(ws_request);
     
-    let http_message = &app.messages[app.messages.len() - 2];
-    let ws_message = &app.messages[app.messages.len() - 1];
+    // Should have 2 exchanges
+    assert_eq!(app.exchanges.len(), 2);
     
-    // HTTP message should have headers
-    assert!(http_message.headers.is_some());
-    assert!(matches!(http_message.transport, TransportType::Http));
+    let http_exchange = &app.exchanges[0];
+    let ws_exchange = &app.exchanges[1];
     
-    // WebSocket message should not have headers
-    assert!(ws_message.headers.is_none());
-    assert!(matches!(ws_message.transport, TransportType::WebSocket));
+    // HTTP exchange should have headers in request
+    assert!(http_exchange.request.as_ref().unwrap().headers.is_some());
+    assert!(matches!(http_exchange.transport, TransportType::Http));
+    
+    // WebSocket exchange should not have headers
+    assert!(ws_exchange.request.as_ref().unwrap().headers.is_none());
+    assert!(matches!(ws_exchange.transport, TransportType::WebSocket));
 }
 
 #[test]
 fn test_error_handling() {
     let mut app = App::new();
     
+    // Add a request first
+    let request = JsonRpcMessage {
+        id: Some(serde_json::Value::Number(serde_json::Number::from(999))),
+        method: Some("invalid_method".to_string()),
+        params: None,
+        result: None,
+        error: None,
+        timestamp: std::time::SystemTime::now(),
+        direction: MessageDirection::Request,
+        transport: TransportType::Http,
+        headers: None,
+    };
+    
+    app.add_message(request);
+    
     // Add an error response
-    let error_msg = JsonRpcMessage {
+    let error_response = JsonRpcMessage {
         id: Some(serde_json::Value::Number(serde_json::Number::from(999))),
         method: None,
         params: None,
@@ -136,15 +159,22 @@ fn test_error_handling() {
         headers: None,
     };
     
-    app.add_message(error_msg);
+    app.add_message(error_response);
     
-    let error_message = app.messages.last().unwrap();
-    assert!(error_message.error.is_some());
-    assert!(error_message.result.is_none());
-    assert!(error_message.method.is_none());
+    // Should have 1 exchange with error response
+    assert_eq!(app.exchanges.len(), 1);
+    let exchange = app.exchanges.last().unwrap();
+    
+    assert!(exchange.request.is_some());
+    assert!(exchange.response.is_some());
+    
+    let error_response = exchange.response.as_ref().unwrap();
+    assert!(error_response.error.is_some());
+    assert!(error_response.result.is_none());
+    assert!(error_response.method.is_none());
     
     // Check error structure
-    let error = error_message.error.as_ref().unwrap();
+    let error = error_response.error.as_ref().unwrap();
     assert_eq!(error["code"], -32601);
     assert_eq!(error["message"], "Method not found");
 }
@@ -153,10 +183,14 @@ fn test_error_handling() {
 fn test_proxy_state_management() {
     let mut app = App::new();
     
-    // Initially stopped
+    // Initially running (changed from original)
+    assert!(app.is_running);
+    
+    // Stop proxy
+    app.toggle_proxy();
     assert!(!app.is_running);
     
-    // Start proxy
+    // Start proxy again
     app.toggle_proxy();
     assert!(app.is_running);
     
@@ -182,6 +216,6 @@ fn test_proxy_state_management() {
     app.toggle_proxy();
     assert!(!app.is_running);
     
-    // Messages should still be there
-    assert!(!app.messages.is_empty());
+    // Exchanges should still be there
+    assert!(!app.exchanges.is_empty());
 } 
