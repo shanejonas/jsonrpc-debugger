@@ -301,8 +301,6 @@ impl App {
         }
     }
 
-
-
     // Enhanced details scrolling with vim-style page jumps
     pub fn page_down_details(&mut self, visible_lines: usize) {
         let page_size = visible_lines / 2; // Half page
@@ -455,8 +453,6 @@ impl App {
         };
     }
 
-
-
     pub fn select_next_pending(&mut self) {
         if !self.pending_requests.is_empty() {
             self.selected_pending = (self.selected_pending + 1) % self.pending_requests.len();
@@ -564,8 +560,6 @@ impl App {
 
         Ok(())
     }
-
-
 
     pub fn get_pending_request_headers(&self) -> Option<String> {
         if let Some(pending) = self.get_selected_pending() {

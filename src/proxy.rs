@@ -46,8 +46,6 @@ impl ProxyServer {
         self
     }
 
-
-
     pub async fn start(&self) -> Result<()> {
         let target_url = self.target_url.clone();
         let client = self.client.clone();
