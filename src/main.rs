@@ -1,0 +1,515 @@
+use anyhow::Result;
+use clap::Parser;
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    Terminal,
+};
+use std::io;
+use std::io::Write;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use tempfile::NamedTempFile;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+mod app;
+mod ui;
+mod proxy;
+
+use app::{App, AppMode};
+use proxy::{ProxyServer, ProxyState};
+
+#[derive(Parser)]
+#[command(name = "jsonrpc-proxy-tui")]
+#[command(about = "A JSON-RPC proxy TUI for intercepting and inspecting requests")]
+struct Cli {
+    /// Port to listen on for incoming requests
+    #[arg(short, long, default_value = "8080")]
+    port: u16,
+    
+    /// Target URL to proxy requests to
+    #[arg(short, long, default_value = "https://mock.open-rpc.org")]
+    target: String,
+}
+
+// Function to launch external editor
+fn launch_external_editor(content: &str) -> Result<String> {
+    // Create a temporary file
+    let mut temp_file = NamedTempFile::new()?;
+    temp_file.write_all(content.as_bytes())?;
+    let temp_path = temp_file.path().to_string_lossy().to_string();
+
+    // Get the editor from environment, fallback to vim, then nano
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| {
+            if Command::new("vim").arg("--version").output().is_ok() {
+                "vim".to_string()
+            } else if Command::new("nano").arg("--version").output().is_ok() {
+                "nano".to_string()
+            } else {
+                "vi".to_string() // Last resort
+            }
+        });
+
+    // Launch the editor
+    let status = Command::new(&editor)
+        .arg(&temp_path)
+        .status()?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!("Editor exited with non-zero status"));
+    }
+
+    // Read the modified content
+    let modified_content = std::fs::read_to_string(&temp_path)?;
+    
+    Ok(modified_content)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Parse command line arguments
+    let cli = Cli::parse();
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create message channel for proxy communication
+    let (message_sender, message_receiver) = mpsc::unbounded_channel();
+
+    // Create pending request channel for pause/intercept functionality
+    let (pending_sender, pending_receiver) = mpsc::unbounded_channel();
+
+    // Create decision channel for sending decisions back to proxy
+    let (decision_sender, decision_receiver) = mpsc::unbounded_channel();
+
+    // Create shared state for pause/intercept
+    let shared_app_mode = Arc::new(Mutex::new(AppMode::Normal));
+    let proxy_state = ProxyState {
+        app_mode: shared_app_mode.clone(),
+        pending_sender,
+        decision_receiver: Arc::new(Mutex::new(decision_receiver)),
+    };
+
+    // Create app with receiver and decision sender, using CLI arguments
+    let mut app = App::new_with_receiver(message_receiver);
+    app.decision_sender = Some(decision_sender);
+    
+    // Override default config with CLI arguments
+    app.proxy_config.listen_port = cli.port;
+    app.proxy_config.target_url = cli.target;
+    
+    // Start the proxy server immediately since app.is_running is true by default
+    let initial_server = ProxyServer::new(
+        app.proxy_config.listen_port,
+        app.proxy_config.target_url.clone(),
+        message_sender.clone(),
+    ).with_state(proxy_state.clone());
+    let initial_proxy_handle = tokio::spawn(async move {
+        if let Err(_e) = initial_server.start().await {
+            // Silent error handling
+        }
+    });
+    
+    let res = run_app(&mut terminal, app, message_sender, shared_app_mode, pending_receiver, proxy_state, Some(initial_proxy_handle)).await;
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    if let Err(err) = res {
+        println!("{err:?}");
+    }
+
+    Ok(())
+}
+
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, 
+    mut app: App,
+    message_sender: mpsc::UnboundedSender<app::JsonRpcMessage>,
+    shared_app_mode: Arc<Mutex<AppMode>>,
+    mut pending_receiver: mpsc::UnboundedReceiver<app::PendingRequest>,
+    proxy_state: ProxyState,
+    initial_proxy_handle: Option<JoinHandle<()>>,
+) -> Result<()> {
+    let mut proxy_server: Option<JoinHandle<()>> = initial_proxy_handle;
+
+    loop {
+        // Check for new messages from proxy
+        app.check_for_new_messages();
+
+        // Sync app mode with shared state
+        if let Ok(mut shared_mode) = shared_app_mode.try_lock() {
+            *shared_mode = app.app_mode.clone();
+        }
+
+        // Check for new pending requests
+        while let Ok(pending_request) = pending_receiver.try_recv() {
+            app.pending_requests.push(pending_request);
+        }
+
+        // Force a redraw to ensure clean rendering
+        terminal.draw(|f| ui::draw(f, &app))?;
+
+        // Use timeout to avoid blocking indefinitely
+        if let Ok(has_event) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            async { event::poll(std::time::Duration::from_millis(0)) }
+        ).await {
+            if has_event? {
+                if let Event::Key(key) = event::read()? {
+                    // Handle input modes first
+                    match app.input_mode {
+                        app::InputMode::EditingTarget => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    app.confirm_target_edit();
+                                    // If proxy is running, restart it with new target
+                                    if app.is_running {
+                                                                            if let Some(handle) = proxy_server.take() {
+                                        handle.abort();
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    }
+                                    let server = ProxyServer::new(
+                                        app.proxy_config.listen_port,
+                                        app.proxy_config.target_url.clone(),
+                                        message_sender.clone(),
+                                    ).with_state(proxy_state.clone());
+                                        proxy_server = Some(tokio::spawn(async move {
+                                            if let Err(_e) = server.start().await {
+                                                // Silent error handling
+                                            }
+                                        }));
+                                    }
+                                    terminal.clear()?;
+                                }
+                                KeyCode::Esc => {
+                                    app.cancel_editing();
+                                }
+                                KeyCode::Backspace => {
+                                    app.handle_backspace();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.handle_input_char(c);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        app::InputMode::Normal => {
+                            // Continue to normal key handling below
+                        }
+                    }
+
+                    // Normal mode key handling
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            // Clean shutdown
+                            if let Some(handle) = proxy_server.take() {
+                                handle.abort();
+                                // Give it a moment to clean up
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            return Ok(());
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            // Clean shutdown
+                            if let Some(handle) = proxy_server.take() {
+                                handle.abort();
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            return Ok(());
+                        }
+                        KeyCode::Up => {
+                            match app.app_mode {
+                                app::AppMode::Normal => app.select_previous(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => app.select_previous_pending(),
+                            }
+                        }
+                        KeyCode::Down => {
+                            match app.app_mode {
+                                app::AppMode::Normal => app.select_next(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => app.select_next_pending(),
+                            }
+                        }
+                        KeyCode::Char('k') => app.scroll_details_up(),
+                        KeyCode::Char('j') => {
+                            // Calculate proper max lines for scrolling
+                            if let Some(_) = app.get_selected_exchange() {
+                                let max_lines = app.get_details_content_lines();
+                                app.scroll_details_down(max_lines, 20); // 20 is rough visible lines estimate
+                            }
+                        }
+                        // Vim-style page navigation for details
+                        KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            // Ctrl+d - page down in details
+                            app.page_down_details(20); // 20 is rough visible lines estimate
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            // Ctrl+u - page up in details
+                            app.page_up_details();
+                        }
+                        KeyCode::Char('d') => {
+                            // d - page down in details (vim style)
+                            app.page_down_details(20);
+                        }
+                        KeyCode::Char('u') => {
+                            // u - page up in details (vim style)
+                            app.page_up_details();
+                        }
+                        KeyCode::Char('G') => {
+                            // G - go to bottom of details
+                            let max_lines = app.get_details_content_lines();
+                            app.goto_bottom_details(max_lines, 20);
+                        }
+                        KeyCode::Char('g') => {
+                            // Handle 'gg' sequence for going to top
+                            // For now, just go to top on single 'g'
+                            app.goto_top_details();
+                        }
+                        KeyCode::Char('t') => {
+                            // Edit target URL
+                            app.start_editing_target();
+                        }
+                        KeyCode::Char('n') if key.modifiers.contains(event::KeyModifiers::CONTROL) => app.select_next(),
+                        KeyCode::Char('p') if key.modifiers.contains(event::KeyModifiers::CONTROL) => app.select_previous(),
+                        KeyCode::Char('s') => {
+                            if app.is_running {
+                                // Stop proxy server first
+                                if let Some(handle) = proxy_server.take() {
+                                    handle.abort();
+                                    // Wait a bit for cleanup
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                                app.toggle_proxy();
+                            } else {
+                                // Start proxy server
+                                app.toggle_proxy();
+                                let server = ProxyServer::new(
+                                    app.proxy_config.listen_port,
+                                    app.proxy_config.target_url.clone(),
+                                    message_sender.clone(),
+                                ).with_state(proxy_state.clone());
+                                proxy_server = Some(tokio::spawn(async move {
+                                    if let Err(e) = server.start().await {
+                                        eprintln!("Proxy server error: {}", e);
+                                    }
+                                }));
+                            }
+                            
+                            // Clear and force a redraw after state change
+                            terminal.clear()?;
+                            terminal.draw(|f| ui::draw(f, &app))?;
+                        }
+                        // Pause/Intercept key bindings
+                        KeyCode::Char('p') => {
+                            app.toggle_pause_mode();
+                            terminal.clear()?;
+                        }
+                        KeyCode::Char('a') => {
+                            // Allow selected pending request
+                            app.allow_selected_request();
+                        }
+                        KeyCode::Char('e') => {
+                            // Edit selected pending request with external editor
+                            if let Some(json_content) = app.get_pending_request_json() {
+                                // Temporarily exit TUI mode
+                                disable_raw_mode()?;
+                                execute!(
+                                    terminal.backend_mut(),
+                                    LeaveAlternateScreen,
+                                    DisableMouseCapture
+                                )?;
+                                
+                                // Launch external editor
+                                                                    match launch_external_editor(&json_content) {
+                                    Ok(edited_content) => {
+                                        // Apply the edited JSON
+                                        if let Err(e) = app.apply_edited_json(edited_content) {
+                                            println!("Error applying edited JSON: {}", e);
+                                            println!("Press Enter to continue...");
+                                            let _ = std::io::stdin().read_line(&mut String::new());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("Error launching editor: {}", e);
+                                        println!("Press Enter to continue...");
+                                        let _ = std::io::stdin().read_line(&mut String::new());
+                                    }
+                                }
+                                
+                                // Re-enter TUI mode
+                                enable_raw_mode()?;
+                                execute!(
+                                    terminal.backend_mut(),
+                                    EnterAlternateScreen,
+                                    EnableMouseCapture
+                                )?;
+                                terminal.clear()?;
+                            }
+                        }
+                        KeyCode::Char('h') => {
+                            // Edit selected pending request headers with external editor
+                            if let Some(headers_content) = app.get_pending_request_headers() {
+                                // Temporarily exit TUI mode
+                                disable_raw_mode()?;
+                                execute!(
+                                    terminal.backend_mut(),
+                                    LeaveAlternateScreen,
+                                    DisableMouseCapture
+                                )?;
+                                
+                                // Launch external editor for headers
+                                match launch_external_editor(&headers_content) {
+                                    Ok(edited_content) => {
+                                        // Apply the edited headers
+                                        if let Err(e) = app.apply_edited_headers(edited_content) {
+                                            println!("Error applying edited headers: {}", e);
+                                            println!("Press Enter to continue...");
+                                            let _ = std::io::stdin().read_line(&mut String::new());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("Error launching editor: {}", e);
+                                        println!("Press Enter to continue...");
+                                        let _ = std::io::stdin().read_line(&mut String::new());
+                                    }
+                                }
+                                
+                                // Re-enter TUI mode
+                                enable_raw_mode()?;
+                                execute!(
+                                    terminal.backend_mut(),
+                                    EnterAlternateScreen,
+                                    EnableMouseCapture
+                                )?;
+                                terminal.clear()?;
+                            }
+                        }
+                        KeyCode::Char('c') => {
+                            // Check if we have a selected pending request
+                            if app.app_mode == AppMode::Intercepting && !app.pending_requests.is_empty() {
+                                // Complete selected pending request with custom response
+                                if let Some(response_template) = app.get_pending_response_template() {
+                                    // Temporarily exit TUI mode
+                                    disable_raw_mode()?;
+                                    execute!(
+                                        terminal.backend_mut(),
+                                        LeaveAlternateScreen,
+                                        DisableMouseCapture
+                                    )?;
+                                    
+                                    // Launch external editor for response
+                                    match launch_external_editor(&response_template) {
+                                        Ok(edited_content) => {
+                                            // Complete the request with the custom response
+                                            if let Err(e) = app.complete_selected_request(edited_content) {
+                                                println!("Error completing request: {}", e);
+                                                println!("Press Enter to continue...");
+                                                let _ = std::io::stdin().read_line(&mut String::new());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("Error launching editor: {}", e);
+                                            println!("Press Enter to continue...");
+                                            let _ = std::io::stdin().read_line(&mut String::new());
+                                        }
+                                    }
+                                    
+                                    // Re-enter TUI mode
+                                    enable_raw_mode()?;
+                                    execute!(
+                                        terminal.backend_mut(),
+                                        EnterAlternateScreen,
+                                        EnableMouseCapture
+                                    )?;
+                                    terminal.clear()?;
+                                }
+                            } else {
+                                // Create new request
+                                let new_request_template = r#"{
+  "jsonrpc": "2.0",
+  "method": "your_method",
+  "params": [],
+  "id": 1
+}"#;
+                                
+                                // Temporarily exit TUI mode
+                                disable_raw_mode()?;
+                                execute!(
+                                    terminal.backend_mut(),
+                                    LeaveAlternateScreen,
+                                    DisableMouseCapture
+                                )?;
+                                
+                                // Launch external editor for new request
+                                match launch_external_editor(new_request_template) {
+                                    Ok(edited_content) => {
+                                        // Send the new request
+                                        if let Err(e) = app.send_new_request(edited_content).await {
+                                            println!("Error sending request: {}", e);
+                                            println!("Press Enter to continue...");
+                                            let _ = std::io::stdin().read_line(&mut String::new());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("Error launching editor: {}", e);
+                                        println!("Press Enter to continue...");
+                                        let _ = std::io::stdin().read_line(&mut String::new());
+                                    }
+                                }
+                                
+                                // Re-enter TUI mode
+                                enable_raw_mode()?;
+                                execute!(
+                                    terminal.backend_mut(),
+                                    EnterAlternateScreen,
+                                    EnableMouseCapture
+                                )?;
+                                terminal.clear()?;
+                            }
+                        }
+                        KeyCode::Char('b') => {
+                            // Block selected pending request
+                            app.block_selected_request();
+                        }
+                        KeyCode::Char('r') => {
+                            // Resume all pending requests
+                            app.resume_all_requests();
+                            terminal.clear()?;
+                        }
+
+                        _ => {}
+                    }
+                }
+            }
+        }
+        
+        // Check if proxy server has died unexpectedly
+        if let Some(handle) = &proxy_server {
+            if handle.is_finished() {
+                proxy_server = None;
+                if app.is_running {
+                    app.toggle_proxy(); // Mark as stopped
+                }
+            }
+        }
+    }
+}
