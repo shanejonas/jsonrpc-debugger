@@ -72,7 +72,10 @@ jobs:
         echo "original_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
         
         # Check if this version exists on crates.io
-        if cargo search jsonrpc-debugger | grep -q "jsonrpc-debugger = \"$CURRENT_VERSION\""; then
+        echo "Checking if version $CURRENT_VERSION exists on crates.io..."
+        # Use cargo search and check for exact version match
+        SEARCH_RESULT=$(cargo search jsonrpc-debugger --limit 1 2>/dev/null || echo "")
+        if echo "$SEARCH_RESULT" | grep -q "jsonrpc-debugger.*\"$CURRENT_VERSION\""; then
           echo "Version $CURRENT_VERSION already exists, auto-bumping patch version..."
           
           # Parse version components
