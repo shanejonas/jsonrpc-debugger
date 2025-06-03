@@ -1,16 +1,18 @@
-# JSON-RPC Proxy TUI
+# JSON-RPC Debugger
 
-A terminal-based JSON-RPC proxy with interception capabilities, built with Rust and ratatui. Inspect, modify, and debug JSON-RPC requests and responses in real-time.
+A terminal-based JSON-RPC debugger with interception capabilities, built with Rust and ratatui. Inspect, modify, and debug JSON-RPC requests and responses in real-time.
 
 ## Features
 
-- 🔍 **Real-time monitoring** of JSON-RPC requests and responses
+- 🔍 **Real-time monitoring** of JSON-RPC requests and responses with timing information
 - ⏸️ **Request interception** - pause, inspect, and modify requests before forwarding
-- 🎨 **Syntax highlighting** for JSON content
-- 📊 **HTTP headers display** for debugging
-- ⌨️ **Vim-style navigation** with keyboard shortcuts
+- 🎨 **Syntax highlighting** for JSON content with proper indentation
+- 📊 **HTTP headers display** for debugging transport details
+- ⌨️ **Vim-style navigation** with comprehensive keyboard shortcuts
 - 🎯 **Dynamic configuration** - change target URL and port on the fly
-- 📝 **External editor support** for request modification
+- 📝 **External editor support** for request/response modification
+- 📋 **Table view** with status, transport, method, ID, and duration columns
+- 🔄 **Custom response creation** for intercepted requests
 
 ## Installation
 
@@ -21,18 +23,26 @@ A terminal-based JSON-RPC proxy with interception capabilities, built with Rust 
 ### Build from source
 
 ```bash
-git clone https://github.com/your-username/jsonrpc-proxy-tui.git
-cd jsonrpc-proxy-tui
+git clone https://github.com/your-username/jsonrpc-debugger.git
+cd jsonrpc-debugger
 cargo build --release
+```
+
+### Install locally
+
+```bash
+cargo install --path .
 ```
 
 ## Usage
 
 ### Basic Usage
 
-Start the proxy with default settings (port 8080, target: https://mock.open-rpc.org):
+Start the debugger with default settings (port 8080, no default target):
 
 ```bash
+jsonrpc-debugger
+# or during development:
 cargo run
 ```
 
@@ -40,21 +50,21 @@ cargo run
 
 ```bash
 # Custom port
-cargo run -- --port 9090
+jsonrpc-debugger --port 9090
 
 # Custom target URL
-cargo run -- --target https://your-api.com
+jsonrpc-debugger --target https://your-api.com
 
 # Both custom port and target
-cargo run -- --port 9090 --target https://your-api.com
+jsonrpc-debugger --port 9090 --target https://your-api.com
 
 # Show help
-cargo run -- --help
+jsonrpc-debugger --help
 ```
 
 ### Making Requests
 
-Once the proxy is running, send JSON-RPC requests to the proxy:
+Once the debugger is running, send JSON-RPC requests to the proxy:
 
 ```bash
 curl -X POST http://localhost:8080 \
@@ -68,13 +78,13 @@ The TUI is divided into three main sections:
 
 ```
 ┌Status──────────────────────────────────────────────────────────────────────────────────┐
-│JSON-RPC Proxy TUI | Status: RUNNING | Port: 8080 | Target: https://mock.open-rpc.org   │
+│JSON-RPC Debugger | Status: RUNNING | Port: 8080 | Target: https://api.example.com      │
 └────────────────────────────────────────────────────────────────────────────────────────┘
-┌JSON-RPC Exchanges─────────────────────┐┌Exchange Details───────────────────────────┐
-│→ [HTTP] foo (id: 1) ✓                 ││Transport: Http                            │
-│→ [HTTP] bar (id: 2) ✗                 ││Method: foo                                │
-│→ [HTTP] baz (id: 3) ⏳                ││ID: 1                                      │
-│                                       ││                                           │
+┌JSON-RPC───────────────────────────────┐┌Details────────────────────────────────────┐
+│Status    │Transport│Method     │ID │Dur││Transport: Http                            │
+│✓ Success │HTTP     │eth_call   │1  │45ms││Method: eth_call                           │
+│✗ Error   │HTTP     │eth_send   │2  │12ms││ID: 1                                      │
+│⏳ Pending │HTTP     │eth_block  │3  │-   ││                                           │
 │                                       ││REQUEST:                                   │
 │                                       ││HTTP Headers:                              │
 │                                       ││  content-type: application/json           │
@@ -82,13 +92,13 @@ The TUI is divided into three main sections:
 │                                       ││JSON-RPC Request:                          │
 │                                       ││{                                          │
 │                                       ││  "jsonrpc": "2.0",                        │
-│                                       ││  "method": "foo",                         │
-│                                       ││  "params": [],                            │
+│                                       ││  "method": "eth_call",                    │
+│                                       ││  "params": [...],                         │
 │                                       ││  "id": 1                                  │
 │                                       ││}                                          │
 └───────────────────────────────────────┘└───────────────────────────────────────────┘
 ┌Controls────────────────────────────────────────────────────────────────────────────────┐
-│q quit | ↑↓/^n/^p navigate | j/k/d/u/G/g scroll details | s start/stop | t edit target  │
+│q quit | ↑↓/^n/^p navigate | j/k/d/u/G/g scroll | s start/stop | t target | p pause     │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -101,40 +111,48 @@ The TUI is divided into three main sections:
 ## Keyboard Shortcuts
 
 ### Navigation
-- `↑/↓` or `Ctrl+p/Ctrl+n` - Navigate between exchanges
-- `j/k` - Scroll details panel up/down
-- `d/u` - Page down/up in details
+- `↑/↓` or `Ctrl+p/Ctrl+n` - Navigate between requests
+- `j/k` - Scroll details panel up/down (vim-style)
+- `d/u` or `Ctrl+d/Ctrl+u` - Page down/up in details
 - `G` - Go to bottom of details
 - `g` - Go to top of details
 
 ### Proxy Control
 - `s` - Start/stop the proxy server
 - `t` - Edit target URL
+- `c` - Create new request (normal mode) / Complete request with custom response (intercept mode)
 - `q` - Quit application
 
 ### Interception Mode
 - `p` - Toggle pause mode (intercept new requests)
 - `a` - Allow selected intercepted request
-- `e` - Edit selected request in external editor
+- `e` - Edit selected request body in external editor
+- `h` - Edit selected request headers in external editor
+- `c` - Complete request with custom response
 - `b` - Block selected request
 - `r` - Resume all pending requests
 
 ## Request Interception
 
-The proxy supports Charles Proxy-style request interception:
+The debugger supports Charles Proxy-style request interception:
 
 1. **Enable pause mode**: Press `p` to start intercepting requests
 2. **Make requests**: Send JSON-RPC requests to the proxy
-3. **Inspect**: Intercepted requests appear in the pending list
-4. **Modify**: Press `e` to edit a request in your external editor
+3. **Inspect**: Intercepted requests appear in the pending list with ⏸ icon
+4. **Modify**: 
+   - Press `e` to edit request body in your external editor
+   - Press `h` to edit HTTP headers
+   - Press `c` to create a custom response
 5. **Control**: Press `a` to allow, `b` to block, or `r` to resume all
 
 ### External Editor
 
-The proxy uses your system's default editor for request modification:
+The debugger uses your system's default editor for request modification:
 - Checks `$EDITOR` environment variable
 - Falls back to `$VISUAL`
 - Defaults to `vim`, then `nano`, then `vi`
+
+Modified requests show with a ✏ icon and [MODIFIED] or [BODY]/[HEADERS] labels.
 
 ## Configuration
 
@@ -156,10 +174,11 @@ Use alternative ports like 8080, 9090, 3000, 4000, 8000, or 8888.
 ### Basic Monitoring
 
 ```bash
-# Start proxy
-cargo run -- --port 8080
+# Start debugger
+jsonrpc-debugger --port 8080
 
-# In another terminal, make requests
+# Set target URL in the TUI (press 't')
+# Then make requests in another terminal
 curl -X POST http://localhost:8080 \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
@@ -167,18 +186,25 @@ curl -X POST http://localhost:8080 \
 
 ### Request Interception
 
-1. Start the proxy: `cargo run`
-2. Enable pause mode: Press `p`
-3. Make a request (it will be intercepted)
-4. Edit the request: Press `e`
-5. Allow the modified request: Press `a`
+1. Start the debugger: `jsonrpc-debugger`
+2. Set target URL: Press `t` and enter your target
+3. Enable pause mode: Press `p`
+4. Make a request (it will be intercepted)
+5. Edit the request: Press `e` to modify body or `h` for headers
+6. Allow the modified request: Press `a`
 
-### Custom Target
+### Custom Responses
 
-```bash
-# Proxy requests to your own JSON-RPC server
-cargo run -- --target http://localhost:3000 --port 8080
-```
+1. Enable pause mode and intercept a request
+2. Press `c` to create a custom response
+3. Edit the JSON response in your external editor
+4. The custom response is sent back to the client
+
+### Creating New Requests
+
+1. Press `c` in normal mode
+2. Edit the JSON-RPC request template in your external editor
+3. The request is sent through the proxy to the target
 
 ## Troubleshooting
 
@@ -190,7 +216,7 @@ If you get a "port already in use" error:
 netstat -an | grep :8080
 
 # Use a different port
-cargo run -- --port 9090
+jsonrpc-debugger --port 9090
 ```
 
 ### Connection Refused
@@ -199,6 +225,7 @@ If requests fail with "connection refused":
 - Check that the target URL is correct and reachable
 - Verify the target server is running
 - Test the target directly with curl
+- Make sure you've set a target URL (press `t` in the TUI)
 
 ### Editor Not Found
 
@@ -209,6 +236,15 @@ export EDITOR=code  # VS Code
 export EDITOR=nano  # Nano
 export EDITOR=vim   # Vim
 ```
+
+### JSON Formatting Issues
+
+The debugger displays JSON with:
+- 2-space indentation
+- Syntax highlighting (keys in cyan, strings in green, numbers in blue, etc.)
+- Proper line breaks and formatting
+
+If JSON appears malformed, check that the original request/response is valid JSON.
 
 ## Development
 
@@ -226,6 +262,17 @@ cargo build
 
 # Release build
 cargo build --release
+```
+
+### Project Structure
+
+```
+src/
+├── main.rs          # CLI and main application loop
+├── app.rs           # Application state and logic
+├── ui.rs            # TUI rendering and layout
+├── proxy.rs         # HTTP proxy server implementation
+└── lib.rs           # Library exports for testing
 ```
 
 ## License

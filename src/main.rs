@@ -25,16 +25,16 @@ use app::{App, AppMode};
 use proxy::{ProxyServer, ProxyState};
 
 #[derive(Parser)]
-#[command(name = "jsonrpc-proxy-tui")]
-#[command(about = "A JSON-RPC proxy TUI for intercepting and inspecting requests")]
+#[command(name = "jsonrpc-debugger")]
+#[command(about = "A JSON-RPC debugger TUI for intercepting and inspecting requests")]
 struct Cli {
     /// Port to listen on for incoming requests
     #[arg(short, long, default_value = "8080")]
     port: u16,
     
     /// Target URL to proxy requests to
-    #[arg(short, long, default_value = "https://mock.open-rpc.org")]
-    target: String,
+    #[arg(short, long)]
+    target: Option<String>,
 }
 
 // Function to launch external editor
@@ -107,7 +107,9 @@ async fn main() -> Result<()> {
     
     // Override default config with CLI arguments
     app.proxy_config.listen_port = cli.port;
-    app.proxy_config.target_url = cli.target;
+    if let Some(target) = cli.target {
+        app.proxy_config.target_url = target;
+    }
     
     // Start the proxy server immediately since app.is_running is true by default
     let initial_server = ProxyServer::new(

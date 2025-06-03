@@ -1,5 +1,5 @@
 [package]
-name = "jsonrpc-proxy-tui"
+name = "jsonrpc-debugger"
 version = "0.1.0"
 edition = "2021"
 

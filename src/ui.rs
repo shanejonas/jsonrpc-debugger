@@ -167,7 +167,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     
     let header_text = vec![
         Line::from(vec![
-            Span::raw("JSON-RPC Proxy TUI | Status: "),
+            Span::raw("JSON-RPC Debugger | Status: "),
             Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
             Span::raw(format!(" | Port: {} | Target: {}", 
                 app.proxy_config.listen_port, 
