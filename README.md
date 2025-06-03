@@ -2,6 +2,13 @@
 
 A terminal-based JSON-RPC debugger with interception capabilities, built with Rust and ratatui. Inspect, modify, and debug JSON-RPC requests and responses in real-time.
 
+Demo video of pointing metamask JSON-RPC at the debugger:
+
+https://github.com/user-attachments/assets/20a23f55-e3b8-44b1-9536-fcc1fd6e09dc
+
+
+
+
 ## Features
 
 - 🔍 **Real-time monitoring** of JSON-RPC requests and responses with timing information
