@@ -95,6 +95,10 @@ jobs:
           echo "Version $CURRENT_VERSION is new, will publish as-is"
         fi
     
+    - name: Update Cargo.lock after version bump
+      if: steps.version-check.outputs.version_bumped == 'true'
+      run: cargo update --workspace
+    
     - name: Commit version bump
       if: steps.version-check.outputs.version_bumped == 'true'
       run: |
