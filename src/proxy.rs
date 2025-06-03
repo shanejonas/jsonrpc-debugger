@@ -279,7 +279,7 @@ async fn forward_request(
                 }
             }
 
-            // Get the raw response text first
+            // Get the response text - reqwest should handle decompression automatically
             match response.text().await {
                 Ok(response_text) => {
                     // Try to parse as JSON
@@ -306,13 +306,50 @@ async fn forward_request(
                                 status,
                             )))
                         }
-                        Err(_) => {
-                            // Not valid JSON - could be HTML error page, plain text, etc.
-                            // Don't include the raw response content in the UI - just log the error
+                        Err(parse_error) => {
+                            // Not valid JSON - analyze the response to provide better error info
                             let content_type = response_header_map
                                 .get("content-type")
                                 .unwrap_or(&"unknown".to_string())
                                 .clone();
+
+                            // Check if response contains null bytes (binary data)
+                            let has_null_bytes = response_text.contains('\0');
+                            let is_empty = response_text.trim().is_empty();
+
+                            // Get a safe preview of the response content
+                            let content_preview = if has_null_bytes {
+                                // Show hex representation for binary data
+                                let bytes: Vec<u8> = response_text.bytes().take(50).collect();
+                                format!("Binary data: {:02x?}...", bytes)
+                            } else if response_text.trim().starts_with('{')
+                                || response_text.trim().starts_with('[')
+                            {
+                                // For JSON-like content, show more text
+                                if response_text.len() > 500 {
+                                    format!("{}...", &response_text[..500])
+                                } else {
+                                    response_text.clone()
+                                }
+                            } else if response_text.len() > 200 {
+                                format!("{}...", &response_text[..200])
+                            } else {
+                                response_text.clone()
+                            };
+
+                            // Determine the likely issue
+                            let issue_type = if is_empty {
+                                "empty_response"
+                            } else if has_null_bytes {
+                                "binary_data"
+                            } else if content_type.contains("text/html") {
+                                "html_response"
+                            } else if content_type.contains("application/json") {
+                                "malformed_json"
+                            } else {
+                                "unknown_format"
+                            };
+
                             let error_message = JsonRpcMessage {
                                 id: body.get("id").cloned(),
                                 method: None,
@@ -320,8 +357,16 @@ async fn forward_request(
                                 result: None,
                                 error: Some(serde_json::json!({
                                     "code": -32700,
-                                    "message": format!("Server returned non-JSON response (HTTP {})", status),
-                                    "data": format!("Content-Type: {}", content_type)
+                                    "message": format!("Invalid JSON response from server (HTTP {})", status),
+                                    "data": {
+                                        "issue_type": issue_type,
+                                        "content_type": content_type,
+                                        "response_preview": content_preview,
+                                        "response_length": response_text.len(),
+                                        "has_null_bytes": has_null_bytes,
+                                        "parse_error": parse_error.to_string(),
+                                        "target_url": target_url
+                                    }
                                 })),
                                 timestamp: std::time::SystemTime::now(),
                                 direction: MessageDirection::Response,
@@ -338,8 +383,12 @@ async fn forward_request(
                                     "id": body.get("id"),
                                     "error": {
                                         "code": -32700,
-                                        "message": format!("Server returned non-JSON response (HTTP {})", status),
-                                        "data": format!("Content-Type: {}", content_type)
+                                        "message": format!("Invalid JSON response from server (HTTP {})", status),
+                                        "data": {
+                                            "issue_type": issue_type,
+                                            "content_type": content_type,
+                                            "has_null_bytes": has_null_bytes
+                                        }
                                     }
                                 })),
                                 warp::http::StatusCode::OK, // Return 200 with JSON-RPC error
