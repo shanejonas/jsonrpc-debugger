@@ -312,17 +312,19 @@ async fn forward_request(
                                 .get("content-type")
                                 .unwrap_or(&"unknown".to_string())
                                 .clone();
-                            
+
                             // Check if response contains null bytes (binary data)
                             let has_null_bytes = response_text.contains('\0');
                             let is_empty = response_text.trim().is_empty();
-                            
+
                             // Get a safe preview of the response content
                             let content_preview = if has_null_bytes {
                                 // Show hex representation for binary data
                                 let bytes: Vec<u8> = response_text.bytes().take(50).collect();
                                 format!("Binary data: {:02x?}...", bytes)
-                            } else if response_text.trim().starts_with('{') || response_text.trim().starts_with('[') {
+                            } else if response_text.trim().starts_with('{')
+                                || response_text.trim().starts_with('[')
+                            {
                                 // For JSON-like content, show more text
                                 if response_text.len() > 500 {
                                     format!("{}...", &response_text[..500])
@@ -334,7 +336,7 @@ async fn forward_request(
                             } else {
                                 response_text.clone()
                             };
-                            
+
                             // Determine the likely issue
                             let issue_type = if is_empty {
                                 "empty_response"
@@ -347,7 +349,7 @@ async fn forward_request(
                             } else {
                                 "unknown_format"
                             };
-                            
+
                             let error_message = JsonRpcMessage {
                                 id: body.get("id").cloned(),
                                 method: None,
@@ -467,5 +469,3 @@ fn should_forward_header(header_name: &str) -> bool {
         "host" | "content-length" | "transfer-encoding" | "connection"
     )
 }
-
-
