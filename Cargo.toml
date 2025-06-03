@@ -2,6 +2,20 @@
 name = "jsonrpc-debugger"
 version = "0.1.0"
 edition = "2021"
+authors = ["Shane Jonas <shane@shanejonas.com>"]
+description = "A terminal-based JSON-RPC debugger with interception capabilities"
+license = "MIT"
+repository = "https://github.com/shanejonas/jsonrpc-debugger"
+homepage = "https://github.com/shanejonas/jsonrpc-debugger"
+documentation = "https://docs.rs/jsonrpc-debugger"
+readme = "README.md"
+keywords = ["jsonrpc", "debugger", "proxy", "tui", "terminal"]
+categories = ["command-line-utilities", "development-tools::debugging", "network-programming"]
+exclude = [
+    ".github/*",
+    "*.md",
+    "tests/*",
+]
 
 [dependencies]
 ratatui = "0.26"

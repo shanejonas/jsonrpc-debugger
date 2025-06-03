@@ -20,10 +20,22 @@ A terminal-based JSON-RPC debugger with interception capabilities, built with Ru
 
 - Rust 1.70+ (install from [rustup.rs](https://rustup.rs/))
 
+### Install from crates.io
+
+```bash
+cargo install jsonrpc-debugger
+```
+
+### Install from GitHub
+
+```bash
+cargo install --git https://github.com/shanejonas/jsonrpc-debugger
+```
+
 ### Build from source
 
 ```bash
-git clone https://github.com/your-username/jsonrpc-debugger.git
+git clone https://github.com/shanejonas/jsonrpc-debugger.git
 cd jsonrpc-debugger
 cargo build --release
 ```
@@ -77,29 +89,29 @@ curl -X POST http://localhost:8080 \
 The TUI is divided into three main sections:
 
 ```
-┌Status──────────────────────────────────────────────────────────────────────────────────┐
-│JSON-RPC Debugger | Status: RUNNING | Port: 8080 | Target: https://api.example.com      │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-┌JSON-RPC───────────────────────────────┐┌Details────────────────────────────────────┐
-│Status    │Transport│Method     │ID │Dur││Transport: Http                            │
-│✓ Success │HTTP     │eth_call   │1  │45ms││Method: eth_call                           │
-│✗ Error   │HTTP     │eth_send   │2  │12ms││ID: 1                                      │
-│⏳ Pending │HTTP     │eth_block  │3  │-   ││                                           │
-│                                       ││REQUEST:                                   │
-│                                       ││HTTP Headers:                              │
-│                                       ││  content-type: application/json           │
-│                                       ││                                           │
-│                                       ││JSON-RPC Request:                          │
-│                                       ││{                                          │
-│                                       ││  "jsonrpc": "2.0",                        │
-│                                       ││  "method": "eth_call",                    │
-│                                       ││  "params": [...],                         │
-│                                       ││  "id": 1                                  │
-│                                       ││}                                          │
-└───────────────────────────────────────┘└───────────────────────────────────────────┘
-┌Controls────────────────────────────────────────────────────────────────────────────────┐
-│q quit | ↑↓/^n/^p navigate | j/k/d/u/G/g scroll | s start/stop | t target | p pause     │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+┌─ Status ─────────────────────────────────────────────────────────────────────────────┐
+│ JSON-RPC Debugger | Status: RUNNING | Port: 8080 | Target: https://api.example.com   │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+┌─ JSON-RPC ────────────────────────────┐ ┌─ Details ──────────────────────────────────┐
+│ Status    │Transport│Method    │ID│Dur│ │ Transport: Http                            │
+│ ✓ Success │ HTTP    │ eth_call │1 │45m│ │ Method: eth_call                           │
+│ ✗ Error   │ HTTP    │ eth_send │2 │12m│ │ ID: 1                                      │
+│⏳ Pending │ HTTP    │ eth_block│3 │11m│ │                                            │
+│                                       │ │ REQUEST:                                   │
+│                                       │ │ HTTP Headers:                              │
+│                                       │ │   content-type: application/json           │
+│                                       │ │                                            │
+│                                       │ │ JSON-RPC Request:                          │
+│                                       │ │ {                                          │
+│                                       │ │   "jsonrpc": "2.0",                        │
+│                                       │ │   "method": "eth_call",                    │
+│                                       │ │   "params": [...],                         │
+│                                       │ │   "id": 1                                  │
+│                                       │ │ }                                          │
+└───────────────────────────────────────┘ └────────────────────────────────────────────┘
+┌─ Controls ───────────────────────────────────────────────────────────────────────────┐
+│ q quit | ↑↓/^n/^p navigate | j/k/d/u/G/g scroll | s start/stop | t target | p pause  │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Status Indicators
