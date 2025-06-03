@@ -286,11 +286,7 @@ impl App {
 
     pub fn page_up_intercept_details(&mut self) {
         let page_size = 10; // Half page
-        self.intercept_details_scroll = if self.intercept_details_scroll >= page_size {
-            self.intercept_details_scroll - page_size
-        } else {
-            0
-        };
+        self.intercept_details_scroll = self.intercept_details_scroll.saturating_sub(page_size);
     }
 
     pub fn goto_top_intercept_details(&mut self) {
@@ -311,11 +307,7 @@ impl App {
 
     pub fn page_up_details(&mut self) {
         let page_size = 10; // Half page
-        self.details_scroll = if self.details_scroll >= page_size {
-            self.details_scroll - page_size
-        } else {
-            0
-        };
+        self.details_scroll = self.details_scroll.saturating_sub(page_size);
     }
 
     pub fn goto_top_details(&mut self) {
