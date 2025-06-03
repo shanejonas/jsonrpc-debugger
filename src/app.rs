@@ -21,6 +21,7 @@ pub struct JsonRpcExchange {
     pub method: Option<String>,
     pub request: Option<JsonRpcMessage>,
     pub response: Option<JsonRpcMessage>,
+    #[allow(dead_code)] // Used in UI for duration calculation
     pub timestamp: std::time::SystemTime,
     pub transport: TransportType,
 }
@@ -34,6 +35,7 @@ pub enum MessageDirection {
 #[derive(Debug, Clone)]
 pub enum TransportType {
     Http,
+    #[allow(dead_code)] // Used in tests and UI display
     WebSocket,
 }
 
