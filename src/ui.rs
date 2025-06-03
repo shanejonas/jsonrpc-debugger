@@ -2,49 +2,39 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap, Table, Row, Cell, TableState},
     Frame,
 };
 
 use crate::app::{App, TransportType, InputMode, AppMode};
+use serde::Serialize;
 
-// Helper function to format JSON with syntax highlighting
+// Helper function to format JSON with syntax highlighting and 2-space indentation
 fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'static>> {
-    let json_str = serde_json::to_string_pretty(json_value)
-        .unwrap_or_else(|_| "Failed to format JSON".to_string());
-    
-    // Sanitize the JSON string to prevent UI corruption
-    let sanitized_json = json_str
-        .chars()
-        .filter(|c| c.is_ascii() && (!c.is_control() || *c == '\n' || *c == '\t' || *c == '\r'))
-        .collect::<String>();
+    // Use the standard pretty formatter
+    let json_str = match serde_json::to_string_pretty(json_value) {
+        Ok(s) => s,
+        Err(_) => return vec![Line::from("Failed to format JSON")],
+    };
     
     let mut lines = Vec::new();
     
-    for (line_num, line) in sanitized_json.lines().enumerate() {
+    for (line_num, line) in json_str.lines().enumerate() {
         // Limit total lines to prevent UI issues
         if line_num > 1000 {
             lines.push(Line::from(Span::styled("... (content truncated)", Style::default().fg(Color::Gray))));
             break;
         }
         
+        // Don't trim the line - work with it as-is to preserve indentation
         let mut spans = Vec::new();
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        
-        // Add indentation
-        if indent > 0 {
-            spans.push(Span::raw(" ".repeat(indent)));
-        }
-        
-        // Parse the line for syntax highlighting
-        let mut chars = trimmed.chars().peekable();
+        let mut chars = line.chars().peekable();
         let mut current_token = String::new();
 
-        
         while let Some(ch) = chars.next() {
             match ch {
                 '"' => {
+                    // Flush any accumulated token (including spaces)
                     if !current_token.is_empty() {
                         spans.push(Span::raw(current_token.clone()));
                         current_token.clear();
@@ -101,12 +91,13 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
                     spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
                 }
                 _ => {
+                    // Accumulate all other characters including spaces
                     current_token.push(ch);
                 }
             }
         }
         
-        // Handle any remaining token
+        // Handle any remaining token (including trailing spaces)
         if !current_token.is_empty() {
             let trimmed_token = current_token.trim();
             if trimmed_token == "true" || trimmed_token == "false" {
@@ -116,6 +107,7 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
             } else if trimmed_token.parse::<f64>().is_ok() {
                 spans.push(Span::styled(current_token, Style::default().fg(Color::Blue)));
             } else {
+                // This includes spaces and other whitespace - preserve as-is
                 spans.push(Span::raw(current_token));
             }
         }
@@ -213,7 +205,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         };
         
         let paragraph = Paragraph::new(empty_message.as_str())
-            .block(Block::default().borders(Borders::ALL).title("JSON-RPC Exchanges"))
+            .block(Block::default().borders(Borders::ALL).title("JSON-RPC"))
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: true });
         
@@ -221,7 +213,19 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let exchanges: Vec<ListItem> = app
+    // Create table headers
+    let header = Row::new(vec![
+        Cell::from("Status"),
+        Cell::from("Transport"),
+        Cell::from("Method"),
+        Cell::from("ID"),
+        Cell::from("Duration"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+    .height(1);
+
+    // Create table rows
+    let rows: Vec<Row> = app
         .exchanges
         .iter()
         .enumerate()
@@ -233,20 +237,41 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
 
             let method = exchange.method.as_deref().unwrap_or("unknown");
             let id = exchange.id.as_ref()
-                .map(|v| v.to_string())
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => v.to_string(),
+                })
                 .unwrap_or_else(|| "null".to_string());
 
             // Determine status
             let (status_symbol, status_color) = if exchange.response.is_none() {
-                ("⏳", Color::Yellow) // Pending
+                ("⏳ Pending", Color::Yellow)
             } else if let Some(response) = &exchange.response {
                 if response.error.is_some() {
-                    ("✗", Color::Red) // Error
+                    ("✗ Error", Color::Red)
                 } else {
-                    ("✓", Color::Green) // Success
+                    ("✓ Success", Color::Green)
                 }
             } else {
-                ("?", Color::Gray) // Unknown
+                ("? Unknown", Color::Gray)
+            };
+
+            // Calculate duration if we have both request and response
+            let duration_text = if let (Some(request), Some(response)) = (&exchange.request, &exchange.response) {
+                match response.timestamp.duration_since(request.timestamp) {
+                    Ok(duration) => {
+                        let millis = duration.as_millis();
+                        if millis < 1000 {
+                            format!("{}ms", millis)
+                        } else {
+                            format!("{:.2}s", duration.as_secs_f64())
+                        }
+                    }
+                    Err(_) => "-".to_string(),
+                }
+            } else {
+                "-".to_string()
             };
 
             let style = if i == app.selected_exchange {
@@ -255,21 +280,33 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
-            ListItem::new(Line::from(vec![
-                Span::styled("→ ", Style::default().fg(Color::Yellow)),
-                Span::styled(format!("[{}] ", transport_symbol), Style::default().fg(Color::Blue)),
-                Span::styled(format!("{} ", method), Style::default().fg(Color::Red)),
-                Span::styled(format!("(id: {}) ", id), Style::default().fg(Color::Gray)),
-                Span::styled(status_symbol, Style::default().fg(status_color)),
-            ])).style(style)
+            Row::new(vec![
+                Cell::from(status_symbol).style(Style::default().fg(status_color)),
+                Cell::from(transport_symbol).style(Style::default().fg(Color::Blue)),
+                Cell::from(method).style(Style::default().fg(Color::Red)),
+                Cell::from(id).style(Style::default().fg(Color::Gray)),
+                Cell::from(duration_text).style(Style::default().fg(Color::Magenta)),
+            ])
+            .style(style)
+            .height(1)
         })
         .collect();
 
-    let exchanges_list = List::new(exchanges)
-        .block(Block::default().borders(Borders::ALL).title("JSON-RPC Exchanges"))
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD));
+    let table = Table::new(rows, [
+        Constraint::Length(12), // Status
+        Constraint::Length(9),  // Transport
+        Constraint::Min(15),    // Method (flexible)
+        Constraint::Length(12), // ID
+        Constraint::Length(10), // Duration
+    ])
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title("JSON-RPC"))
+    .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+    .highlight_symbol("→ ");
 
-    f.render_widget(exchanges_list, area);
+    let mut table_state = TableState::default();
+    table_state.select(Some(app.selected_exchange));
+    f.render_stateful_widget(table, area, &mut table_state);
 }
 
 fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
@@ -377,7 +414,7 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
 
         lines
     } else {
-        vec![Line::from("No exchange selected")]
+        vec![Line::from("No request selected")]
     };
 
     // Calculate visible area for scrolling
@@ -397,14 +434,14 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
     // Create title with scroll indicator
     let scroll_info = if total_lines > visible_lines {
         let progress = ((app.details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
-        format!("Exchange Details ({}% - vim: j/k/d/u/G/g)", progress)
+        format!("Details ({}% - vim: j/k/d/u/G/g)", progress)
     } else {
-        "Exchange Details".to_string()
+        "Details".to_string()
     };
 
     let details = Paragraph::new(visible_content)
         .block(Block::default().borders(Borders::ALL).title(scroll_info))
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: false });
 
     f.render_widget(details, area);
 }
@@ -670,9 +707,31 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
         vec![Line::from("No request selected")]
     };
 
-    let details = Paragraph::new(content)
-        .block(Block::default().borders(Borders::ALL).title("Request Details"))
-        .wrap(Wrap { trim: true });
+    // Calculate visible area for scrolling
+    let inner_area = area.inner(&Margin { vertical: 1, horizontal: 1 });
+    let visible_lines = inner_area.height as usize;
+    let total_lines = content.len();
+    
+    // Apply scrolling offset
+    let start_line = app.intercept_details_scroll;
+    let end_line = std::cmp::min(start_line + visible_lines, total_lines);
+    let visible_content = if start_line < total_lines {
+        content[start_line..end_line].to_vec()
+    } else {
+        vec![]
+    };
+
+    // Create title with scroll indicator
+    let scroll_info = if total_lines > visible_lines {
+        let progress = ((app.intercept_details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
+        format!("Request Details ({}% - vim: j/k/d/u/G/g)", progress)
+    } else {
+        "Request Details".to_string()
+    };
+
+    let details = Paragraph::new(visible_content)
+        .block(Block::default().borders(Borders::ALL).title(scroll_info))
+        .wrap(Wrap { trim: false });
 
     f.render_widget(details, area);
 }

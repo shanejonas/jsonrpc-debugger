@@ -249,40 +249,70 @@ async fn run_app(
                                 app::AppMode::Paused | app::AppMode::Intercepting => app.select_next_pending(),
                             }
                         }
-                        KeyCode::Char('k') => app.scroll_details_up(),
+                        KeyCode::Char('k') => {
+                            match app.app_mode {
+                                app::AppMode::Normal => app.scroll_details_up(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => app.scroll_intercept_details_up(),
+                            }
+                        }
                         KeyCode::Char('j') => {
-                            // Calculate proper max lines for scrolling
-                            if let Some(_) = app.get_selected_exchange() {
-                                let max_lines = app.get_details_content_lines();
-                                app.scroll_details_down(max_lines, 20); // 20 is rough visible lines estimate
+                            match app.app_mode {
+                                app::AppMode::Normal => {
+                                    // Calculate proper max lines for scrolling
+                                    if let Some(_) = app.get_selected_exchange() {
+                                        let max_lines = app.get_details_content_lines();
+                                        app.scroll_details_down(max_lines, 20); // 20 is rough visible lines estimate
+                                    }
+                                }
+                                app::AppMode::Paused | app::AppMode::Intercepting => {
+                                    // For intercept mode, we need to calculate content lines differently
+                                    // For now, use a large number as max_lines since we don't have a helper method yet
+                                    app.scroll_intercept_details_down(1000, 20);
+                                }
                             }
                         }
                         // Vim-style page navigation for details
                         KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                            // Ctrl+d - page down in details
-                            app.page_down_details(20); // 20 is rough visible lines estimate
+                            match app.app_mode {
+                                app::AppMode::Normal => app.page_down_details(20),
+                                app::AppMode::Paused | app::AppMode::Intercepting => app.page_down_intercept_details(20),
+                            }
                         }
                         KeyCode::Char('u') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                            // Ctrl+u - page up in details
-                            app.page_up_details();
+                            match app.app_mode {
+                                app::AppMode::Normal => app.page_up_details(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => app.page_up_intercept_details(),
+                            }
                         }
                         KeyCode::Char('d') => {
-                            // d - page down in details (vim style)
-                            app.page_down_details(20);
+                            match app.app_mode {
+                                app::AppMode::Normal => app.page_down_details(20),
+                                app::AppMode::Paused | app::AppMode::Intercepting => app.page_down_intercept_details(20),
+                            }
                         }
                         KeyCode::Char('u') => {
-                            // u - page up in details (vim style)
-                            app.page_up_details();
+                            match app.app_mode {
+                                app::AppMode::Normal => app.page_up_details(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => app.page_up_intercept_details(),
+                            }
                         }
                         KeyCode::Char('G') => {
-                            // G - go to bottom of details
-                            let max_lines = app.get_details_content_lines();
-                            app.goto_bottom_details(max_lines, 20);
+                            match app.app_mode {
+                                app::AppMode::Normal => {
+                                    let max_lines = app.get_details_content_lines();
+                                    app.goto_bottom_details(max_lines, 20);
+                                }
+                                app::AppMode::Paused | app::AppMode::Intercepting => {
+                                    // For intercept mode, use a large number as max_lines
+                                    app.goto_bottom_intercept_details(1000, 20);
+                                }
+                            }
                         }
                         KeyCode::Char('g') => {
-                            // Handle 'gg' sequence for going to top
-                            // For now, just go to top on single 'g'
-                            app.goto_top_details();
+                            match app.app_mode {
+                                app::AppMode::Normal => app.goto_top_details(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => app.goto_top_intercept_details(),
+                            }
                         }
                         KeyCode::Char('t') => {
                             // Edit target URL
@@ -404,8 +434,8 @@ async fn run_app(
                             }
                         }
                         KeyCode::Char('c') => {
-                            // Check if we have a selected pending request
-                            if app.app_mode == AppMode::Intercepting && !app.pending_requests.is_empty() {
+                            // Check if we have a selected pending request (in either Paused or Intercepting mode)
+                            if (app.app_mode == AppMode::Paused || app.app_mode == AppMode::Intercepting) && !app.pending_requests.is_empty() {
                                 // Complete selected pending request with custom response
                                 if let Some(response_template) = app.get_pending_response_template() {
                                     // Temporarily exit TUI mode

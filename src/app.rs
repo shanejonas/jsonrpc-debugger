@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
+use ratatui::widgets::TableState;
 
 #[derive(Debug, Clone)]
 pub struct JsonRpcMessage {
@@ -67,7 +68,9 @@ pub struct PendingRequest {
 pub struct App {
     pub exchanges: Vec<JsonRpcExchange>,
     pub selected_exchange: usize,
+    pub table_state: TableState,
     pub details_scroll: usize,
+    pub intercept_details_scroll: usize,      // New field for intercept details scrolling
     pub proxy_config: ProxyConfig,
     pub is_running: bool,
     pub message_receiver: Option<mpsc::UnboundedReceiver<JsonRpcMessage>>,
@@ -89,13 +92,18 @@ pub struct ProxyConfig {
 
 impl App {
     pub fn new() -> Self {
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+        
         Self {
             exchanges: Vec::new(),
             selected_exchange: 0,
+            table_state,
             details_scroll: 0,
+            intercept_details_scroll: 0,
             proxy_config: ProxyConfig {
                 listen_port: 8080,
-                target_url: "https://mock.open-rpc.org".to_string(),
+                target_url: "".to_string(),
                 transport: TransportType::Http,
             },
             is_running: true,
@@ -111,13 +119,18 @@ impl App {
     }
 
     pub fn new_with_receiver(receiver: mpsc::UnboundedReceiver<JsonRpcMessage>) -> Self {
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+        
         Self {
             exchanges: Vec::new(),
             selected_exchange: 0,
+            table_state,
             details_scroll: 0,
+            intercept_details_scroll: 0,
             proxy_config: ProxyConfig {
                 listen_port: 8080,
-                target_url: "https://mock.open-rpc.org".to_string(),
+                target_url: "".to_string(),
                 transport: TransportType::Http,
             },
             is_running: true,
@@ -201,6 +214,7 @@ impl App {
     pub fn select_next(&mut self) {
         if !self.exchanges.is_empty() {
             self.selected_exchange = (self.selected_exchange + 1) % self.exchanges.len();
+            self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
         }
     }
@@ -212,6 +226,7 @@ impl App {
             } else {
                 self.selected_exchange - 1
             };
+            self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
         }
     }
@@ -236,6 +251,47 @@ impl App {
         self.details_scroll = 0;
     }
 
+    // Intercept details scrolling methods
+    pub fn scroll_intercept_details_up(&mut self) {
+        if self.intercept_details_scroll > 0 {
+            self.intercept_details_scroll -= 1;
+        }
+    }
+
+    pub fn scroll_intercept_details_down(&mut self, max_lines: usize, visible_lines: usize) {
+        if max_lines > visible_lines && self.intercept_details_scroll < max_lines - visible_lines {
+            self.intercept_details_scroll += 1;
+        }
+    }
+
+    pub fn reset_intercept_details_scroll(&mut self) {
+        self.intercept_details_scroll = 0;
+    }
+
+    pub fn page_down_intercept_details(&mut self, visible_lines: usize) {
+        let page_size = visible_lines / 2; // Half page
+        self.intercept_details_scroll += page_size;
+    }
+
+    pub fn page_up_intercept_details(&mut self) {
+        let page_size = 10; // Half page
+        self.intercept_details_scroll = if self.intercept_details_scroll >= page_size {
+            self.intercept_details_scroll - page_size
+        } else {
+            0
+        };
+    }
+
+    pub fn goto_top_intercept_details(&mut self) {
+        self.intercept_details_scroll = 0;
+    }
+
+    pub fn goto_bottom_intercept_details(&mut self, max_lines: usize, visible_lines: usize) {
+        if max_lines > visible_lines {
+            self.intercept_details_scroll = max_lines - visible_lines;
+        }
+    }
+
     // Vim-style navigation methods
     pub fn page_down_exchanges(&mut self) {
         if !self.exchanges.is_empty() {
@@ -244,6 +300,7 @@ impl App {
                 self.selected_exchange + page_size,
                 self.exchanges.len() - 1
             );
+            self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
         }
     }
@@ -255,12 +312,14 @@ impl App {
         } else {
             0
         };
+        self.table_state.select(Some(self.selected_exchange));
         self.reset_details_scroll();
     }
 
     pub fn goto_first_exchange(&mut self) {
         if !self.exchanges.is_empty() {
             self.selected_exchange = 0;
+            self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
         }
     }
@@ -268,6 +327,7 @@ impl App {
     pub fn goto_last_exchange(&mut self) {
         if !self.exchanges.is_empty() {
             self.selected_exchange = self.exchanges.len() - 1;
+            self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
         }
     }
@@ -430,6 +490,7 @@ impl App {
     pub fn select_next_pending(&mut self) {
         if !self.pending_requests.is_empty() {
             self.selected_pending = (self.selected_pending + 1) % self.pending_requests.len();
+            self.reset_intercept_details_scroll();
         }
     }
 
@@ -440,6 +501,7 @@ impl App {
             } else {
                 self.selected_pending - 1
             };
+            self.reset_intercept_details_scroll();
         }
     }
 
@@ -695,12 +757,24 @@ impl App {
             return Err("Missing 'method' field".to_string());
         }
 
-        // Send HTTP request to the proxy's listen port (which will forward to target)
+        // Check if target URL is empty
+        if self.proxy_config.target_url.trim().is_empty() {
+            return Err("Target URL is not set. Press 't' to set a target URL first.".to_string());
+        }
+
         let client = reqwest::Client::new();
-        let proxy_url = format!("http://localhost:{}", self.proxy_config.listen_port);
+        
+        // If we're in paused mode, send directly to target to avoid interception
+        // Otherwise, send through proxy for normal logging
+        let url = if matches!(self.app_mode, AppMode::Paused | AppMode::Intercepting) {
+            &self.proxy_config.target_url
+        } else {
+            // Send through proxy for normal logging
+            &format!("http://localhost:{}", self.proxy_config.listen_port)
+        };
         
         let response = client
-            .post(&proxy_url)
+            .post(url)
             .header("Content-Type", "application/json")
             .body(request_json)
             .send()

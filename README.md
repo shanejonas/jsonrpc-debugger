@@ -77,18 +77,18 @@ The TUI is divided into three main sections:
 │                                       ││                                           │
 │                                       ││REQUEST:                                   │
 │                                       ││HTTP Headers:                              │
-│                                       ││  content-type: application/json          │
+│                                       ││  content-type: application/json           │
 │                                       ││                                           │
 │                                       ││JSON-RPC Request:                          │
 │                                       ││{                                          │
-│                                       ││  "jsonrpc": "2.0",                       │
+│                                       ││  "jsonrpc": "2.0",                        │
 │                                       ││  "method": "foo",                         │
 │                                       ││  "params": [],                            │
 │                                       ││  "id": 1                                  │
 │                                       ││}                                          │
 └───────────────────────────────────────┘└───────────────────────────────────────────┘
 ┌Controls────────────────────────────────────────────────────────────────────────────────┐
-│q quit | ↑↓/^n/^p navigate | j/k/d/u/G/g scroll details | s start/stop | t edit target │
+│q quit | ↑↓/^n/^p navigate | j/k/d/u/G/g scroll details | s start/stop | t edit target  │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -115,9 +115,7 @@ The TUI is divided into three main sections:
 ### Interception Mode
 - `p` - Toggle pause mode (intercept new requests)
 - `a` - Allow selected intercepted request
-- `e` - Edit selected request body in external editor
-- `h` - Edit selected request headers in external editor
-- `c` - Complete selected request with custom response
+- `e` - Edit selected request in external editor
 - `b` - Block selected request
 - `r` - Resume all pending requests
 
@@ -128,8 +126,8 @@ The proxy supports Charles Proxy-style request interception:
 1. **Enable pause mode**: Press `p` to start intercepting requests
 2. **Make requests**: Send JSON-RPC requests to the proxy
 3. **Inspect**: Intercepted requests appear in the pending list
-4. **Modify**: Press `e` to edit request body or `h` to edit headers in your external editor
-5. **Control**: Press `a` to allow, `c` to complete with custom response, `b` to block, or `r` to resume all
+4. **Modify**: Press `e` to edit a request in your external editor
+5. **Control**: Press `a` to allow, `b` to block, or `r` to resume all
 
 ### External Editor
 
@@ -137,29 +135,6 @@ The proxy uses your system's default editor for request modification:
 - Checks `$EDITOR` environment variable
 - Falls back to `$VISUAL`
 - Defaults to `vim`, then `nano`, then `vi`
-
-### Custom Response Completion
-
-The complete feature (`c` key) allows you to craft custom JSON-RPC responses without forwarding to the target server:
-
-1. **Intercept a request**: Enable pause mode and make a request
-2. **Press 'c'**: Opens your editor with a response template
-3. **Edit response**: Modify the JSON-RPC response (must have `result` or `error`, not both)
-4. **Save and exit**: The custom response is returned to the client
-
-**Example response template:**
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": "custom response"
-}
-```
-
-This is useful for:
-- **Mocking responses** during development
-- **Testing error conditions** by returning custom errors
-- **API simulation** without a real backend
 
 ## Configuration
 
@@ -195,12 +170,8 @@ curl -X POST http://localhost:8080 \
 1. Start the proxy: `cargo run`
 2. Enable pause mode: Press `p`
 3. Make a request (it will be intercepted)
-4. Choose action:
-   - Press `e` to edit request body
-   - Press `h` to edit request headers  
-   - Press `c` to complete with custom response
-   - Press `a` to allow as-is
-   - Press `b` to block
+4. Edit the request: Press `e`
+5. Allow the modified request: Press `a`
 
 ### Custom Target
 
