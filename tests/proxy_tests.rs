@@ -75,7 +75,7 @@ async fn test_proxy_handles_different_paths() {
         });
 
         let response = client
-            .post(&format!("http://localhost:8071{}", path))
+            .post(format!("http://localhost:8071{}", path))
             .header("Content-Type", "application/json")
             .json(&request_body)
             .send()
