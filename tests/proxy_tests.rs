@@ -14,6 +14,125 @@ async fn test_proxy_server_creation() {
     // The constructor parameters are validated during creation
 }
 
+#[tokio::test]
+async fn test_proxy_handles_different_paths() {
+    use warp::Filter;
+
+    // Create a mock target server that echoes back the path
+    let mock_target = warp::path::full()
+        .and(warp::post())
+        .and(warp::body::json())
+        .map(|path: warp::path::FullPath, body: serde_json::Value| {
+            warp::reply::json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "result": {
+                    "received_path": path.as_str(),
+                    "original_request": body
+                }
+            }))
+        });
+
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_headers(vec!["content-type"])
+        .allow_methods(vec!["POST"]);
+
+    let mock_routes = mock_target.with(cors);
+
+    // Start mock target server on port 8061
+    let mock_server = tokio::spawn(async move {
+        warp::serve(mock_routes).run(([127, 0, 0, 1], 8061)).await;
+    });
+
+    // Give the mock server time to start
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Create message channel for proxy
+    let (message_sender, mut message_receiver) = mpsc::unbounded_channel();
+
+    // Create proxy pointing to mock target
+    let proxy = ProxyServer::new(8071, "http://localhost:8061".to_string(), message_sender);
+
+    // Start proxy server
+    let proxy_server = tokio::spawn(async move {
+        let _ = proxy.start().await;
+    });
+
+    // Give the proxy time to start
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Test different paths
+    let client = reqwest::Client::new();
+    let test_cases = vec!["/", "/rpc/v1", "/api/v2", "/some/nested/path"];
+
+    for path in test_cases {
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "test_method",
+            "params": {"test": "value"},
+            "id": 1
+        });
+
+        let response = client
+            .post(format!("http://localhost:8071{}", path))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await;
+
+        assert!(response.is_ok(), "Request to {} should succeed", path);
+
+        let response = response.unwrap();
+        assert!(
+            response.status().is_success(),
+            "Response should be successful for path {}",
+            path
+        );
+
+        let response_json: serde_json::Value = response.json().await.unwrap();
+
+        // Verify the mock target received the correct path
+        assert_eq!(
+            response_json["result"]["received_path"].as_str().unwrap(),
+            path,
+            "Path should be forwarded correctly"
+        );
+
+        // Verify the request was logged by checking the message channel
+        // We should receive both request and response messages
+        let mut found_request = false;
+        let mut attempts = 0;
+
+        while !found_request && attempts < 3 {
+            let received_message = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                message_receiver.recv(),
+            )
+            .await;
+
+            if let Ok(Some(message)) = received_message {
+                if matches!(message.direction, MessageDirection::Request)
+                    && message.method == Some("test_method".to_string())
+                {
+                    found_request = true;
+                }
+            }
+            attempts += 1;
+        }
+
+        assert!(
+            found_request,
+            "Should receive a request message for path {}",
+            path
+        );
+    }
+
+    // Clean up
+    proxy_server.abort();
+    mock_server.abort();
+}
+
 #[test]
 fn test_message_channel_integration() {
     let (sender, receiver) = mpsc::unbounded_channel();
