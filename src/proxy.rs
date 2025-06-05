@@ -52,11 +52,11 @@ impl ProxyServer {
         let message_sender = self.message_sender.clone();
         let proxy_state = self.proxy_state.clone();
 
-        let proxy_route = warp::path::end()
+        let proxy_route = warp::path::full()
             .and(warp::post())
             .and(warp::header::headers_cloned())
             .and(warp::body::json())
-            .and_then(move |headers: warp::http::HeaderMap, body: Value| {
+            .and_then(move |path: warp::path::FullPath, headers: warp::http::HeaderMap, body: Value| {
                 let target_url = target_url.clone();
                 let client = client.clone();
                 let message_sender = message_sender.clone();
@@ -64,6 +64,7 @@ impl ProxyServer {
 
                 async move {
                     handle_proxy_request(
+                        path,
                         headers,
                         body,
                         target_url,
@@ -93,6 +94,7 @@ impl ProxyServer {
 }
 
 async fn handle_proxy_request(
+    path: warp::path::FullPath,
     headers: warp::http::HeaderMap,
     body: Value,
     target_url: String,
@@ -182,7 +184,7 @@ async fn handle_proxy_request(
                     forward_request(
                         final_headers,
                         request_body,
-                        target_url,
+                        format!("{}{}", target_url, path.as_str()),
                         client,
                         message_sender,
                     )
@@ -246,7 +248,7 @@ async fn handle_proxy_request(
     }
 
     // Normal forwarding (not intercepted)
-    forward_request(headers, body, target_url, client, message_sender).await
+    forward_request(headers, body, format!("{}{}", target_url, path.as_str()), client, message_sender).await
 }
 
 async fn forward_request(
