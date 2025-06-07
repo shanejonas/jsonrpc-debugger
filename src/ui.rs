@@ -142,12 +142,19 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
+    // Calculate footer height dynamically
+    let keybinds = get_keybinds_for_mode(app);
+    let available_width = f.size().width as usize;
+    let line_spans = arrange_keybinds_responsive(keybinds, available_width);
+    let footer_height = (line_spans.len() + 2).max(3); // +2 for borders, minimum 3
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(10),   // Main content
-            Constraint::Length(3), // Footer
+            Constraint::Length(3),                    // Header
+            Constraint::Min(10),                      // Main content
+            Constraint::Length(footer_height as u16), // Dynamic footer height
+            Constraint::Length(1),                    // Input dialog
         ])
         .split(f.size());
 
@@ -535,88 +542,158 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(details, area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let mut footer_spans = vec![
-        Span::styled(
-            "q",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" quit | "),
-        Span::styled(
-            "↑↓",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("/"),
-        Span::styled(
-            "^n/^p",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" navigate | "),
-        Span::styled(
-            "j/k/d/u/G/g",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" scroll details | "),
-        Span::styled(
-            "s",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" start/stop proxy | "),
-        Span::styled(
-            "t",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" edit target | "),
-        Span::styled(
-            "p",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" pause"),
-    ];
+// Helper struct to represent a keybind with its display information
+#[derive(Clone)]
+struct KeybindInfo {
+    key: String,
+    description: String,
+    priority: u8, // Lower number = higher priority
+}
 
-    // Show context-specific controls
-    match app.app_mode {
-        AppMode::Paused | AppMode::Intercepting => {
-            footer_spans.extend(vec![
-                Span::raw(" | "),
-                Span::styled(
-                    "a/e/h/c/b/r",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" allow/edit/headers/complete/block/resume"),
-            ]);
-        }
-        AppMode::Normal => {
-            footer_spans.extend(vec![
-                Span::raw(" | "),
-                Span::styled(
-                    "c",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" create request"),
-            ]);
+impl KeybindInfo {
+    fn new(key: &str, description: &str, priority: u8) -> Self {
+        Self {
+            key: key.to_string(),
+            description: description.to_string(),
+            priority,
         }
     }
 
-    let footer_text = vec![Line::from(footer_spans)];
+    // Calculate the display width of this keybind (key + description + separators)
+    fn display_width(&self) -> usize {
+        self.key.len() + 1 + self.description.len() + 3 // " | " separator
+    }
+
+    // Convert to spans for rendering
+    fn to_spans(&self) -> Vec<Span<'static>> {
+        vec![
+            Span::styled(
+                self.key.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {} | ", self.description)),
+        ]
+    }
+}
+
+fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
+    let mut keybinds = vec![
+        // Essential keybinds (priority 1)
+        KeybindInfo::new("q", "quit", 1),
+        KeybindInfo::new("↑↓", "navigate", 1),
+        KeybindInfo::new("s", "start/stop proxy", 1),
+        // Navigation keybinds (priority 2)
+        KeybindInfo::new("^n/^p", "navigate", 2),
+        KeybindInfo::new("t", "edit target", 2),
+        KeybindInfo::new("p", "pause", 2),
+        // Advanced keybinds (priority 3)
+        KeybindInfo::new("j/k/d/u/G/g", "scroll details", 3),
+    ];
+
+    // Add context-specific keybinds (priority 4)
+    match app.app_mode {
+        AppMode::Paused | AppMode::Intercepting => {
+            // Only show intercept controls if there are pending requests
+            if !app.pending_requests.is_empty() {
+                keybinds.extend(vec![
+                    KeybindInfo::new("a", "allow", 4),
+                    KeybindInfo::new("e", "edit", 4),
+                    KeybindInfo::new("h", "headers", 4),
+                    KeybindInfo::new("c", "complete", 4),
+                    KeybindInfo::new("b", "block", 4),
+                    KeybindInfo::new("r", "resume", 4),
+                ]);
+            }
+        }
+        AppMode::Normal => {
+            keybinds.push(KeybindInfo::new("c", "create request", 4));
+        }
+    }
+
+    keybinds
+}
+
+fn arrange_keybinds_responsive(
+    keybinds: Vec<KeybindInfo>,
+    available_width: usize,
+) -> Vec<Vec<Span<'static>>> {
+    let mut lines = Vec::new();
+    let mut current_line_spans = Vec::new();
+    let mut current_line_width = 0;
+
+    // Account for border padding (2 chars for left/right borders)
+    let usable_width = available_width.saturating_sub(4);
+
+    // Sort keybinds by priority
+    let mut sorted_keybinds = keybinds;
+    sorted_keybinds.sort_by_key(|k| k.priority);
+
+    for (i, keybind) in sorted_keybinds.iter().enumerate() {
+        let keybind_width = keybind.display_width();
+        let is_last = i == sorted_keybinds.len() - 1;
+
+        // Check if this keybind fits on the current line
+        let width_needed = if is_last {
+            keybind_width - 3 // Remove " | " from last item
+        } else {
+            keybind_width
+        };
+
+        if current_line_width + width_needed <= usable_width || current_line_spans.is_empty() {
+            // Add to current line
+            let mut spans = keybind.to_spans();
+            if is_last {
+                // Remove the trailing " | " from the last keybind
+                if let Some(last_span) = spans.last_mut() {
+                    if let Some(content) = last_span.content.strip_suffix(" | ") {
+                        *last_span = Span::raw(content.to_string());
+                    }
+                }
+            }
+            current_line_spans.extend(spans);
+            current_line_width += width_needed;
+        } else {
+            // Start a new line
+            // Remove trailing " | " from the last span of the current line
+            if let Some(last_span) = current_line_spans.last_mut() {
+                if let Some(content) = last_span.content.strip_suffix(" | ") {
+                    *last_span = Span::raw(content.to_string());
+                }
+            }
+
+            lines.push(current_line_spans);
+            current_line_spans = keybind.to_spans();
+            current_line_width = keybind_width;
+
+            // If this is the last keybind, remove trailing separator
+            if is_last {
+                if let Some(last_span) = current_line_spans.last_mut() {
+                    if let Some(content) = last_span.content.strip_suffix(" | ") {
+                        *last_span = Span::raw(content.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Add the last line if it has content
+    if !current_line_spans.is_empty() {
+        lines.push(current_line_spans);
+    }
+
+    lines
+}
+
+fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    let keybinds = get_keybinds_for_mode(app);
+    let available_width = area.width as usize;
+
+    let line_spans = arrange_keybinds_responsive(keybinds, available_width);
+
+    // Convert spans to Lines
+    let footer_text: Vec<Line> = line_spans.into_iter().map(Line::from).collect();
 
     let footer =
         Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL).title("Controls"));
