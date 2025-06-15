@@ -43,6 +43,7 @@ pub enum TransportType {
 pub enum InputMode {
     Normal,
     EditingTarget,
+    FilteringRequests,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +73,7 @@ pub struct PendingRequest {
 pub struct App {
     pub exchanges: Vec<JsonRpcExchange>,
     pub selected_exchange: usize,
+    pub filter_text: String,
     pub table_state: TableState,
     pub details_scroll: usize,
     pub intercept_details_scroll: usize, // New field for intercept details scrolling
@@ -108,6 +110,7 @@ impl App {
         Self {
             exchanges: Vec::new(),
             selected_exchange: 0,
+            filter_text: String::new(),
             table_state,
             details_scroll: 0,
             intercept_details_scroll: 0,
@@ -134,6 +137,7 @@ impl App {
         Self {
             exchanges: Vec::new(),
             selected_exchange: 0,
+            filter_text: String::new(),
             table_state,
             details_scroll: 0,
             intercept_details_scroll: 0,
@@ -320,6 +324,23 @@ impl App {
         }
     }
 
+    // Filtering requests methods
+    pub fn start_filtering_requests(&mut self) {
+        self.input_mode = InputMode::FilteringRequests;
+        self.input_buffer.clear();
+    }
+
+    pub fn cancel_filtering(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    pub fn apply_filter(&mut self) {
+        self.filter_text = self.input_buffer.clone();
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
     // Get content lines for proper scrolling calculations
     // Target editing methods
     pub fn start_editing_target(&mut self) {
@@ -341,13 +362,13 @@ impl App {
     }
 
     pub fn handle_input_char(&mut self, c: char) {
-        if self.input_mode == InputMode::EditingTarget {
+        if self.input_mode == InputMode::EditingTarget || self.input_mode == InputMode::FilteringRequests {
             self.input_buffer.push(c);
         }
     }
 
     pub fn handle_backspace(&mut self) {
-        if self.input_mode == InputMode::EditingTarget {
+        if self.input_mode == InputMode::EditingTarget || self.input_mode == InputMode::FilteringRequests {
             self.input_buffer.pop();
         }
     }

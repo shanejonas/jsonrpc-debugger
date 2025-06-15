@@ -179,6 +179,24 @@ async fn run_app(
                 if let Event::Key(key) = event::read()? {
                     // Handle input modes first
                     match app.input_mode {
+                        app::InputMode::FilteringRequests => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    app.apply_filter();
+                                }
+                                KeyCode::Esc => {
+                                    app.cancel_filtering();
+                                }
+                                KeyCode::Backspace => {
+                                    app.handle_backspace();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.handle_input_char(c);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         app::InputMode::EditingTarget => {
                             match key.code {
                                 KeyCode::Enter => {
@@ -208,6 +226,24 @@ async fn run_app(
                                 }
                                 KeyCode::Esc => {
                                     app.cancel_editing();
+                                }
+                                KeyCode::Backspace => {
+                                    app.handle_backspace();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.handle_input_char(c);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        app::InputMode::FilteringRequests => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    app.apply_filter();
+                                }
+                                KeyCode::Esc => {
+                                    app.cancel_filtering();
                                 }
                                 KeyCode::Backspace => {
                                     app.handle_backspace();
@@ -332,8 +368,10 @@ async fn run_app(
                             }
                         },
                         KeyCode::Char('t') => {
-                            // Edit target URL
                             app.start_editing_target();
+                        }
+                        KeyCode::Char('/') => {
+                            app.start_filtering_requests();
                         }
                         KeyCode::Char('n')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
