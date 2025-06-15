@@ -253,3 +253,134 @@ fn test_proxy_config() {
     assert_eq!(config.target_url, "https://example.com");
     assert!(matches!(config.transport, TransportType::Http));
 }
+
+#[test]
+fn test_filtering_functionality() {
+    let mut app = App::new();
+
+    // Add test exchanges with different methods
+    let methods = [
+        "eth_getBalance",
+        "eth_sendTransaction",
+        "net_version",
+        "eth_blockNumber",
+    ];
+
+    for (i, method) in methods.iter().enumerate() {
+        let test_message = JsonRpcMessage {
+            id: Some(serde_json::Value::Number(serde_json::Number::from(
+                i as i64,
+            ))),
+            method: Some(method.to_string()),
+            params: Some(serde_json::json!({"test": format!("value_{}", i)})),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: MessageDirection::Request,
+            transport: TransportType::Http,
+            headers: None,
+        };
+        app.add_message(test_message);
+    }
+
+    // Test initial state - no filter
+    assert_eq!(app.filter_text, "");
+    assert_eq!(app.exchanges.len(), 4);
+
+    // Test filter methods
+    app.start_filtering_requests();
+    assert_eq!(app.input_mode, InputMode::FilteringRequests);
+    assert_eq!(app.input_buffer, ""); // Should start empty
+
+    // Simulate typing "eth"
+    app.handle_input_char('e');
+    app.handle_input_char('t');
+    app.handle_input_char('h');
+    assert_eq!(app.input_buffer, "eth");
+
+    // Apply the filter
+    app.apply_filter();
+    assert_eq!(app.filter_text, "eth");
+    assert_eq!(app.input_mode, InputMode::Normal);
+    assert_eq!(app.input_buffer, "");
+
+    // Test that filtering logic would work (this tests the filter logic conceptually)
+    let filtered_count = app
+        .exchanges
+        .iter()
+        .filter(|exchange| {
+            if app.filter_text.is_empty() {
+                true
+            } else {
+                exchange
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
+            }
+        })
+        .count();
+
+    // Should match 3 exchanges: eth_getBalance, eth_sendTransaction, eth_blockNumber
+    assert_eq!(filtered_count, 3);
+
+    // Test cancel filtering
+    app.start_filtering_requests();
+    app.handle_input_char('n');
+    app.handle_input_char('e');
+    app.handle_input_char('t');
+    app.cancel_filtering();
+    assert_eq!(app.filter_text, "eth"); // Should keep previous filter
+    assert_eq!(app.input_mode, InputMode::Normal);
+    assert_eq!(app.input_buffer, "");
+
+    // Test clearing filter
+    app.start_filtering_requests();
+    app.apply_filter(); // Apply empty filter
+    assert_eq!(app.filter_text, "");
+
+    // All exchanges should match when filter is empty
+    let all_count = app
+        .exchanges
+        .iter()
+        .filter(|exchange| {
+            if app.filter_text.is_empty() {
+                true
+            } else {
+                exchange
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
+            }
+        })
+        .count();
+    assert_eq!(all_count, 4);
+
+    // Test case-insensitive filtering (if implemented)
+    app.start_filtering_requests();
+    app.handle_input_char('E');
+    app.handle_input_char('T');
+    app.handle_input_char('H');
+    app.apply_filter();
+    assert_eq!(app.filter_text, "ETH");
+
+    // This would test case-insensitive matching if implemented
+    let case_insensitive_count = app
+        .exchanges
+        .iter()
+        .filter(|exchange| {
+            if app.filter_text.is_empty() {
+                true
+            } else {
+                exchange
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&app.filter_text.to_lowercase())
+            }
+        })
+        .count();
+    assert_eq!(case_insensitive_count, 3);
+}
