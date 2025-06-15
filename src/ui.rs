@@ -174,7 +174,9 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Draw input dialogs
     if app.input_mode == InputMode::EditingTarget {
-        draw_input_dialog(f, app);
+        draw_input_dialog(f, app, "Edit Target URL", "Target URL");
+    } else if app.input_mode == InputMode::FilteringRequests {
+        draw_input_dialog(f, app, "Filter Requests", "Filter");
     }
 }
 
@@ -209,8 +211,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            " | Port: {} | Target: {}",
-            app.proxy_config.listen_port, app.proxy_config.target_url
+            " | Port: {} | Target: {} | Filter: {}",
+            app.proxy_config.listen_port, app.proxy_config.target_url, app.filter_text
         )),
         Span::styled(
             mode_text,
@@ -273,6 +275,18 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         .exchanges
         .iter()
         .enumerate()
+        .filter(|(_, exchange)| {
+            if app.filter_text.is_empty() {
+                true
+            } else {
+                // TODO: Filter by id, params, result, error, etc.
+                exchange
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
+            }
+        })
         .map(|(i, exchange)| {
             let transport_symbol = match exchange.transport {
                 TransportType::Http => "HTTP",
@@ -587,6 +601,7 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
         // Navigation keybinds (priority 2)
         KeybindInfo::new("^n/^p", "navigate", 2),
         KeybindInfo::new("t", "edit target", 2),
+        KeybindInfo::new("/", "filter", 2),
         KeybindInfo::new("p", "pause", 2),
         // Advanced keybinds (priority 3)
         KeybindInfo::new("j/k/d/u/G/g", "scroll details", 3),
@@ -701,7 +716,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(footer, area);
 }
 
-fn draw_input_dialog(f: &mut Frame, app: &App) {
+fn draw_input_dialog(f: &mut Frame, app: &App, title: &str, label: &str) {
     let area = f.size();
 
     // Create a centered popup
@@ -725,7 +740,7 @@ fn draw_input_dialog(f: &mut Frame, app: &App) {
     let input_text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::raw("Target URL: "),
+            Span::raw(format!("{}: ", label)),
             Span::styled(&app.input_buffer, Style::default().fg(Color::Green)),
         ]),
         Line::from(""),
@@ -740,7 +755,7 @@ fn draw_input_dialog(f: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Edit Target URL")
+                .title(title)
                 .style(Style::default().fg(Color::White).bg(Color::DarkGray)),
         )
         .wrap(Wrap { trim: true });
@@ -785,6 +800,19 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
         .pending_requests
         .iter()
         .enumerate()
+        .filter(|(_, pending)| {
+            if app.filter_text.is_empty() {
+                true
+            } else {
+                // Filter pending requests by method name (same as main list)
+                pending
+                    .original_request
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
+            }
+        })
         .map(|(i, pending)| {
             let method = pending
                 .original_request
