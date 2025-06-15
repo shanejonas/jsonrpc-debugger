@@ -362,13 +362,17 @@ impl App {
     }
 
     pub fn handle_input_char(&mut self, c: char) {
-        if self.input_mode == InputMode::EditingTarget || self.input_mode == InputMode::FilteringRequests {
+        if self.input_mode == InputMode::EditingTarget
+            || self.input_mode == InputMode::FilteringRequests
+        {
             self.input_buffer.push(c);
         }
     }
 
     pub fn handle_backspace(&mut self) {
-        if self.input_mode == InputMode::EditingTarget || self.input_mode == InputMode::FilteringRequests {
+        if self.input_mode == InputMode::EditingTarget
+            || self.input_mode == InputMode::FilteringRequests
+        {
             self.input_buffer.pop();
         }
     }

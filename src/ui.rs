@@ -280,7 +280,11 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                 true
             } else {
                 // TODO: Filter by id, params, result, error, etc.
-                exchange.method.as_deref().unwrap_or("").contains(&app.filter_text)
+                exchange
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
             }
         })
         .map(|(i, exchange)| {
@@ -796,6 +800,19 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
         .pending_requests
         .iter()
         .enumerate()
+        .filter(|(_, pending)| {
+            if app.filter_text.is_empty() {
+                true
+            } else {
+                // Filter pending requests by method name (same as main list)
+                pending
+                    .original_request
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
+            }
+        })
         .map(|(i, pending)| {
             let method = pending
                 .original_request

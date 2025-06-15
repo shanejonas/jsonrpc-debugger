@@ -32,11 +32,20 @@ impl ProxyServer {
         target_url: String,
         message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
     ) -> Self {
+        // Configure client for higher concurrency
+        let client = Client::builder()
+            .pool_max_idle_per_host(50) // More idle connections
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .http2_max_frame_size(Some(16384)) // Larger frame size
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .unwrap_or_else(|_| Client::new()); // Fallback to default if config fails
+
         Self {
             listen_port,
             target_url,
             message_sender,
-            client: Client::new(),
+            client,
             proxy_state: None,
         }
     }

@@ -237,24 +237,6 @@ async fn run_app(
                             }
                             continue;
                         }
-                        app::InputMode::FilteringRequests => {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    app.apply_filter();
-                                }
-                                KeyCode::Esc => {
-                                    app.cancel_filtering();
-                                }
-                                KeyCode::Backspace => {
-                                    app.handle_backspace();
-                                }
-                                KeyCode::Char(c) => {
-                                    app.handle_input_char(c);
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
 
                         app::InputMode::Normal => {
                             // Continue to normal key handling below
@@ -376,12 +358,22 @@ async fn run_app(
                         KeyCode::Char('n')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            app.select_next()
+                            match app.app_mode {
+                                app::AppMode::Normal => app.select_next(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => {
+                                    app.select_next_pending()
+                                }
+                            }
                         }
                         KeyCode::Char('p')
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
-                            app.select_previous()
+                            match app.app_mode {
+                                app::AppMode::Normal => app.select_previous(),
+                                app::AppMode::Paused | app::AppMode::Intercepting => {
+                                    app.select_previous_pending()
+                                }
+                            }
                         }
                         KeyCode::Char('s') => {
                             if app.is_running {
