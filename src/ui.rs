@@ -3,7 +3,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Wrap,
+        Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
     },
     Frame,
 };
@@ -379,6 +380,42 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
     let mut table_state = TableState::default();
     table_state.select(Some(app.selected_exchange));
     f.render_stateful_widget(table, area, &mut table_state);
+
+    let filtered_count = app
+        .exchanges
+        .iter()
+        .filter(|exchange| {
+            if app.filter_text.is_empty() {
+                true
+            } else {
+                exchange
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
+            }
+        })
+        .count();
+
+    if filtered_count > 0 {
+        let mut scrollbar_state =
+            ScrollbarState::new(filtered_count).position(app.selected_exchange);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("▐");
+
+        f.render_stateful_widget(
+            scrollbar,
+            area.inner(&Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
@@ -554,6 +591,25 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false });
 
     f.render_widget(details, area);
+
+    if total_lines > visible_lines {
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(app.details_scroll);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("▐");
+
+        f.render_stateful_widget(
+            scrollbar,
+            area.inner(&Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 // Helper struct to represent a keybind with its display information
@@ -1052,4 +1108,24 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false });
 
     f.render_widget(details, area);
+
+    if total_lines > visible_lines {
+        let mut scrollbar_state =
+            ScrollbarState::new(total_lines).position(app.intercept_details_scroll);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("▐");
+
+        f.render_stateful_widget(
+            scrollbar,
+            area.inner(&Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
