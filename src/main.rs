@@ -276,6 +276,16 @@ async fn run_app(
                                 app.select_next_pending()
                             }
                         },
+                        KeyCode::Left => {
+                            if app.app_mode == app::AppMode::Normal {
+                                app.previous_details_tab();
+                            }
+                        }
+                        KeyCode::Right => {
+                            if app.app_mode == app::AppMode::Normal {
+                                app.next_details_tab();
+                            }
+                        }
                         KeyCode::Char('k') => match app.app_mode {
                             app::AppMode::Normal => app.scroll_details_up(),
                             app::AppMode::Paused | app::AppMode::Intercepting => {

@@ -142,6 +142,56 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
     lines
 }
 
+fn build_tab_line(
+    labels: &[&str],
+    selected: usize,
+    is_active: bool,
+    is_enabled: bool,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+
+    for (index, label) in labels.iter().enumerate() {
+        let is_selected = index == selected;
+        let style = if is_selected {
+            let mut style = Style::default();
+            if is_enabled {
+                style = style
+                    .fg(if is_active {
+                        Color::Yellow
+                    } else {
+                        Color::White
+                    })
+                    .add_modifier(Modifier::BOLD);
+            } else {
+                style = style.fg(Color::DarkGray);
+            }
+            style
+        } else if is_enabled {
+            Style::default().fg(if is_active {
+                Color::Gray
+            } else {
+                Color::DarkGray
+            })
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let text = if is_selected {
+            format!("[{}]", label)
+        } else {
+            format!(" {} ", label)
+        };
+
+        spans.push(Span::styled(text, style));
+
+        if index < labels.len() - 1 {
+            spans.push(Span::raw(" "));
+        }
+    }
+
+    Line::from(spans)
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     // Calculate footer height dynamically
     let keybinds = get_keybinds_for_mode(app);
@@ -442,116 +492,137 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
             ]));
         }
 
-        // Request details
-        if let Some(request) = &exchange.request {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "REQUEST:",
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Green),
-            )));
+        // Request section with tabs
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "REQUEST:",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Green),
+        )));
+        let request_active = matches!(app.details_tab, 0 | 1);
+        lines.push(build_tab_line(
+            &["Headers", "Body"],
+            app.request_details_tab,
+            request_active,
+            exchange.request.is_some(),
+        ));
 
-            // Show HTTP headers if available
-            if let Some(headers) = &request.headers {
-                lines.push(Line::from(""));
-                lines.push(Line::from("HTTP Headers:"));
-                for (key, value) in headers {
-                    lines.push(Line::from(format!("  {}: {}", key, value)));
+        if let Some(request) = &exchange.request {
+            match app.request_details_tab {
+                0 => {
+                    lines.push(Line::from(""));
+                    match &request.headers {
+                        Some(headers) if !headers.is_empty() => {
+                            for (key, value) in headers {
+                                lines.push(Line::from(format!("  {}: {}", key, value)));
+                            }
+                        }
+                        Some(_) => {
+                            lines.push(Line::from("  No headers"));
+                        }
+                        None => {
+                            lines.push(Line::from("  No headers captured"));
+                        }
+                    }
+                }
+                _ => {
+                    lines.push(Line::from(""));
+                    let mut request_json = serde_json::Map::new();
+                    request_json.insert(
+                        "jsonrpc".to_string(),
+                        serde_json::Value::String("2.0".to_string()),
+                    );
+
+                    if let Some(id) = &request.id {
+                        request_json.insert("id".to_string(), id.clone());
+                    }
+                    if let Some(method) = &request.method {
+                        request_json.insert(
+                            "method".to_string(),
+                            serde_json::Value::String(method.clone()),
+                        );
+                    }
+                    if let Some(params) = &request.params {
+                        request_json.insert("params".to_string(), params.clone());
+                    }
+
+                    let request_json_value = serde_json::Value::Object(request_json);
+                    let request_json_lines = format_json_with_highlighting(&request_json_value);
+                    for line in request_json_lines {
+                        lines.push(line);
+                    }
                 }
             }
-
-            // Build and show the complete JSON-RPC request object
+        } else {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "JSON-RPC Request:",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
-            let mut request_json = serde_json::Map::new();
-            request_json.insert(
-                "jsonrpc".to_string(),
-                serde_json::Value::String("2.0".to_string()),
-            );
-
-            if let Some(id) = &request.id {
-                request_json.insert("id".to_string(), id.clone());
-            }
-            if let Some(method) = &request.method {
-                request_json.insert(
-                    "method".to_string(),
-                    serde_json::Value::String(method.clone()),
-                );
-            }
-            if let Some(params) = &request.params {
-                request_json.insert("params".to_string(), params.clone());
-            }
-
-            let request_json_value = serde_json::Value::Object(request_json);
-            let request_json_lines = format_json_with_highlighting(&request_json_value);
-            for line in request_json_lines {
-                lines.push(line);
-            }
+            lines.push(Line::from("Request not captured yet"));
         }
 
-        // Response details
+        // Response section with tabs
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "RESPONSE:",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Blue),
+        )));
+        let response_active = matches!(app.details_tab, 2 | 3);
+        lines.push(build_tab_line(
+            &["Headers", "Body"],
+            app.response_details_tab,
+            response_active,
+            exchange.response.is_some(),
+        ));
+
         if let Some(response) = &exchange.response {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "RESPONSE:",
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Blue),
-            )));
-
-            // Show HTTP headers if available
-            if let Some(headers) = &response.headers {
-                lines.push(Line::from(""));
-                lines.push(Line::from("HTTP Headers:"));
-                for (key, value) in headers {
-                    lines.push(Line::from(format!("  {}: {}", key, value)));
+            match app.response_details_tab {
+                0 => {
+                    lines.push(Line::from(""));
+                    match &response.headers {
+                        Some(headers) if !headers.is_empty() => {
+                            for (key, value) in headers {
+                                lines.push(Line::from(format!("  {}: {}", key, value)));
+                            }
+                        }
+                        Some(_) => {
+                            lines.push(Line::from("  No headers"));
+                        }
+                        None => {
+                            lines.push(Line::from("  No headers captured"));
+                        }
+                    }
                 }
-            }
+                _ => {
+                    lines.push(Line::from(""));
+                    let mut response_json = serde_json::Map::new();
+                    response_json.insert(
+                        "jsonrpc".to_string(),
+                        serde_json::Value::String("2.0".to_string()),
+                    );
 
-            // Build and show the complete JSON-RPC response object
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "JSON-RPC Response:",
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(""));
-            let mut response_json = serde_json::Map::new();
-            response_json.insert(
-                "jsonrpc".to_string(),
-                serde_json::Value::String("2.0".to_string()),
-            );
+                    if let Some(id) = &response.id {
+                        response_json.insert("id".to_string(), id.clone());
+                    }
+                    if let Some(result) = &response.result {
+                        response_json.insert("result".to_string(), result.clone());
+                    }
+                    if let Some(error) = &response.error {
+                        response_json.insert("error".to_string(), error.clone());
+                    }
 
-            if let Some(id) = &response.id {
-                response_json.insert("id".to_string(), id.clone());
-            }
-            if let Some(result) = &response.result {
-                response_json.insert("result".to_string(), result.clone());
-            }
-            if let Some(error) = &response.error {
-                response_json.insert("error".to_string(), error.clone());
-            }
-
-            let response_json_value = serde_json::Value::Object(response_json);
-            let response_json_lines = format_json_with_highlighting(&response_json_value);
-            for line in response_json_lines {
-                lines.push(line);
+                    let response_json_value = serde_json::Value::Object(response_json);
+                    let response_json_lines = format_json_with_highlighting(&response_json_value);
+                    for line in response_json_lines {
+                        lines.push(line);
+                    }
+                }
             }
         } else {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "RESPONSE: Pending...",
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Yellow),
+                "Response pending...",
+                Style::default().fg(Color::Yellow),
             )));
         }
 

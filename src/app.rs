@@ -76,6 +76,9 @@ pub struct App {
     pub filter_text: String,
     pub table_state: TableState,
     pub details_scroll: usize,
+    pub details_tab: usize,
+    pub request_details_tab: usize,
+    pub response_details_tab: usize,
     pub intercept_details_scroll: usize, // New field for intercept details scrolling
     pub proxy_config: ProxyConfig,
     pub is_running: bool,
@@ -113,6 +116,9 @@ impl App {
             filter_text: String::new(),
             table_state,
             details_scroll: 0,
+            details_tab: 0,
+            request_details_tab: 0,
+            response_details_tab: 0,
             intercept_details_scroll: 0,
             proxy_config: ProxyConfig {
                 listen_port: 8080,
@@ -140,6 +146,9 @@ impl App {
             filter_text: String::new(),
             table_state,
             details_scroll: 0,
+            details_tab: 0,
+            request_details_tab: 0,
+            response_details_tab: 0,
             intercept_details_scroll: 0,
             proxy_config: ProxyConfig {
                 listen_port: 8080,
@@ -231,6 +240,9 @@ impl App {
             self.selected_exchange = (self.selected_exchange + 1) % self.exchanges.len();
             self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
+            self.details_tab = 0;
+            self.request_details_tab = 0;
+            self.response_details_tab = 0;
         }
     }
 
@@ -243,6 +255,9 @@ impl App {
             };
             self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
+            self.details_tab = 0;
+            self.request_details_tab = 0;
+            self.response_details_tab = 0;
         }
     }
 
@@ -264,6 +279,34 @@ impl App {
 
     pub fn reset_details_scroll(&mut self) {
         self.details_scroll = 0;
+    }
+
+    pub fn next_details_tab(&mut self) {
+        self.details_tab = (self.details_tab + 1) % 4;
+        match self.details_tab {
+            0 => self.request_details_tab = 0,
+            1 => self.request_details_tab = 1,
+            2 => self.response_details_tab = 0,
+            3 => self.response_details_tab = 1,
+            _ => {}
+        }
+        self.reset_details_scroll();
+    }
+
+    pub fn previous_details_tab(&mut self) {
+        if self.details_tab == 0 {
+            self.details_tab = 3;
+        } else {
+            self.details_tab -= 1;
+        }
+        match self.details_tab {
+            0 => self.request_details_tab = 0,
+            1 => self.request_details_tab = 1,
+            2 => self.response_details_tab = 0,
+            3 => self.response_details_tab = 1,
+            _ => {}
+        }
+        self.reset_details_scroll();
     }
 
     // Intercept details scrolling methods
@@ -379,87 +422,105 @@ impl App {
 
     pub fn get_details_content_lines(&self) -> usize {
         if let Some(exchange) = self.get_selected_exchange() {
-            let mut line_count = 0;
+            let mut line_count = 1; // Transport line
 
-            // Basic info lines
-            line_count += 3; // Transport, Method, ID
+            if exchange.method.is_some() {
+                line_count += 1;
+            }
+            if exchange.id.is_some() {
+                line_count += 1;
+            }
 
             // Request section
+            line_count += 1; // Blank line before section
+            line_count += 1; // Section header
+            line_count += 1; // Tabs line
+
             if let Some(request) = &exchange.request {
-                line_count += 2; // Empty line + "REQUEST:" header
+                match self.request_details_tab {
+                    0 => match &request.headers {
+                        Some(headers) if !headers.is_empty() => {
+                            line_count += headers.len();
+                        }
+                        Some(_) | None => {
+                            line_count += 1;
+                        }
+                    },
+                    _ => {
+                        let mut request_json = serde_json::Map::new();
+                        request_json.insert(
+                            "jsonrpc".to_string(),
+                            serde_json::Value::String("2.0".to_string()),
+                        );
+                        if let Some(id) = &request.id {
+                            request_json.insert("id".to_string(), id.clone());
+                        }
+                        if let Some(method) = &request.method {
+                            request_json.insert(
+                                "method".to_string(),
+                                serde_json::Value::String(method.clone()),
+                            );
+                        }
+                        if let Some(params) = &request.params {
+                            request_json.insert("params".to_string(), params.clone());
+                        }
 
-                if let Some(headers) = &request.headers {
-                    line_count += 2; // Empty line + "HTTP Headers:"
-                    line_count += headers.len();
+                        if let Ok(json_str) =
+                            serde_json::to_string_pretty(&serde_json::Value::Object(request_json))
+                        {
+                            line_count += json_str.lines().count();
+                        }
+                    }
                 }
-
-                line_count += 2; // Empty line + "JSON-RPC Request:"
-
-                // Estimate JSON lines (rough calculation)
-                let mut request_json = serde_json::Map::new();
-                request_json.insert(
-                    "jsonrpc".to_string(),
-                    serde_json::Value::String("2.0".to_string()),
-                );
-                if let Some(id) = &request.id {
-                    request_json.insert("id".to_string(), id.clone());
-                }
-                if let Some(method) = &request.method {
-                    request_json.insert(
-                        "method".to_string(),
-                        serde_json::Value::String(method.clone()),
-                    );
-                }
-                if let Some(params) = &request.params {
-                    request_json.insert("params".to_string(), params.clone());
-                }
-
-                if let Ok(json_str) =
-                    serde_json::to_string_pretty(&serde_json::Value::Object(request_json))
-                {
-                    line_count += json_str.lines().count();
-                }
+            } else {
+                line_count += 1;
             }
 
             // Response section
+            line_count += 1; // Blank line before section
+            line_count += 1; // Section header
+            line_count += 1; // Tabs line
+
             if let Some(response) = &exchange.response {
-                line_count += 2; // Empty line + "RESPONSE:" header
+                match self.response_details_tab {
+                    0 => match &response.headers {
+                        Some(headers) if !headers.is_empty() => {
+                            line_count += headers.len();
+                        }
+                        Some(_) | None => {
+                            line_count += 1;
+                        }
+                    },
+                    _ => {
+                        let mut response_json = serde_json::Map::new();
+                        response_json.insert(
+                            "jsonrpc".to_string(),
+                            serde_json::Value::String("2.0".to_string()),
+                        );
+                        if let Some(id) = &response.id {
+                            response_json.insert("id".to_string(), id.clone());
+                        }
+                        if let Some(result) = &response.result {
+                            response_json.insert("result".to_string(), result.clone());
+                        }
+                        if let Some(error) = &response.error {
+                            response_json.insert("error".to_string(), error.clone());
+                        }
 
-                if let Some(headers) = &response.headers {
-                    line_count += 2; // Empty line + "HTTP Headers:"
-                    line_count += headers.len();
-                }
-
-                line_count += 2; // Empty line + "JSON-RPC Response:"
-
-                // Estimate JSON lines
-                let mut response_json = serde_json::Map::new();
-                response_json.insert(
-                    "jsonrpc".to_string(),
-                    serde_json::Value::String("2.0".to_string()),
-                );
-                if let Some(id) = &response.id {
-                    response_json.insert("id".to_string(), id.clone());
-                }
-                if let Some(result) = &response.result {
-                    response_json.insert("result".to_string(), result.clone());
-                }
-                if let Some(error) = &response.error {
-                    response_json.insert("error".to_string(), error.clone());
-                }
-
-                if let Ok(json_str) =
-                    serde_json::to_string_pretty(&serde_json::Value::Object(response_json))
-                {
-                    line_count += json_str.lines().count();
+                        if let Ok(json_str) =
+                            serde_json::to_string_pretty(&serde_json::Value::Object(response_json))
+                        {
+                            line_count += json_str.lines().count();
+                        }
+                    }
                 }
             } else {
-                line_count += 2; // Empty line + "RESPONSE: Pending..."
+                line_count += 1;
             }
 
             line_count
         } else {
-            1 // "No exchange selected"
+            1
         }
     }
 
