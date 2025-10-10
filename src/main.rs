@@ -272,10 +272,10 @@ async fn run_app(
                                     if app.request_details_scroll > 0 {
                                         app.request_details_scroll -= 1;
                                     }
-                                } else if app.is_response_section_focused() {
-                                    if app.response_details_scroll > 0 {
-                                        app.response_details_scroll -= 1;
-                                    }
+                                } else if app.is_response_section_focused()
+                                    && app.response_details_scroll > 0
+                                {
+                                    app.response_details_scroll -= 1;
                                 }
                             }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -290,10 +290,10 @@ async fn run_app(
                                     if app.get_selected_exchange().is_some() {
                                         app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                     }
-                                } else if app.is_response_section_focused() {
-                                    if app.get_selected_exchange().is_some() {
-                                        app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
-                                    }
+                                } else if app.is_response_section_focused()
+                                    && app.get_selected_exchange().is_some()
+                                {
+                                    app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                 }
                             }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -344,10 +344,10 @@ async fn run_app(
                                     if app.request_details_scroll > 0 {
                                         app.request_details_scroll -= 1;
                                     }
-                                } else if app.is_response_section_focused() {
-                                    if app.response_details_scroll > 0 {
-                                        app.response_details_scroll -= 1;
-                                    }
+                                } else if app.is_response_section_focused()
+                                    && app.response_details_scroll > 0
+                                {
+                                    app.response_details_scroll -= 1;
                                 }
                             }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -363,10 +363,10 @@ async fn run_app(
                                         if app.get_selected_exchange().is_some() {
                                             app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                         }
-                                    } else if app.is_response_section_focused() {
-                                        if app.get_selected_exchange().is_some() {
-                                            app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
-                                        }
+                                    } else if app.is_response_section_focused()
+                                        && app.get_selected_exchange().is_some()
+                                    {
+                                        app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                     }
                                 }
                                 app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -413,11 +413,11 @@ async fn run_app(
                                         if app.get_selected_exchange().is_some() {
                                             app.request_details_scroll = 10000; // Large number, UI will clamp to actual bottom
                                         }
-                                    } else if app.is_response_section_focused() {
-                                        if app.get_selected_exchange().is_some() {
-                                            app.response_details_scroll = 10000;
-                                            // Large number, UI will clamp to actual bottom
-                                        }
+                                    } else if app.is_response_section_focused()
+                                        && app.get_selected_exchange().is_some()
+                                    {
+                                        app.response_details_scroll = 10000;
+                                        // Large number, UI will clamp to actual bottom
                                     }
                                     // G does nothing when message list is focused
                                 }

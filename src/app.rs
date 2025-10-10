@@ -117,6 +117,7 @@ impl Default for App {
     }
 }
 
+#[allow(dead_code)]
 impl App {
     pub fn new() -> Self {
         let mut table_state = TableState::default();
