@@ -265,19 +265,91 @@ async fn run_app(
                             return Ok(());
                         }
                         KeyCode::Up => match app.app_mode {
-                            app::AppMode::Normal => app.select_previous(),
+                            app::AppMode::Normal => {
+                                if app.is_message_list_focused() {
+                                    app.select_previous();
+                                } else if app.is_request_section_focused() {
+                                    if app.request_details_scroll > 0 {
+                                        app.request_details_scroll -= 1;
+                                    }
+                                } else if app.is_response_section_focused()
+                                    && app.response_details_scroll > 0
+                                {
+                                    app.response_details_scroll -= 1;
+                                }
+                            }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
                                 app.select_previous_pending()
                             }
                         },
                         KeyCode::Down => match app.app_mode {
-                            app::AppMode::Normal => app.select_next(),
+                            app::AppMode::Normal => {
+                                if app.is_message_list_focused() {
+                                    app.select_next();
+                                } else if app.is_request_section_focused() {
+                                    if app.get_selected_exchange().is_some() {
+                                        app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                                    }
+                                } else if app.is_response_section_focused()
+                                    && app.get_selected_exchange().is_some()
+                                {
+                                    app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                                }
+                            }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
                                 app.select_next_pending()
                             }
                         },
+                        KeyCode::Left => {
+                            if app.app_mode == app::AppMode::Normal {
+                                if app.is_request_section_focused() {
+                                    app.previous_request_tab();
+                                } else if app.is_response_section_focused() {
+                                    app.previous_response_tab();
+                                } else if app.is_message_list_focused() {
+                                    app.select_previous();
+                                }
+                            }
+                        }
+                        KeyCode::Right => {
+                            if app.app_mode == app::AppMode::Normal {
+                                if app.is_request_section_focused() {
+                                    app.next_request_tab();
+                                } else if app.is_response_section_focused() {
+                                    app.next_response_tab();
+                                } else if app.is_message_list_focused() {
+                                    app.select_next();
+                                }
+                            }
+                        }
+                        KeyCode::Tab => {
+                            if app.app_mode == app::AppMode::Normal {
+                                app.switch_focus();
+                            }
+                            // Don't process any other key handling for Tab
+                            continue;
+                        }
+                        KeyCode::BackTab => {
+                            if app.app_mode == app::AppMode::Normal {
+                                app.switch_focus_reverse();
+                            }
+                            // Don't process any other key handling for Shift+Tab
+                            continue;
+                        }
                         KeyCode::Char('k') => match app.app_mode {
-                            app::AppMode::Normal => app.scroll_details_up(),
+                            app::AppMode::Normal => {
+                                if app.is_message_list_focused() {
+                                    app.select_previous();
+                                } else if app.is_request_section_focused() {
+                                    if app.request_details_scroll > 0 {
+                                        app.request_details_scroll -= 1;
+                                    }
+                                } else if app.is_response_section_focused()
+                                    && app.response_details_scroll > 0
+                                {
+                                    app.response_details_scroll -= 1;
+                                }
+                            }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
                                 app.scroll_intercept_details_up()
                             }
@@ -285,57 +357,69 @@ async fn run_app(
                         KeyCode::Char('j') => {
                             match app.app_mode {
                                 app::AppMode::Normal => {
-                                    // Calculate proper max lines for scrolling
-                                    if app.get_selected_exchange().is_some() {
-                                        let max_lines = app.get_details_content_lines();
-                                        app.scroll_details_down(max_lines, 20); // 20 is rough visible lines estimate
+                                    if app.is_message_list_focused() {
+                                        app.select_next();
+                                    } else if app.is_request_section_focused() {
+                                        if app.get_selected_exchange().is_some() {
+                                            app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                                        }
+                                    } else if app.is_response_section_focused()
+                                        && app.get_selected_exchange().is_some()
+                                    {
+                                        app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                     }
                                 }
                                 app::AppMode::Paused | app::AppMode::Intercepting => {
-                                    // For intercept mode, we need to calculate content lines differently
-                                    // For now, use a large number as max_lines since we don't have a helper method yet
-                                    app.scroll_intercept_details_down(1000, 20);
+                                    app.intercept_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                 }
                             }
                         }
-                        // Vim-style page navigation for details
-                        KeyCode::Char('d')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            match app.app_mode {
-                                app::AppMode::Normal => app.page_down_details(20),
-                                app::AppMode::Paused | app::AppMode::Intercepting => {
-                                    app.page_down_intercept_details(20)
-                                }
-                            }
-                        }
-                        KeyCode::Char('u')
-                            if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            match app.app_mode {
-                                app::AppMode::Normal => app.page_up_details(),
-                                app::AppMode::Paused | app::AppMode::Intercepting => {
-                                    app.page_up_intercept_details()
-                                }
-                            }
-                        }
-                        KeyCode::Char('d') => match app.app_mode {
-                            app::AppMode::Normal => app.page_down_details(20),
-                            app::AppMode::Paused | app::AppMode::Intercepting => {
-                                app.page_down_intercept_details(20)
-                            }
-                        },
                         KeyCode::Char('u') => match app.app_mode {
-                            app::AppMode::Normal => app.page_up_details(),
+                            app::AppMode::Normal => {
+                                if app.is_request_section_focused() {
+                                    let page_size = 10;
+                                    app.request_details_scroll =
+                                        app.request_details_scroll.saturating_sub(page_size);
+                                } else if app.is_response_section_focused() {
+                                    let page_size = 10;
+                                    app.response_details_scroll =
+                                        app.response_details_scroll.saturating_sub(page_size);
+                                }
+                                // u does nothing when message list is focused
+                            }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
                                 app.page_up_intercept_details()
+                            }
+                        },
+                        KeyCode::Char('d') => match app.app_mode {
+                            app::AppMode::Normal => {
+                                if app.is_request_section_focused() {
+                                    let page_size = 10;
+                                    app.request_details_scroll += page_size;
+                                } else if app.is_response_section_focused() {
+                                    let page_size = 10;
+                                    app.response_details_scroll += page_size;
+                                }
+                                // d does nothing when message list is focused
+                            }
+                            app::AppMode::Paused | app::AppMode::Intercepting => {
+                                app.page_down_intercept_details();
                             }
                         },
                         KeyCode::Char('G') => {
                             match app.app_mode {
                                 app::AppMode::Normal => {
-                                    let max_lines = app.get_details_content_lines();
-                                    app.goto_bottom_details(max_lines, 20);
+                                    if app.is_request_section_focused() {
+                                        if app.get_selected_exchange().is_some() {
+                                            app.request_details_scroll = 10000; // Large number, UI will clamp to actual bottom
+                                        }
+                                    } else if app.is_response_section_focused()
+                                        && app.get_selected_exchange().is_some()
+                                    {
+                                        app.response_details_scroll = 10000;
+                                        // Large number, UI will clamp to actual bottom
+                                    }
+                                    // G does nothing when message list is focused
                                 }
                                 app::AppMode::Paused | app::AppMode::Intercepting => {
                                     // For intercept mode, use a large number as max_lines
@@ -344,7 +428,14 @@ async fn run_app(
                             }
                         }
                         KeyCode::Char('g') => match app.app_mode {
-                            app::AppMode::Normal => app.goto_top_details(),
+                            app::AppMode::Normal => {
+                                if app.is_request_section_focused() {
+                                    app.request_details_scroll = 0;
+                                } else if app.is_response_section_focused() {
+                                    app.response_details_scroll = 0;
+                                }
+                                // g does nothing when message list is focused
+                            }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
                                 app.goto_top_intercept_details()
                             }
@@ -359,7 +450,21 @@ async fn run_app(
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             match app.app_mode {
-                                app::AppMode::Normal => app.select_next(),
+                                app::AppMode::Normal => {
+                                    if app.is_message_list_focused() {
+                                        app.select_next();
+                                    } else if app.is_request_section_focused() {
+                                        // Request details - scroll down
+                                        if app.get_selected_exchange().is_some() {
+                                            app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                                        }
+                                    } else if app.is_response_section_focused() {
+                                        // Response details - scroll down
+                                        if app.get_selected_exchange().is_some() {
+                                            app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                                        }
+                                    }
+                                }
                                 app::AppMode::Paused | app::AppMode::Intercepting => {
                                     app.select_next_pending()
                                 }
@@ -369,7 +474,21 @@ async fn run_app(
                             if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                         {
                             match app.app_mode {
-                                app::AppMode::Normal => app.select_previous(),
+                                app::AppMode::Normal => {
+                                    if app.is_message_list_focused() {
+                                        app.select_previous();
+                                    } else if app.is_request_section_focused() {
+                                        // Request details - scroll up
+                                        if app.request_details_scroll > 0 {
+                                            app.request_details_scroll -= 1;
+                                        }
+                                    } else if app.is_response_section_focused() {
+                                        // Response details - scroll up
+                                        if app.response_details_scroll > 0 {
+                                            app.response_details_scroll -= 1;
+                                        }
+                                    }
+                                }
                                 app::AppMode::Paused | app::AppMode::Intercepting => {
                                     app.select_previous_pending()
                                 }
@@ -452,8 +571,12 @@ async fn run_app(
                             }
                         }
                         KeyCode::Char('h') => {
-                            // Edit selected pending request headers with external editor
-                            if let Some(headers_content) = app.get_pending_request_headers() {
+                            // Edit selected pending request headers with external editor (intercept mode)
+                            if (app.app_mode == app::AppMode::Paused
+                                || app.app_mode == app::AppMode::Intercepting)
+                                && app.get_pending_request_headers().is_some()
+                            {
+                                let headers_content = app.get_pending_request_headers().unwrap();
                                 // Temporarily exit TUI mode
                                 disable_raw_mode()?;
                                 execute!(
@@ -487,6 +610,17 @@ async fn run_app(
                                     EnableMouseCapture
                                 )?;
                                 terminal.clear()?;
+                            }
+                            // Navigate tabs left in normal mode
+                            if app.app_mode == app::AppMode::Normal
+                                && (app.is_request_section_focused()
+                                    || app.is_response_section_focused())
+                            {
+                                if app.is_request_section_focused() {
+                                    app.previous_request_tab();
+                                } else if app.is_response_section_focused() {
+                                    app.previous_response_tab();
+                                }
                             }
                         }
                         KeyCode::Char('c') => {
@@ -587,6 +721,18 @@ async fn run_app(
                             // Resume all pending requests
                             app.resume_all_requests();
                             terminal.clear()?;
+                        }
+                        KeyCode::Char('l') => {
+                            if app.app_mode == app::AppMode::Normal
+                                && (app.is_request_section_focused()
+                                    || app.is_response_section_focused())
+                            {
+                                if app.is_request_section_focused() {
+                                    app.next_request_tab();
+                                } else if app.is_response_section_focused() {
+                                    app.next_response_tab();
+                                }
+                            }
                         }
 
                         _ => {}
