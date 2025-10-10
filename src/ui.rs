@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, InputMode, TransportType};
+use crate::app::{App, AppMode, InputMode, TransportType, Focus};
 
 // Helper function to format JSON with syntax highlighting and 2-space indentation
 fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'static>> {
@@ -143,7 +143,7 @@ fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'st
 }
 
 fn build_tab_line(
-    labels: &[&str],
+    labels: &'static [&'static str],
     selected: usize,
     is_active: bool,
     is_enabled: bool,
@@ -152,40 +152,39 @@ fn build_tab_line(
 
     for (index, label) in labels.iter().enumerate() {
         let is_selected = index == selected;
-        let style = if is_selected {
+        
+        if is_selected {
+            // Active tab - use a more prominent style like modern tab designs
             let mut style = Style::default();
             if is_enabled {
                 style = style
-                    .fg(if is_active {
-                        Color::Yellow
+                    .fg(Color::Black)
+                    .bg(if is_active {
+                        Color::Cyan
                     } else {
                         Color::White
                     })
                     .add_modifier(Modifier::BOLD);
             } else {
-                style = style.fg(Color::DarkGray);
+                style = style.fg(Color::DarkGray).bg(Color::DarkGray);
             }
-            style
+            
+            spans.push(Span::styled(format!(" {} ", *label), style));
         } else if is_enabled {
-            Style::default().fg(if is_active {
-                Color::Gray
-            } else {
-                Color::DarkGray
-            })
+            // Inactive tab - subtle background
+            let style = Style::default()
+                .fg(if is_active { Color::White } else { Color::Gray })
+                .bg(Color::DarkGray);
+            spans.push(Span::styled(format!(" {} ", *label), style));
         } else {
-            Style::default().fg(Color::DarkGray)
-        };
+            // Disabled tab
+            let style = Style::default().fg(Color::DarkGray);
+            spans.push(Span::styled(format!(" {} ", *label), style));
+        }
 
-        let text = if is_selected {
-            format!("[{}]", label)
-        } else {
-            format!(" {} ", label)
-        };
-
-        spans.push(Span::styled(text, style));
-
+        // Add separator between tabs
         if index < labels.len() - 1 {
-            spans.push(Span::raw(" "));
+            spans.push(Span::raw(""));
         }
     }
 
@@ -282,12 +281,12 @@ fn draw_main_content(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(50), // Message list
-            Constraint::Percentage(50), // Message details
+            Constraint::Percentage(50), // Details area
         ])
         .split(area);
 
     draw_message_list(f, chunks[0], app);
-    draw_message_details(f, chunks[1], app);
+    draw_details_split(f, chunks[1], app);
 }
 
 fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
@@ -407,6 +406,17 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
+    let table_title = "JSON-RPC";
+
+    let table_block = if matches!(app.focus, Focus::MessageList) {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(table_title)
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Block::default().borders(Borders::ALL).title(table_title)
+    };
+
     let table = Table::new(
         rows,
         [
@@ -418,7 +428,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title("JSON-RPC"))
+    .block(table_block)
     .highlight_style(
         Style::default()
             .bg(Color::Cyan)
@@ -468,7 +478,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
+fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     let content = if let Some(exchange) = app.get_selected_exchange() {
         let mut lines = Vec::new();
 
@@ -500,58 +510,56 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Green),
         )));
-        let request_active = matches!(app.details_tab, 0 | 1);
         lines.push(build_tab_line(
             &["Headers", "Body"],
-            app.request_details_tab,
-            request_active,
+            app.request_tab,
+            matches!(app.focus, Focus::RequestSection),
             exchange.request.is_some(),
         ));
 
         if let Some(request) = &exchange.request {
-            match app.request_details_tab {
-                0 => {
-                    lines.push(Line::from(""));
-                    match &request.headers {
-                        Some(headers) if !headers.is_empty() => {
-                            for (key, value) in headers {
-                                lines.push(Line::from(format!("  {}: {}", key, value)));
-                            }
+            if app.request_tab == 0 {
+                // Show headers regardless of focus state
+                lines.push(Line::from(""));
+                match &request.headers {
+                    Some(headers) if !headers.is_empty() => {
+                        for (key, value) in headers {
+                            lines.push(Line::from(format!("  {}: {}", key, value)));
                         }
-                        Some(_) => {
-                            lines.push(Line::from("  No headers"));
-                        }
-                        None => {
-                            lines.push(Line::from("  No headers captured"));
-                        }
+                    }
+                    Some(_) => {
+                        lines.push(Line::from("  No headers"));
+                    }
+                    None => {
+                        lines.push(Line::from("  No headers captured"));
                     }
                 }
-                _ => {
-                    lines.push(Line::from(""));
-                    let mut request_json = serde_json::Map::new();
+            } else {
+                // Show body regardless of focus state
+                lines.push(Line::from(""));
+                let mut request_json = serde_json::Map::new();
+                request_json.insert(
+                    "jsonrpc".to_string(),
+                    serde_json::Value::String("2.0".to_string()),
+                );
+
+                if let Some(id) = &request.id {
+                    request_json.insert("id".to_string(), id.clone());
+                }
+                if let Some(method) = &request.method {
                     request_json.insert(
-                        "jsonrpc".to_string(),
-                        serde_json::Value::String("2.0".to_string()),
+                        "method".to_string(),
+                        serde_json::Value::String(method.clone()),
                     );
+                }
+                if let Some(params) = &request.params {
+                    request_json.insert("params".to_string(), params.clone());
+                }
 
-                    if let Some(id) = &request.id {
-                        request_json.insert("id".to_string(), id.clone());
-                    }
-                    if let Some(method) = &request.method {
-                        request_json.insert(
-                            "method".to_string(),
-                            serde_json::Value::String(method.clone()),
-                        );
-                    }
-                    if let Some(params) = &request.params {
-                        request_json.insert("params".to_string(), params.clone());
-                    }
-
-                    let request_json_value = serde_json::Value::Object(request_json);
-                    let request_json_lines = format_json_with_highlighting(&request_json_value);
-                    for line in request_json_lines {
-                        lines.push(line);
-                    }
+                let request_json_value = serde_json::Value::Object(request_json);
+                let request_json_lines = format_json_with_highlighting(&request_json_value);
+                for line in request_json_lines {
+                    lines.push(line);
                 }
             }
         } else {
@@ -559,63 +567,145 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from("Request not captured yet"));
         }
 
+        lines
+    } else {
+        vec![Line::from("No request selected")]
+    };
+
+    // Calculate visible area for scrolling
+    let inner_area = area.inner(&Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let visible_lines = inner_area.height as usize;
+    let total_lines = content.len();
+
+    // Apply scrolling offset
+    let start_line = app.request_details_scroll;
+    let end_line = std::cmp::min(start_line + visible_lines, total_lines);
+    let visible_content = if start_line < total_lines {
+        content[start_line..end_line].to_vec()
+    } else {
+        vec![]
+    };
+
+    // Create title with scroll indicator
+    let base_title = "Request Details";
+
+    let scroll_info = if total_lines > visible_lines {
+        let progress =
+            ((app.request_details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
+        format!("{} ({}% - vim: j/k/d/u/G/g)", base_title, progress)
+    } else {
+        base_title.to_string()
+    };
+
+    let details_block = if matches!(app.focus, Focus::RequestSection) {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(scroll_info)
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Block::default().borders(Borders::ALL).title(scroll_info)
+    };
+
+    let details = Paragraph::new(visible_content)
+        .block(details_block)
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(details, area);
+
+    if total_lines > visible_lines {
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(app.request_details_scroll);
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("▐");
+
+        f.render_stateful_widget(
+            scrollbar,
+            area.inner(&Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
+}
+
+fn draw_details_split(f: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50), // Request details
+            Constraint::Percentage(50), // Response details
+        ])
+        .split(area);
+
+    draw_request_details(f, chunks[0], app);
+    draw_response_details(f, chunks[1], app);
+}
+
+fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
+    let content = if let Some(exchange) = app.get_selected_exchange() {
+        let mut lines = Vec::new();
+
         // Response section with tabs
-        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "RESPONSE:",
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Blue),
         )));
-        let response_active = matches!(app.details_tab, 2 | 3);
         lines.push(build_tab_line(
             &["Headers", "Body"],
-            app.response_details_tab,
-            response_active,
+            app.response_tab,
+            matches!(app.focus, Focus::ResponseSection),
             exchange.response.is_some(),
         ));
 
         if let Some(response) = &exchange.response {
-            match app.response_details_tab {
-                0 => {
-                    lines.push(Line::from(""));
-                    match &response.headers {
-                        Some(headers) if !headers.is_empty() => {
-                            for (key, value) in headers {
-                                lines.push(Line::from(format!("  {}: {}", key, value)));
-                            }
+            if app.response_tab == 0 {
+                // Show headers regardless of focus state
+                lines.push(Line::from(""));
+                match &response.headers {
+                    Some(headers) if !headers.is_empty() => {
+                        for (key, value) in headers {
+                            lines.push(Line::from(format!("  {}: {}", key, value)));
                         }
-                        Some(_) => {
-                            lines.push(Line::from("  No headers"));
-                        }
-                        None => {
-                            lines.push(Line::from("  No headers captured"));
-                        }
+                    }
+                    Some(_) => {
+                        lines.push(Line::from("  No headers"));
+                    }
+                    None => {
+                        lines.push(Line::from("  No headers captured"));
                     }
                 }
-                _ => {
-                    lines.push(Line::from(""));
-                    let mut response_json = serde_json::Map::new();
-                    response_json.insert(
-                        "jsonrpc".to_string(),
-                        serde_json::Value::String("2.0".to_string()),
-                    );
+            } else {
+                // Show body regardless of focus state
+                lines.push(Line::from(""));
+                let mut response_json = serde_json::Map::new();
+                response_json.insert(
+                    "jsonrpc".to_string(),
+                    serde_json::Value::String("2.0".to_string()),
+                );
 
-                    if let Some(id) = &response.id {
-                        response_json.insert("id".to_string(), id.clone());
-                    }
-                    if let Some(result) = &response.result {
-                        response_json.insert("result".to_string(), result.clone());
-                    }
-                    if let Some(error) = &response.error {
-                        response_json.insert("error".to_string(), error.clone());
-                    }
+                if let Some(id) = &response.id {
+                    response_json.insert("id".to_string(), id.clone());
+                }
+                if let Some(result) = &response.result {
+                    response_json.insert("result".to_string(), result.clone());
+                }
+                if let Some(error) = &response.error {
+                    response_json.insert("error".to_string(), error.clone());
+                }
 
-                    let response_json_value = serde_json::Value::Object(response_json);
-                    let response_json_lines = format_json_with_highlighting(&response_json_value);
-                    for line in response_json_lines {
-                        lines.push(line);
-                    }
+                let response_json_value = serde_json::Value::Object(response_json);
+                let response_json_lines = format_json_with_highlighting(&response_json_value);
+                for line in response_json_lines {
+                    lines.push(line);
                 }
             }
         } else {
@@ -640,7 +730,7 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
     let total_lines = content.len();
 
     // Apply scrolling offset
-    let start_line = app.details_scroll;
+    let start_line = app.response_details_scroll;
     let end_line = std::cmp::min(start_line + visible_lines, total_lines);
     let visible_content = if start_line < total_lines {
         content[start_line..end_line].to_vec()
@@ -649,22 +739,33 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Create title with scroll indicator
+    let base_title = "Response Details";
+
     let scroll_info = if total_lines > visible_lines {
         let progress =
-            ((app.details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
-        format!("Details ({}% - vim: j/k/d/u/G/g)", progress)
+            ((app.response_details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
+        format!("{} ({}% - vim: j/k/d/u/G/g)", base_title, progress)
     } else {
-        "Details".to_string()
+        base_title.to_string()
+    };
+
+    let details_block = if matches!(app.focus, Focus::ResponseSection) {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(scroll_info)
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Block::default().borders(Borders::ALL).title(scroll_info)
     };
 
     let details = Paragraph::new(visible_content)
-        .block(Block::default().borders(Borders::ALL).title(scroll_info))
+        .block(details_block)
         .wrap(Wrap { trim: false });
 
     f.render_widget(details, area);
 
     if total_lines > visible_lines {
-        let mut scrollbar_state = ScrollbarState::new(total_lines).position(app.details_scroll);
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(app.response_details_scroll);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -682,6 +783,8 @@ fn draw_message_details(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 }
+
+
 
 // Helper struct to represent a keybind with its display information
 #[derive(Clone)]
@@ -726,12 +829,14 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
         KeybindInfo::new("↑↓", "navigate", 1),
         KeybindInfo::new("s", "start/stop proxy", 1),
         // Navigation keybinds (priority 2)
+        KeybindInfo::new("Tab/Shift+Tab", "navigate", 2),
         KeybindInfo::new("^n/^p", "navigate", 2),
         KeybindInfo::new("t", "edit target", 2),
         KeybindInfo::new("/", "filter", 2),
         KeybindInfo::new("p", "pause", 2),
         // Advanced keybinds (priority 3)
         KeybindInfo::new("j/k/d/u/G/g", "scroll details", 3),
+        KeybindInfo::new("h/l", "navigate tabs", 3),
     ];
 
     // Add context-specific keybinds (priority 4)
@@ -900,7 +1005,7 @@ fn draw_intercept_content(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     draw_pending_requests(f, chunks[0], app);
-    draw_request_details(f, chunks[1], app);
+    draw_intercept_request_details(f, chunks[1], app);
 }
 
 fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
@@ -1002,12 +1107,19 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
+    let pending_block = if matches!(app.app_mode, AppMode::Paused | AppMode::Intercepting) {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Pending Requests ({})", app.pending_requests.len()))
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Pending Requests ({})", app.pending_requests.len()))
+    };
+
     let requests_list = List::new(requests)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Pending Requests ({})", app.pending_requests.len())),
-        )
+        .block(pending_block)
         .highlight_style(
             Style::default()
                 .bg(Color::Cyan)
@@ -1018,7 +1130,7 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(requests_list, area);
 }
 
-fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
+fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
     let content = if let Some(pending) = app.get_selected_pending() {
         let mut lines = Vec::new();
 
@@ -1174,8 +1286,17 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
         "Request Details".to_string()
     };
 
+    let details_block = if matches!(app.app_mode, AppMode::Paused | AppMode::Intercepting) {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(scroll_info)
+            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Block::default().borders(Borders::ALL).title(scroll_info)
+    };
+
     let details = Paragraph::new(visible_content)
-        .block(Block::default().borders(Borders::ALL).title(scroll_info))
+        .block(details_block)
         .wrap(Wrap { trim: false });
 
     f.render_widget(details, area);

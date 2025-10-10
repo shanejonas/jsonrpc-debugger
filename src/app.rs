@@ -47,6 +47,13 @@ pub enum InputMode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Focus {
+    MessageList,
+    RequestSection,
+    ResponseSection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Normal,       // Regular proxy mode
     Paused,       // All requests paused
@@ -76,6 +83,8 @@ pub struct App {
     pub filter_text: String,
     pub table_state: TableState,
     pub details_scroll: usize,
+    pub request_details_scroll: usize,
+    pub response_details_scroll: usize,
     pub details_tab: usize,
     pub request_details_tab: usize,
     pub response_details_tab: usize,
@@ -89,6 +98,9 @@ pub struct App {
     pub pending_requests: Vec<PendingRequest>, // New field
     pub selected_pending: usize,               // New field
     pub request_editor_buffer: String,         // New field
+    pub focus: Focus,                         // New field for tracking which element is active
+    pub request_tab: usize,                    // 0 = Headers, 1 = Body
+    pub response_tab: usize,                   // 0 = Headers, 1 = Body
 }
 
 #[derive(Debug)]
@@ -116,6 +128,8 @@ impl App {
             filter_text: String::new(),
             table_state,
             details_scroll: 0,
+            request_details_scroll: 0,
+            response_details_scroll: 0,
             details_tab: 0,
             request_details_tab: 0,
             response_details_tab: 0,
@@ -133,6 +147,9 @@ impl App {
             pending_requests: Vec::new(),
             selected_pending: 0,
             request_editor_buffer: String::new(),
+            focus: Focus::MessageList,
+            request_tab: 1,  // Body selected by default
+            response_tab: 1, // Body selected by default
         }
     }
 
@@ -146,6 +163,8 @@ impl App {
             filter_text: String::new(),
             table_state,
             details_scroll: 0,
+            request_details_scroll: 0,
+            response_details_scroll: 0,
             details_tab: 0,
             request_details_tab: 0,
             response_details_tab: 0,
@@ -163,6 +182,9 @@ impl App {
             pending_requests: Vec::new(),
             selected_pending: 0,
             request_editor_buffer: String::new(),
+            focus: Focus::MessageList,
+            request_tab: 1,  // Body selected by default
+            response_tab: 1, // Body selected by default
         }
     }
 
@@ -240,6 +262,8 @@ impl App {
             self.selected_exchange = (self.selected_exchange + 1) % self.exchanges.len();
             self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
+            self.request_details_scroll = 0;
+            self.response_details_scroll = 0;
             self.details_tab = 0;
             self.request_details_tab = 0;
             self.response_details_tab = 0;
@@ -255,6 +279,8 @@ impl App {
             };
             self.table_state.select(Some(self.selected_exchange));
             self.reset_details_scroll();
+            self.request_details_scroll = 0;
+            self.response_details_scroll = 0;
             self.details_tab = 0;
             self.request_details_tab = 0;
             self.response_details_tab = 0;
@@ -281,33 +307,7 @@ impl App {
         self.details_scroll = 0;
     }
 
-    pub fn next_details_tab(&mut self) {
-        self.details_tab = (self.details_tab + 1) % 4;
-        match self.details_tab {
-            0 => self.request_details_tab = 0,
-            1 => self.request_details_tab = 1,
-            2 => self.response_details_tab = 0,
-            3 => self.response_details_tab = 1,
-            _ => {}
-        }
-        self.reset_details_scroll();
-    }
 
-    pub fn previous_details_tab(&mut self) {
-        if self.details_tab == 0 {
-            self.details_tab = 3;
-        } else {
-            self.details_tab -= 1;
-        }
-        match self.details_tab {
-            0 => self.request_details_tab = 0,
-            1 => self.request_details_tab = 1,
-            2 => self.response_details_tab = 0,
-            3 => self.response_details_tab = 1,
-            _ => {}
-        }
-        self.reset_details_scroll();
-    }
 
     // Intercept details scrolling methods
     pub fn scroll_intercept_details_up(&mut self) {
@@ -326,8 +326,8 @@ impl App {
         self.intercept_details_scroll = 0;
     }
 
-    pub fn page_down_intercept_details(&mut self, visible_lines: usize) {
-        let page_size = visible_lines / 2; // Half page
+    pub fn page_down_intercept_details(&mut self) {
+        let page_size = 10; // Half page
         self.intercept_details_scroll += page_size;
     }
 
@@ -365,6 +365,64 @@ impl App {
         if max_lines > visible_lines {
             self.details_scroll = max_lines - visible_lines;
         }
+    }
+
+    pub fn switch_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::MessageList => Focus::RequestSection,
+            Focus::RequestSection => Focus::ResponseSection,
+            Focus::ResponseSection => Focus::MessageList,
+        };
+        self.reset_details_scroll();
+        self.request_details_scroll = 0;
+        self.response_details_scroll = 0;
+    }
+
+    pub fn switch_focus_reverse(&mut self) {
+        self.focus = match self.focus {
+            Focus::MessageList => Focus::ResponseSection,
+            Focus::RequestSection => Focus::MessageList,
+            Focus::ResponseSection => Focus::RequestSection,
+        };
+        self.reset_details_scroll();
+        self.request_details_scroll = 0;
+        self.response_details_scroll = 0;
+    }
+
+
+
+    pub fn is_message_list_focused(&self) -> bool {
+        matches!(self.focus, Focus::MessageList)
+    }
+
+    pub fn is_request_section_focused(&self) -> bool {
+        matches!(self.focus, Focus::RequestSection)
+    }
+
+    pub fn is_response_section_focused(&self) -> bool {
+        matches!(self.focus, Focus::ResponseSection)
+    }
+
+
+
+    pub fn next_request_tab(&mut self) {
+        self.request_tab = 1 - self.request_tab; // Toggle between 0 and 1
+        self.reset_details_scroll();
+    }
+
+    pub fn previous_request_tab(&mut self) {
+        self.request_tab = 1 - self.request_tab; // Toggle between 0 and 1
+        self.reset_details_scroll();
+    }
+
+    pub fn next_response_tab(&mut self) {
+        self.response_tab = 1 - self.response_tab; // Toggle between 0 and 1
+        self.reset_details_scroll();
+    }
+
+    pub fn previous_response_tab(&mut self) {
+        self.response_tab = 1 - self.response_tab; // Toggle between 0 and 1
+        self.reset_details_scroll();
     }
 
     // Filtering requests methods
@@ -478,6 +536,122 @@ impl App {
 
             // Response section
             line_count += 1; // Blank line before section
+            line_count += 1; // Section header
+            line_count += 1; // Tabs line
+
+            if let Some(response) = &exchange.response {
+                match self.response_details_tab {
+                    0 => match &response.headers {
+                        Some(headers) if !headers.is_empty() => {
+                            line_count += headers.len();
+                        }
+                        Some(_) | None => {
+                            line_count += 1;
+                        }
+                    },
+                    _ => {
+                        let mut response_json = serde_json::Map::new();
+                        response_json.insert(
+                            "jsonrpc".to_string(),
+                            serde_json::Value::String("2.0".to_string()),
+                        );
+                        if let Some(id) = &response.id {
+                            response_json.insert("id".to_string(), id.clone());
+                        }
+                        if let Some(result) = &response.result {
+                            response_json.insert("result".to_string(), result.clone());
+                        }
+                        if let Some(error) = &response.error {
+                            response_json.insert("error".to_string(), error.clone());
+                        }
+
+                        if let Ok(json_str) =
+                            serde_json::to_string_pretty(&serde_json::Value::Object(response_json))
+                        {
+                            line_count += json_str.lines().count();
+                        }
+                    }
+                }
+            } else {
+                line_count += 1;
+            }
+
+            line_count
+        } else {
+            1
+        }
+    }
+
+    pub fn get_request_details_content_lines(&self) -> usize {
+        if let Some(exchange) = self.get_selected_exchange() {
+            let mut line_count = 0;
+
+            // Basic exchange info
+            line_count += 1; // Transport line
+
+            if exchange.method.is_some() {
+                line_count += 1;
+            }
+            if exchange.id.is_some() {
+                line_count += 1;
+            }
+
+            // Request section
+            line_count += 1; // Blank line before section
+            line_count += 1; // Section header
+            line_count += 1; // Tabs line
+
+            if let Some(request) = &exchange.request {
+                match self.request_details_tab {
+                    0 => match &request.headers {
+                        Some(headers) if !headers.is_empty() => {
+                            line_count += headers.len();
+                        }
+                        Some(_) | None => {
+                            line_count += 1;
+                        }
+                    },
+                    _ => {
+                        let mut request_json = serde_json::Map::new();
+                        request_json.insert(
+                            "jsonrpc".to_string(),
+                            serde_json::Value::String("2.0".to_string()),
+                        );
+                        if let Some(id) = &request.id {
+                            request_json.insert("id".to_string(), id.clone());
+                        }
+                        if let Some(method) = &request.method {
+                            request_json.insert(
+                                "method".to_string(),
+                                serde_json::Value::String(method.clone()),
+                            );
+                        }
+                        if let Some(params) = &request.params {
+                            request_json.insert("params".to_string(), params.clone());
+                        }
+
+                        if let Ok(json_str) =
+                            serde_json::to_string_pretty(&serde_json::Value::Object(request_json))
+                        {
+                            line_count += json_str.lines().count();
+                        }
+                    }
+                }
+            } else {
+                line_count += 1;
+            }
+
+            line_count
+        } else {
+            1
+        }
+    }
+
+    pub fn get_response_details_content_lines(&self) -> usize {
+        if let Some(exchange) = self.get_selected_exchange() {
+            let mut line_count = 0;
+
+            // Response section
             line_count += 1; // Section header
             line_count += 1; // Tabs line
 
