@@ -286,11 +286,11 @@ async fn run_app(
                             app::AppMode::Normal => {
                                 if app.is_message_list_focused() {
                                     app.select_next();
-                                  } else if app.is_request_section_focused() {
-                                      if app.get_selected_exchange().is_some() {
-                                          app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
-                                      }
-                                  } else if app.is_response_section_focused() {
+                                } else if app.is_request_section_focused() {
+                                    if app.get_selected_exchange().is_some() {
+                                        app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                                    }
+                                } else if app.is_response_section_focused() {
                                     if app.get_selected_exchange().is_some() {
                                         app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                     }
@@ -373,15 +373,17 @@ async fn run_app(
                                     app.intercept_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                 }
                             }
-                        },
+                        }
                         KeyCode::Char('u') => match app.app_mode {
                             app::AppMode::Normal => {
                                 if app.is_request_section_focused() {
                                     let page_size = 10;
-                                    app.request_details_scroll = app.request_details_scroll.saturating_sub(page_size);
+                                    app.request_details_scroll =
+                                        app.request_details_scroll.saturating_sub(page_size);
                                 } else if app.is_response_section_focused() {
                                     let page_size = 10;
-                                    app.response_details_scroll = app.response_details_scroll.saturating_sub(page_size);
+                                    app.response_details_scroll =
+                                        app.response_details_scroll.saturating_sub(page_size);
                                 }
                                 // u does nothing when message list is focused
                             }
@@ -409,11 +411,12 @@ async fn run_app(
                                 app::AppMode::Normal => {
                                     if app.is_request_section_focused() {
                                         if app.get_selected_exchange().is_some() {
-                                             app.request_details_scroll = 10000; // Large number, UI will clamp to actual bottom
+                                            app.request_details_scroll = 10000; // Large number, UI will clamp to actual bottom
                                         }
                                     } else if app.is_response_section_focused() {
                                         if app.get_selected_exchange().is_some() {
-                                             app.response_details_scroll = 10000; // Large number, UI will clamp to actual bottom
+                                            app.response_details_scroll = 10000;
+                                            // Large number, UI will clamp to actual bottom
                                         }
                                     }
                                     // G does nothing when message list is focused
@@ -453,12 +456,12 @@ async fn run_app(
                                     } else if app.is_request_section_focused() {
                                         // Request details - scroll down
                                         if app.get_selected_exchange().is_some() {
-                                             app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                                            app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                         }
                                     } else if app.is_response_section_focused() {
                                         // Response details - scroll down
                                         if app.get_selected_exchange().is_some() {
-                                             app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                                            app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
                                         }
                                     }
                                 }
@@ -569,8 +572,10 @@ async fn run_app(
                         }
                         KeyCode::Char('h') => {
                             // Edit selected pending request headers with external editor (intercept mode)
-                            if (app.app_mode == app::AppMode::Paused || app.app_mode == app::AppMode::Intercepting)
-                                && app.get_pending_request_headers().is_some() {
+                            if (app.app_mode == app::AppMode::Paused
+                                || app.app_mode == app::AppMode::Intercepting)
+                                && app.get_pending_request_headers().is_some()
+                            {
                                 let headers_content = app.get_pending_request_headers().unwrap();
                                 // Temporarily exit TUI mode
                                 disable_raw_mode()?;
@@ -608,7 +613,9 @@ async fn run_app(
                             }
                             // Navigate tabs left in normal mode
                             if app.app_mode == app::AppMode::Normal
-                                && (app.is_request_section_focused() || app.is_response_section_focused()) {
+                                && (app.is_request_section_focused()
+                                    || app.is_response_section_focused())
+                            {
                                 if app.is_request_section_focused() {
                                     app.previous_request_tab();
                                 } else if app.is_response_section_focused() {
@@ -717,7 +724,9 @@ async fn run_app(
                         }
                         KeyCode::Char('l') => {
                             if app.app_mode == app::AppMode::Normal
-                                && (app.is_request_section_focused() || app.is_response_section_focused()) {
+                                && (app.is_request_section_focused()
+                                    || app.is_response_section_focused())
+                            {
                                 if app.is_request_section_focused() {
                                     app.next_request_tab();
                                 } else if app.is_response_section_focused() {

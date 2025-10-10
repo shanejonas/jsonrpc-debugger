@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, InputMode, TransportType, Focus};
+use crate::app::{App, AppMode, Focus, InputMode, TransportType};
 
 // Helper function to format JSON with syntax highlighting and 2-space indentation
 fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'static>> {
@@ -152,23 +152,19 @@ fn build_tab_line(
 
     for (index, label) in labels.iter().enumerate() {
         let is_selected = index == selected;
-        
+
         if is_selected {
             // Active tab - use a more prominent style like modern tab designs
             let mut style = Style::default();
             if is_enabled {
                 style = style
                     .fg(Color::Black)
-                    .bg(if is_active {
-                        Color::Cyan
-                    } else {
-                        Color::White
-                    })
+                    .bg(if is_active { Color::Cyan } else { Color::White })
                     .add_modifier(Modifier::BOLD);
             } else {
                 style = style.fg(Color::DarkGray).bg(Color::DarkGray);
             }
-            
+
             spans.push(Span::styled(format!(" {} ", *label), style));
         } else if is_enabled {
             // Inactive tab - subtle background
@@ -412,7 +408,11 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(table_title)
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
     } else {
         Block::default().borders(Borders::ALL).title(table_title)
     };
@@ -593,8 +593,8 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     let base_title = "Request Details";
 
     let scroll_info = if total_lines > visible_lines {
-        let progress =
-            ((app.request_details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
+        let progress = ((app.request_details_scroll as f32 / (total_lines - visible_lines) as f32)
+            * 100.0) as u8;
         format!("{} ({}% - vim: j/k/d/u/G/g)", base_title, progress)
     } else {
         base_title.to_string()
@@ -604,7 +604,11 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(scroll_info)
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
     } else {
         Block::default().borders(Borders::ALL).title(scroll_info)
     };
@@ -616,7 +620,8 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(details, area);
 
     if total_lines > visible_lines {
-        let mut scrollbar_state = ScrollbarState::new(total_lines).position(app.request_details_scroll);
+        let mut scrollbar_state =
+            ScrollbarState::new(total_lines).position(app.request_details_scroll);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -742,8 +747,8 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
     let base_title = "Response Details";
 
     let scroll_info = if total_lines > visible_lines {
-        let progress =
-            ((app.response_details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8;
+        let progress = ((app.response_details_scroll as f32 / (total_lines - visible_lines) as f32)
+            * 100.0) as u8;
         format!("{} ({}% - vim: j/k/d/u/G/g)", base_title, progress)
     } else {
         base_title.to_string()
@@ -753,7 +758,11 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(scroll_info)
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
     } else {
         Block::default().borders(Borders::ALL).title(scroll_info)
     };
@@ -765,7 +774,8 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(details, area);
 
     if total_lines > visible_lines {
-        let mut scrollbar_state = ScrollbarState::new(total_lines).position(app.response_details_scroll);
+        let mut scrollbar_state =
+            ScrollbarState::new(total_lines).position(app.response_details_scroll);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -783,8 +793,6 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 }
-
-
 
 // Helper struct to represent a keybind with its display information
 #[derive(Clone)]
@@ -1111,21 +1119,23 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!("Pending Requests ({})", app.pending_requests.len()))
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
     } else {
         Block::default()
             .borders(Borders::ALL)
             .title(format!("Pending Requests ({})", app.pending_requests.len()))
     };
 
-    let requests_list = List::new(requests)
-        .block(pending_block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        );
+    let requests_list = List::new(requests).block(pending_block).highlight_style(
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    );
 
     f.render_widget(requests_list, area);
 }
@@ -1290,7 +1300,11 @@ fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(scroll_info)
-            .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
     } else {
         Block::default().borders(Borders::ALL).title(scroll_info)
     };

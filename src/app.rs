@@ -98,7 +98,7 @@ pub struct App {
     pub pending_requests: Vec<PendingRequest>, // New field
     pub selected_pending: usize,               // New field
     pub request_editor_buffer: String,         // New field
-    pub focus: Focus,                         // New field for tracking which element is active
+    pub focus: Focus,                          // New field for tracking which element is active
     pub request_tab: usize,                    // 0 = Headers, 1 = Body
     pub response_tab: usize,                   // 0 = Headers, 1 = Body
 }
@@ -307,8 +307,6 @@ impl App {
         self.details_scroll = 0;
     }
 
-
-
     // Intercept details scrolling methods
     pub fn scroll_intercept_details_up(&mut self) {
         if self.intercept_details_scroll > 0 {
@@ -389,8 +387,6 @@ impl App {
         self.response_details_scroll = 0;
     }
 
-
-
     pub fn is_message_list_focused(&self) -> bool {
         matches!(self.focus, Focus::MessageList)
     }
@@ -402,8 +398,6 @@ impl App {
     pub fn is_response_section_focused(&self) -> bool {
         matches!(self.focus, Focus::ResponseSection)
     }
-
-
 
     pub fn next_request_tab(&mut self) {
         self.request_tab = 1 - self.request_tab; // Toggle between 0 and 1
