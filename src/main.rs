@@ -301,7 +301,21 @@ async fn run_app(
                             }
                         },
                         KeyCode::Left => {
-                            if app.app_mode == app::AppMode::Normal {
+                            if app.is_status_focused() {
+                                let desired_running = !app.is_running;
+                                if set_proxy_running(
+                                    &mut app,
+                                    desired_running,
+                                    &mut proxy_server,
+                                    &message_sender,
+                                    &proxy_state,
+                                )
+                                .await
+                                {
+                                    terminal.clear()?;
+                                    terminal.draw(|f| ui::draw(f, &app))?;
+                                }
+                            } else if app.app_mode == app::AppMode::Normal {
                                 if app.is_request_section_focused() {
                                     app.previous_request_tab();
                                 } else if app.is_response_section_focused() {
@@ -312,7 +326,21 @@ async fn run_app(
                             }
                         }
                         KeyCode::Right => {
-                            if app.app_mode == app::AppMode::Normal {
+                            if app.is_status_focused() {
+                                let desired_running = !app.is_running;
+                                if set_proxy_running(
+                                    &mut app,
+                                    desired_running,
+                                    &mut proxy_server,
+                                    &message_sender,
+                                    &proxy_state,
+                                )
+                                .await
+                                {
+                                    terminal.clear()?;
+                                    terminal.draw(|f| ui::draw(f, &app))?;
+                                }
+                            } else if app.app_mode == app::AppMode::Normal {
                                 if app.is_request_section_focused() {
                                     app.next_request_tab();
                                 } else if app.is_response_section_focused() {
@@ -495,33 +523,19 @@ async fn run_app(
                             }
                         }
                         KeyCode::Char('s') => {
-                            if app.is_running {
-                                // Stop proxy server first
-                                if let Some(handle) = proxy_server.take() {
-                                    handle.abort();
-                                    // Wait a bit for cleanup
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                                app.toggle_proxy();
-                            } else {
-                                // Start proxy server
-                                app.toggle_proxy();
-                                let server = ProxyServer::new(
-                                    app.proxy_config.listen_port,
-                                    app.proxy_config.target_url.clone(),
-                                    message_sender.clone(),
-                                )
-                                .with_state(proxy_state.clone());
-                                proxy_server = Some(tokio::spawn(async move {
-                                    if let Err(e) = server.start().await {
-                                        eprintln!("Proxy server error: {}", e);
-                                    }
-                                }));
+                            let desired_running = !app.is_running;
+                            if set_proxy_running(
+                                &mut app,
+                                desired_running,
+                                &mut proxy_server,
+                                &message_sender,
+                                &proxy_state,
+                            )
+                            .await
+                            {
+                                terminal.clear()?;
+                                terminal.draw(|f| ui::draw(f, &app))?;
                             }
-
-                            // Clear and force a redraw after state change
-                            terminal.clear()?;
-                            terminal.draw(|f| ui::draw(f, &app))?;
                         }
                         // Pause/Intercept key bindings
                         KeyCode::Char('p') => {
@@ -571,6 +585,23 @@ async fn run_app(
                             }
                         }
                         KeyCode::Char('h') => {
+                            if app.is_status_focused() && app.app_mode == app::AppMode::Normal {
+                                let desired_running = !app.is_running;
+                                if set_proxy_running(
+                                    &mut app,
+                                    desired_running,
+                                    &mut proxy_server,
+                                    &message_sender,
+                                    &proxy_state,
+                                )
+                                .await
+                                {
+                                    terminal.clear()?;
+                                    terminal.draw(|f| ui::draw(f, &app))?;
+                                }
+                                continue;
+                            }
+
                             // Edit selected pending request headers with external editor (intercept mode)
                             if (app.app_mode == app::AppMode::Paused
                                 || app.app_mode == app::AppMode::Intercepting)
@@ -723,7 +754,21 @@ async fn run_app(
                             terminal.clear()?;
                         }
                         KeyCode::Char('l') => {
-                            if app.app_mode == app::AppMode::Normal
+                            if app.is_status_focused() && app.app_mode == app::AppMode::Normal {
+                                let desired_running = !app.is_running;
+                                if set_proxy_running(
+                                    &mut app,
+                                    desired_running,
+                                    &mut proxy_server,
+                                    &message_sender,
+                                    &proxy_state,
+                                )
+                                .await
+                                {
+                                    terminal.clear()?;
+                                    terminal.draw(|f| ui::draw(f, &app))?;
+                                }
+                            } else if app.app_mode == app::AppMode::Normal
                                 && (app.is_request_section_focused()
                                     || app.is_response_section_focused())
                             {
@@ -751,4 +796,41 @@ async fn run_app(
             }
         }
     }
+}
+
+async fn set_proxy_running(
+    app: &mut App,
+    should_run: bool,
+    proxy_server: &mut Option<JoinHandle<()>>,
+    message_sender: &mpsc::UnboundedSender<app::JsonRpcMessage>,
+    proxy_state: &ProxyState,
+) -> bool {
+    if should_run == app.is_running {
+        return false;
+    }
+
+    if should_run {
+        app.toggle_proxy();
+
+        let listen_port = app.proxy_config.listen_port;
+        let target_url = app.proxy_config.target_url.clone();
+        let sender_clone = message_sender.clone();
+        let state_clone = proxy_state.clone();
+
+        *proxy_server = Some(tokio::spawn(async move {
+            let server =
+                ProxyServer::new(listen_port, target_url, sender_clone).with_state(state_clone);
+            if let Err(e) = server.start().await {
+                eprintln!("Proxy server error: {}", e);
+            }
+        }));
+    } else {
+        if let Some(handle) = proxy_server.take() {
+            handle.abort();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        app.toggle_proxy();
+    }
+
+    true
 }

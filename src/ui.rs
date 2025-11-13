@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, Focus, InputMode, TransportType};
+use crate::app::{App, AppMode, Focus, InputMode, JsonRpcExchange, TransportType};
 
 // Helper function to format JSON with syntax highlighting and 2-space indentation
 fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'static>> {
@@ -197,7 +197,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),                    // Header
+            Constraint::Length(5),                    // Header
             Constraint::Min(10),                      // Main content
             Constraint::Length(footer_height as u16), // Dynamic footer height
             Constraint::Length(1),                    // Input dialog
@@ -218,58 +218,204 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_footer(f, chunks[2], app);
 
-    // Draw input dialogs
-    if app.input_mode == InputMode::EditingTarget {
-        draw_input_dialog(f, app, "Edit Target URL", "Target URL");
-    } else if app.input_mode == InputMode::FilteringRequests {
+    // Draw modal input dialogs (target editing now inline at top)
+    if app.input_mode == InputMode::FilteringRequests {
         draw_input_dialog(f, app, "Filter Requests", "Filter");
     }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let status = if app.is_running { "RUNNING" } else { "STOPPED" };
-    let status_color = if app.is_running {
-        Color::Green
-    } else {
-        Color::Red
+    let header_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(area);
+
+    draw_request_header(f, header_chunks[0], app);
+    draw_status_header(f, header_chunks[1], app);
+}
+
+fn draw_request_header(f: &mut Frame, area: Rect, app: &App) {
+    let transport_label = match app.proxy_config.transport {
+        TransportType::Http => "HTTP",
+        TransportType::WebSocket => "WebSocket",
     };
 
-    let mode_text = match app.app_mode {
-        AppMode::Normal => String::new(),
-        AppMode::Paused => " | Mode: PAUSED".to_string(),
-        AppMode::Intercepting => format!(
-            " | Mode: INTERCEPTING ({} pending)",
-            app.pending_requests.len()
-        ),
+    let transport_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(210, 160, 255))
+        .add_modifier(Modifier::BOLD);
+
+    let dropdown_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Rgb(170, 120, 235))
+        .add_modifier(Modifier::BOLD);
+
+    let target_bg = if app.input_mode == InputMode::EditingTarget {
+        Color::Rgb(80, 56, 140)
+    } else {
+        Color::Rgb(48, 36, 96)
     };
+
+    let target_style = Style::default()
+        .fg(Color::White)
+        .bg(target_bg)
+        .add_modifier(Modifier::BOLD);
+
+    let target_text = if app.input_mode == InputMode::EditingTarget {
+        if app.input_buffer.is_empty() {
+            "Enter target URL".to_string()
+        } else {
+            app.input_buffer.clone()
+        }
+    } else if app.proxy_config.target_url.is_empty() {
+        "Press t to set target".to_string()
+    } else {
+        app.proxy_config.target_url.clone()
+    };
+
+    let mut spans = vec![
+        Span::styled(format!(" {} ", transport_label), transport_style),
+        Span::styled(" ▾ ", dropdown_style),
+        Span::raw(" "),
+        Span::styled(format!(" {} ", target_text), target_style),
+    ];
+
+    if app.input_mode == InputMode::EditingTarget {
+        spans.push(Span::styled("█", target_style));
+    }
+
+    spans.push(Span::raw("  "));
+
+    let filter_bg = if app.input_mode == InputMode::FilteringRequests {
+        Color::Rgb(80, 56, 140)
+    } else {
+        Color::Rgb(48, 36, 96)
+    };
+
+    let filter_style = Style::default()
+        .fg(if app.filter_text.is_empty() {
+            Color::Rgb(180, 170, 210)
+        } else {
+            Color::White
+        })
+        .bg(filter_bg)
+        .add_modifier(Modifier::BOLD);
+
+    let filter_text = if app.filter_text.is_empty() {
+        "Filter (press /)".to_string()
+    } else {
+        format!("Filter: {}", app.filter_text)
+    };
+
+    spans.push(Span::styled(format!(" {} ", filter_text), filter_style));
+
+    if app.input_mode == InputMode::FilteringRequests {
+        spans.push(Span::styled("█", filter_style));
+    }
+
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        "Request",
+        Style::default().fg(Color::LightMagenta),
+    ));
+
+    let paragraph = Paragraph::new(Line::from(spans))
+        .block(block)
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(paragraph, area);
+}
+
+fn draw_status_header(f: &mut Frame, area: Rect, app: &App) {
+    let status_focus = matches!(app.focus, Focus::StatusHeader);
+
+    let inactive_fg = Color::Rgb(180, 170, 210);
+
+    let mut running_style = if app.is_running {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(inactive_fg).bg(Color::Rgb(60, 60, 60))
+    };
+
+    let mut stopped_style = if app.is_running {
+        Style::default().fg(inactive_fg).bg(Color::Rgb(60, 60, 60))
+    } else {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(120, 35, 52))
+            .add_modifier(Modifier::BOLD)
+    };
+
+    if status_focus {
+        if app.is_running {
+            running_style = running_style.add_modifier(Modifier::UNDERLINED);
+        } else {
+            stopped_style = stopped_style.add_modifier(Modifier::UNDERLINED);
+        }
+    }
+
+    let mode_text = match app.app_mode {
+        AppMode::Normal => "Normal".to_string(),
+        AppMode::Paused => "Paused".to_string(),
+        AppMode::Intercepting => format!("Intercepting ({})", app.pending_requests.len()),
+    };
+
     let mode_color = match app.app_mode {
-        AppMode::Normal => Color::White,
+        AppMode::Normal => Color::Gray,
         AppMode::Paused => Color::Yellow,
         AppMode::Intercepting => Color::Red,
     };
 
-    let header_text = vec![Line::from(vec![
-        Span::raw("JSON-RPC Debugger | Status: "),
-        Span::styled(
-            status,
+    let mut lines = Vec::new();
+
+    let tab_spans = vec![
+        Span::styled(" RUNNING ", running_style),
+        Span::styled(" STOPPED ", stopped_style),
+    ];
+    lines.push(Line::from(tab_spans));
+
+    let label_style = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+
+    let info_line = Line::from(vec![
+        Span::styled("Port:", label_style),
+        Span::raw(format!(" {}", app.proxy_config.listen_port)),
+        Span::raw("    "),
+        Span::styled("Mode:", label_style),
+        Span::raw(format!(" {}", mode_text)),
+    ]);
+    lines.push(info_line);
+
+    if app.input_mode == InputMode::EditingTarget {
+        lines.push(Line::from(Span::styled(
+            "Editing target (Enter to save, Esc to cancel)",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    let mut block = Block::default().borders(Borders::ALL).title(Span::styled(
+        "Status",
+        Style::default().fg(Color::LightMagenta),
+    ));
+
+    if status_focus {
+        block = block.border_style(
             Style::default()
-                .fg(status_color)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " | Port: {} | Target: {} | Filter: {}",
-            app.proxy_config.listen_port, app.proxy_config.target_url, app.filter_text
-        )),
-        Span::styled(
-            mode_text,
-            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
-        ),
-    ])];
+        );
+    } else {
+        block = block.border_style(Style::default().fg(Color::DarkGray));
+    }
 
-    let header =
-        Paragraph::new(header_text).block(Block::default().borders(Borders::ALL).title("Status"));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
 
-    f.render_widget(header, area);
+    f.render_widget(paragraph, area);
 }
 
 fn draw_main_content(f: &mut Frame, area: Rect, app: &App) {
@@ -286,18 +432,46 @@ fn draw_main_content(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
-    if app.exchanges.is_empty() {
+    let filtered: Vec<(usize, &JsonRpcExchange)> = app
+        .exchanges
+        .iter()
+        .enumerate()
+        .filter(|(_, exchange)| {
+            if app.filter_text.is_empty() {
+                true
+            } else {
+                exchange
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
+            }
+        })
+        .collect();
+
+    if filtered.is_empty() {
         let empty_message = if app.is_running {
             format!(
-                "Proxy is running on port {}. Waiting for JSON-RPC requests...",
+                "Proxy is running on port {}. Waiting for requests...",
                 app.proxy_config.listen_port
             )
         } else {
             "Press 's' to start the proxy and begin capturing messages".to_string()
         };
 
+        let mut block = Block::default().borders(Borders::ALL).title("Requests");
+        if matches!(app.focus, Focus::MessageList) {
+            block = block.border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        } else {
+            block = block.border_style(Style::default().fg(Color::DarkGray));
+        }
+
         let paragraph = Paragraph::new(empty_message.as_str())
-            .block(Block::default().borders(Borders::ALL).title("JSON-RPC"))
+            .block(block)
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: true });
 
@@ -305,7 +479,20 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Create table headers
+    let selected_position = filtered
+        .iter()
+        .position(|(index, _)| *index == app.selected_exchange)
+        .unwrap_or(0);
+
+    let highlight_style = if matches!(app.focus, Focus::MessageList) {
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
     let header = Row::new(vec![
         Cell::from("Status"),
         Cell::from("Transport"),
@@ -316,24 +503,9 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
     .style(Style::default().add_modifier(Modifier::BOLD))
     .height(1);
 
-    // Create table rows
-    let rows: Vec<Row> = app
-        .exchanges
+    let rows: Vec<Row> = filtered
         .iter()
-        .enumerate()
-        .filter(|(_, exchange)| {
-            if app.filter_text.is_empty() {
-                true
-            } else {
-                // TODO: Filter by id, params, result, error, etc.
-                exchange
-                    .method
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains(&app.filter_text)
-            }
-        })
-        .map(|(i, exchange)| {
+        .map(|(_, exchange)| {
             let transport_symbol = match exchange.transport {
                 TransportType::Http => "HTTP",
                 TransportType::WebSocket => "WS",
@@ -350,7 +522,6 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                 })
                 .unwrap_or_else(|| "null".to_string());
 
-            // Determine status
             let (status_symbol, status_color) = if exchange.response.is_none() {
                 ("⏳ Pending", Color::Yellow)
             } else if let Some(response) = &exchange.response {
@@ -363,7 +534,6 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                 ("? Unknown", Color::Gray)
             };
 
-            // Calculate duration if we have both request and response
             let duration_text =
                 if let (Some(request), Some(response)) = (&exchange.request, &exchange.response) {
                     match response.timestamp.duration_since(request.timestamp) {
@@ -381,15 +551,6 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                     "-".to_string()
                 };
 
-            let style = if i == app.selected_exchange {
-                Style::default()
-                    .bg(Color::Cyan)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-
             Row::new(vec![
                 Cell::from(status_symbol).style(Style::default().fg(status_color)),
                 Cell::from(transport_symbol).style(Style::default().fg(Color::Blue)),
@@ -397,25 +558,20 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(id).style(Style::default().fg(Color::Gray)),
                 Cell::from(duration_text).style(Style::default().fg(Color::Magenta)),
             ])
-            .style(style)
             .height(1)
         })
         .collect();
 
-    let table_title = "JSON-RPC";
-
-    let table_block = if matches!(app.focus, Focus::MessageList) {
-        Block::default()
-            .borders(Borders::ALL)
-            .title(table_title)
-            .border_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+    let mut table_block = Block::default().borders(Borders::ALL).title("Requests");
+    if matches!(app.focus, Focus::MessageList) {
+        table_block = table_block.border_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
     } else {
-        Block::default().borders(Borders::ALL).title(table_title)
-    };
+        table_block = table_block.border_style(Style::default().fg(Color::DarkGray));
+    }
 
     let table = Table::new(
         rows,
@@ -429,37 +585,15 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .block(table_block)
-    .highlight_style(
-        Style::default()
-            .bg(Color::Cyan)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("→ ");
+    .highlight_style(highlight_style)
+    .highlight_symbol("  ");
 
     let mut table_state = TableState::default();
-    table_state.select(Some(app.selected_exchange));
+    table_state.select(Some(selected_position));
     f.render_stateful_widget(table, area, &mut table_state);
 
-    let filtered_count = app
-        .exchanges
-        .iter()
-        .filter(|exchange| {
-            if app.filter_text.is_empty() {
-                true
-            } else {
-                exchange
-                    .method
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains(&app.filter_text)
-            }
-        })
-        .count();
-
-    if filtered_count > 0 {
-        let mut scrollbar_state =
-            ScrollbarState::new(filtered_count).position(app.selected_exchange);
+    if filtered.len() > 1 {
+        let mut scrollbar_state = ScrollbarState::new(filtered.len()).position(selected_position);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)

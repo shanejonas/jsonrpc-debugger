@@ -51,6 +51,7 @@ pub enum Focus {
     MessageList,
     RequestSection,
     ResponseSection,
+    StatusHeader,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -370,7 +371,8 @@ impl App {
         self.focus = match self.focus {
             Focus::MessageList => Focus::RequestSection,
             Focus::RequestSection => Focus::ResponseSection,
-            Focus::ResponseSection => Focus::MessageList,
+            Focus::ResponseSection => Focus::StatusHeader,
+            Focus::StatusHeader => Focus::MessageList,
         };
         self.reset_details_scroll();
         self.request_details_scroll = 0;
@@ -379,9 +381,10 @@ impl App {
 
     pub fn switch_focus_reverse(&mut self) {
         self.focus = match self.focus {
-            Focus::MessageList => Focus::ResponseSection,
+            Focus::MessageList => Focus::StatusHeader,
             Focus::RequestSection => Focus::MessageList,
             Focus::ResponseSection => Focus::RequestSection,
+            Focus::StatusHeader => Focus::ResponseSection,
         };
         self.reset_details_scroll();
         self.request_details_scroll = 0;
@@ -398,6 +401,10 @@ impl App {
 
     pub fn is_response_section_focused(&self) -> bool {
         matches!(self.focus, Focus::ResponseSection)
+    }
+
+    pub fn is_status_focused(&self) -> bool {
+        matches!(self.focus, Focus::StatusHeader)
     }
 
     pub fn next_request_tab(&mut self) {
@@ -441,7 +448,7 @@ impl App {
     // Target editing methods
     pub fn start_editing_target(&mut self) {
         self.input_mode = InputMode::EditingTarget;
-        self.input_buffer.clear();
+        self.input_buffer = self.proxy_config.target_url.clone();
     }
 
     pub fn cancel_editing(&mut self) {
