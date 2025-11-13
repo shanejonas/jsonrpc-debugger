@@ -385,7 +385,7 @@ fn draw_status_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(format!(" {}", app.proxy_config.listen_port)),
         Span::raw("    "),
         Span::styled("Mode:", label_style),
-        Span::raw(format!(" {}", mode_text)),
+        Span::styled(format!(" {}", mode_text), Style::default().fg(mode_color)),
     ]);
     lines.push(info_line);
 
