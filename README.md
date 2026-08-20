@@ -17,9 +17,11 @@ https://github.com/user-attachments/assets/20a23f55-e3b8-44b1-9536-fcc1fd6e09dc
 - 📊 **HTTP headers display** for debugging transport details
 - ⌨️ **Vim-style navigation** with comprehensive keyboard shortcuts
 - 🎯 **Dynamic configuration** - change target URL and port on the fly
-- 📝 **External editor support** for request/response modification
+- 📝 **Inline modal editor** with core Vim motions and operators
 - 📋 **Table view** with status, transport, method, ID, and duration columns
 - 🔄 **Custom response creation** for intercepted requests
+- 🖱️ **Mouse support** for hover focus, scrolling, tabs, inputs, and line references
+- 🤖 **JSON-RPC control plane** for agents and scripts
 
 ## Installation
 
@@ -76,6 +78,9 @@ jsonrpc-debugger --target https://your-api.com
 
 # Both custom port and target
 jsonrpc-debugger --port 9090 --target https://your-api.com
+
+# Override the control plane port (defaults to proxy port + 1)
+jsonrpc-debugger --port 9090 --control-port 9999
 
 # Show help
 jsonrpc-debugger --help
@@ -135,6 +140,12 @@ The TUI is divided into three main sections:
 - `d/u` or `Ctrl+d/Ctrl+u` - Page down/up in details
 - `G` - Go to bottom of details
 - `g` - Go to top of details
+- `Enter` - Copy the focused panel as Markdown
+- Move the mouse over a panel to focus it
+- Use the mouse wheel to scroll the panel under the pointer
+- Click a request or response line to focus and highlight it
+- Shift-click another line to extend the highlighted range
+- Click tabs, target, filter, or status controls to use them
 
 ### Proxy Control
 - `s` - Start/stop the proxy server
@@ -145,8 +156,8 @@ The TUI is divided into three main sections:
 ### Interception Mode
 - `p` - Toggle pause mode (intercept new requests)
 - `a` - Allow selected intercepted request
-- `e` - Edit selected request body in external editor
-- `h` - Edit selected request headers in external editor
+- `e` - Edit selected request body
+- `h` - Edit selected request headers
 - `c` - Complete request with custom response
 - `b` - Block selected request
 - `r` - Resume all pending requests
@@ -159,26 +170,29 @@ The debugger supports Charles Proxy-style request interception:
 2. **Make requests**: Send JSON-RPC requests to the proxy
 3. **Inspect**: Intercepted requests appear in the pending list with ⏸ icon
 4. **Modify**: 
-   - Press `e` to edit request body in your external editor
+   - Press `e` to edit request body
    - Press `h` to edit HTTP headers
    - Press `c` to create a custom response
 5. **Control**: Press `a` to allow, `b` to block, or `r` to resume all
 
-### External Editor
+### Inline Editor
 
-The debugger uses your system's default editor for request modification:
-- Checks `$EDITOR` environment variable
-- Falls back to `$VISUAL`
-- Defaults to `vim`, then `nano`, then `vi`
+The editor stays inside the TUI:
+
+- `i`, `a`, `I`, `A`, `o`, or `O` - Enter insert mode
+- `h`, `j`, `k`, `l`, `w`, `b`, `e`, `0`, `$`, `gg`, or `G` - Move
+- `d`, `c`, or `y` plus a motion - Delete, change, or yank (`dw`, `cw`, `db`, `de`, and so on)
+- `dd`, `cc`, or `yy` - Delete, change, or yank a line
+- `x`, `X`, `D`, `C`, `s`, or `S` - Edit characters or the current line
+- `p` or `P` - Paste after or before
+- `u` - Undo
+- `Esc` - Return to normal mode
+- `:w`, `:wq`, `:x`, or `Ctrl+S` - Save
+- `:q`, `:q!`, or `q` in normal mode - Cancel
 
 Modified requests show with a ✏ icon and [MODIFIED] or [BODY]/[HEADERS] labels.
 
 ## Configuration
-
-### Environment Variables
-
-- `EDITOR` - Preferred text editor for request modification
-- `VISUAL` - Alternative editor (fallback)
 
 ### Port Conflicts
 
@@ -216,14 +230,65 @@ curl -X POST http://localhost:8080 \
 
 1. Enable pause mode and intercept a request
 2. Press `c` to create a custom response
-3. Edit the JSON response in your external editor
+3. Edit the JSON response in the inline editor
 4. The custom response is sent back to the client
 
 ### Creating New Requests
 
 1. Press `c` in normal mode
-2. Edit the JSON-RPC request template in your external editor
-3. The request is sent through the proxy to the target
+2. Edit the JSON-RPC request template in the inline editor
+3. Save it. The request runs in the background while the TUI stays responsive
+
+## Agent Control Plane
+
+The debugger exposes a JSON-RPC 2.0 control plane on loopback. Its port defaults to the proxy port plus one, so a proxy on `8080` has a control plane on `8081`.
+
+Ask it for its OpenRPC document:
+
+```bash
+curl http://127.0.0.1:8081 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"rpc.discover"}'
+```
+
+An agent can read state and history, wait for changes, send requests through the debugger, select an exchange, focus or scroll a TUI panel, and highlight numbered request or response lines. A user click creates the same line reference, exposed as `lineSelection` by `debugger.getState`, so the user and agent can discuss the same evidence.
+
+Read numbered panel lines, then reveal one:
+
+```bash
+curl http://127.0.0.1:8081 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"debugger.getPanel","params":{"panel":"response"}}'
+
+curl http://127.0.0.1:8081 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"debugger.revealLines","params":{"panel":"response","startLine":8}}'
+```
+
+The control plane can also set the target or filter, pause interception, inspect pending requests, and allow, block, or complete them. Every call updates the runtime state shown in the TUI.
+
+Wait without polling. Pass the latest `revision` from `debugger.getState`; the call returns when state changes or the timeout expires:
+
+```bash
+curl http://127.0.0.1:8081 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"debugger.waitForChange","params":{"afterRevision":12,"timeoutMs":30000}}'
+```
+
+`debugger.exportSession` returns portable history JSON. Pass that value to `debugger.replaySession` to append it to the visible history. Replay never forwards requests to the target.
+
+Send a request through the debugger:
+
+```bash
+curl http://127.0.0.1:8081 \
+  -H 'content-type: application/json' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"debugger.sendRequest",
+    "params":{"request":{"jsonrpc":"2.0","id":42,"method":"eth_blockNumber","params":[]}}
+  }'
+```
 
 ## Troubleshooting
 
@@ -246,15 +311,9 @@ If requests fail with "connection refused":
 - Test the target directly with curl
 - Make sure you've set a target URL (press `t` in the TUI)
 
-### Editor Not Found
+### Request Errors
 
-If external editing fails:
-```bash
-# Set your preferred editor
-export EDITOR=code  # VS Code
-export EDITOR=nano  # Nano
-export EDITOR=vim   # Vim
-```
+New requests run in the background. Connection, HTTP, and JSON errors appear at the bottom of the TUI.
 
 ### JSON Formatting Issues
 

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-20
+
+### Added
+
+- A loopback JSON-RPC control plane with an OpenRPC document, agent-driven requests, interception controls, shared line references, and revision-based change waiting.
+- Visible request and response line numbers. Click a line to reference it, then Shift-click to extend the range.
+- Portable session export and replay. Replayed history never sends traffic to the target.
+- Mouse focus, panel scrolling, clickable tabs and inputs, and Markdown clipboard output.
+- An inline modal editor with Vim word motions, operators, paste, and undo.
+
+### Changed
+
+- New requests run in the background instead of blocking or leaving the TUI.
+- CI tests every change. Tagged releases publish only when the tag matches the package version.
+
 ## [0.1.0] - 2024-01-XX
 
 ### Added
@@ -39,4 +54,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Uses warp for HTTP proxy server
 - Async/await architecture with tokio
 - Thread-safe state management with Arc<Mutex<>>
-- Comprehensive error handling and input sanitization 
+- Comprehensive error handling and input sanitization

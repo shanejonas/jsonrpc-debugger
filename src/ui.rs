@@ -9,7 +9,320 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, AppMode, Focus, InputMode, JsonRpcExchange, TransportType};
+use crate::app::{App, AppMode, EditorMode, Focus, InputMode, JsonRpcExchange, TransportType};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    EditTarget,
+    EditFilter,
+    SetProxyRunning(bool),
+    SelectExchange(usize),
+    SelectPending(usize),
+    SelectRequestTab(usize),
+    SelectResponseTab(usize),
+    SelectLine { panel: Focus, line: usize },
+    Focus(Focus),
+}
+
+pub fn panel_focus(area: Rect, app: &App, column: u16, row: u16) -> Option<Focus> {
+    let chunks = screen_chunks(area, app);
+    let header = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(chunks[0]);
+    if contains(header[1], column, row) {
+        return Some(Focus::StatusHeader);
+    }
+    if !contains(chunks[1], column, row) {
+        return None;
+    }
+
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+    if contains(main[0], column, row) {
+        return Some(Focus::MessageList);
+    }
+    if !contains(main[1], column, row) || app.app_mode != AppMode::Normal {
+        return contains(main[1], column, row).then_some(Focus::RequestSection);
+    }
+
+    let details = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(main[1]);
+    if contains(details[0], column, row) {
+        return Some(Focus::RequestSection);
+    }
+    if contains(details[1], column, row) {
+        return Some(Focus::ResponseSection);
+    }
+
+    None
+}
+
+pub fn panel_visible_lines(area: Rect, app: &App, focus: Focus) -> usize {
+    let chunks = screen_chunks(area, app);
+    let main_height = chunks[1].height as usize;
+    match (app.app_mode, focus) {
+        (AppMode::Normal, Focus::RequestSection | Focus::ResponseSection) => {
+            (main_height / 2).saturating_sub(2)
+        }
+        (AppMode::Paused | AppMode::Intercepting, Focus::RequestSection) => {
+            main_height.saturating_sub(2)
+        }
+        _ => main_height.saturating_sub(3),
+    }
+}
+
+pub fn mouse_action(area: Rect, app: &App, column: u16, row: u16) -> Option<MouseAction> {
+    let chunks = screen_chunks(area, app);
+    let header_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(chunks[0]);
+
+    if contains(header_chunks[0], column, row) {
+        return request_header_action(header_chunks[0], app, column, row);
+    }
+    if contains(header_chunks[1], column, row) {
+        return status_header_action(header_chunks[1], column, row);
+    }
+    if !contains(chunks[1], column, row) {
+        return None;
+    }
+
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    if contains(main_chunks[0], column, row) {
+        return match app.app_mode {
+            AppMode::Normal => message_list_action(main_chunks[0], app, row),
+            AppMode::Paused | AppMode::Intercepting => {
+                pending_list_action(main_chunks[0], app, row)
+            }
+        };
+    }
+
+    if !contains(main_chunks[1], column, row) {
+        return None;
+    }
+    if app.app_mode != AppMode::Normal {
+        return Some(MouseAction::Focus(Focus::RequestSection));
+    }
+
+    let details = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(main_chunks[1]);
+
+    if contains(details[0], column, row) {
+        return request_details_action(details[0], app, column, row);
+    }
+    if contains(details[1], column, row) {
+        return response_details_action(details[1], app, column, row);
+    }
+
+    None
+}
+
+fn screen_chunks(area: Rect, app: &App) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(10),
+            Constraint::Length(footer_height(app, area.width)),
+            Constraint::Length(1),
+        ])
+        .split(area)
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn request_header_action(area: Rect, app: &App, column: u16, row: u16) -> Option<MouseAction> {
+    if row != area.y.saturating_add(1) {
+        return None;
+    }
+
+    let transport_width = match app.proxy_config.transport {
+        TransportType::Http => 6,
+        TransportType::WebSocket => 11,
+    };
+    let target = if app.input_mode == InputMode::EditingTarget {
+        if app.input_buffer.is_empty() {
+            "Enter target URL"
+        } else {
+            &app.input_buffer
+        }
+    } else if app.proxy_config.target_url.is_empty() {
+        "Press t to set target"
+    } else {
+        &app.proxy_config.target_url
+    };
+    let target_start = area.x.saturating_add(1 + transport_width + 4);
+    let target_end = target_start.saturating_add(target.chars().count() as u16 + 2);
+    if column >= target_start && column < target_end {
+        return Some(MouseAction::EditTarget);
+    }
+
+    let cursor_width = u16::from(app.input_mode == InputMode::EditingTarget);
+    let filter_start = target_end.saturating_add(cursor_width + 2);
+    let filter_width = if app.filter_text.is_empty() {
+        "Filter (press /)".chars().count() as u16 + 2
+    } else {
+        "Filter: ".chars().count() as u16 + app.filter_text.chars().count() as u16 + 2
+    };
+    if column >= filter_start && column < filter_start.saturating_add(filter_width) {
+        return Some(MouseAction::EditFilter);
+    }
+
+    None
+}
+
+fn status_header_action(area: Rect, column: u16, row: u16) -> Option<MouseAction> {
+    if row == area.y.saturating_add(1) {
+        let running_start = area.x.saturating_add(1);
+        let stopped_start = running_start.saturating_add(9);
+        if column >= running_start && column < stopped_start {
+            return Some(MouseAction::SetProxyRunning(true));
+        }
+        if column >= stopped_start && column < stopped_start.saturating_add(9) {
+            return Some(MouseAction::SetProxyRunning(false));
+        }
+    }
+
+    Some(MouseAction::Focus(Focus::StatusHeader))
+}
+
+fn message_list_action(area: Rect, app: &App, row: u16) -> Option<MouseAction> {
+    let indices = app.filtered_exchange_indices();
+    let first_row = area.y.saturating_add(2);
+    let visible_rows = area.height.saturating_sub(3) as usize;
+    if row < first_row || visible_rows == 0 || indices.is_empty() {
+        return Some(MouseAction::Focus(Focus::MessageList));
+    }
+
+    let selected = indices
+        .iter()
+        .position(|index| *index == app.selected_exchange)
+        .unwrap_or(0);
+    let offset = selected.saturating_sub(visible_rows.saturating_sub(1));
+    let clicked = offset + row.saturating_sub(first_row) as usize;
+    let Some(index) = indices.get(clicked) else {
+        return Some(MouseAction::Focus(Focus::MessageList));
+    };
+
+    Some(MouseAction::SelectExchange(*index))
+}
+
+fn pending_list_action(area: Rect, app: &App, row: u16) -> Option<MouseAction> {
+    let first_row = area.y.saturating_add(1);
+    if row < first_row {
+        return Some(MouseAction::Focus(Focus::MessageList));
+    }
+
+    let index = app
+        .pending_requests
+        .iter()
+        .enumerate()
+        .filter(|(_, pending)| {
+            app.filter_text.is_empty()
+                || pending
+                    .original_request
+                    .method
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(&app.filter_text)
+        })
+        .nth(row.saturating_sub(first_row) as usize)
+        .map(|(index, _)| index);
+
+    let Some(index) = index else {
+        return Some(MouseAction::Focus(Focus::MessageList));
+    };
+
+    Some(MouseAction::SelectPending(index))
+}
+
+fn request_details_action(area: Rect, app: &App, column: u16, row: u16) -> Option<MouseAction> {
+    let exchange = app.get_selected_exchange();
+    let tab_line = 3
+        + usize::from(exchange.and_then(|value| value.method.as_ref()).is_some())
+        + usize::from(exchange.and_then(|value| value.id.as_ref()).is_some());
+
+    let content = request_detail_lines(app);
+    let clicked = clicked_detail_line(area, row, app.request_details_scroll, &content);
+    let has_request = exchange.and_then(|value| value.request.as_ref()).is_some();
+    if has_request && clicked == Some(tab_line + 1) {
+        return tab_action(area, column, detail_gutter_width(content.len()))
+            .map(MouseAction::SelectRequestTab);
+    }
+
+    clicked
+        .map(|line| MouseAction::SelectLine {
+            panel: Focus::RequestSection,
+            line,
+        })
+        .or(Some(MouseAction::Focus(Focus::RequestSection)))
+}
+
+fn response_details_action(area: Rect, app: &App, column: u16, row: u16) -> Option<MouseAction> {
+    let content = response_detail_lines(app);
+    let clicked = clicked_detail_line(area, row, app.response_details_scroll, &content);
+    let has_response = app
+        .get_selected_exchange()
+        .and_then(|exchange| exchange.response.as_ref())
+        .is_some();
+    if has_response && clicked == Some(2) {
+        return tab_action(area, column, detail_gutter_width(content.len()))
+            .map(MouseAction::SelectResponseTab);
+    }
+
+    clicked
+        .map(|line| MouseAction::SelectLine {
+            panel: Focus::ResponseSection,
+            line,
+        })
+        .or(Some(MouseAction::Focus(Focus::ResponseSection)))
+}
+
+fn clicked_detail_line(area: Rect, row: u16, scroll: usize, content: &[Line<'_>]) -> Option<usize> {
+    if row <= area.y || row >= area.y.saturating_add(area.height).saturating_sub(1) {
+        return None;
+    }
+
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let gutter_width = detail_gutter_width(content.len());
+    let mut visible_row = usize::from(row.saturating_sub(area.y + 1));
+    for (index, line) in content.iter().enumerate().skip(scroll) {
+        let height = (line.width() + gutter_width).max(1).div_ceil(width);
+        if visible_row < height {
+            return Some(index + 1);
+        }
+        visible_row -= height;
+    }
+
+    None
+}
+
+fn tab_action(area: Rect, column: u16, gutter_width: usize) -> Option<usize> {
+    let gutter_width = u16::try_from(gutter_width).unwrap_or(u16::MAX);
+    let column = column.checked_sub(area.x.saturating_add(1 + gutter_width))?;
+    match column {
+        0..=8 => Some(0),
+        9..=14 => Some(1),
+        _ => None,
+    }
+}
 
 // Helper function to format JSON with syntax highlighting and 2-space indentation
 fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'static>> {
@@ -188,19 +501,15 @@ fn build_tab_line(
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    // Calculate footer height dynamically
-    let keybinds = get_keybinds_for_mode(app);
-    let available_width = f.size().width as usize;
-    let line_spans = arrange_keybinds_responsive(keybinds, available_width);
-    let footer_height = (line_spans.len() + 2).max(3); // +2 for borders, minimum 3
+    let footer_height = footer_height(app, f.size().width);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),                    // Header
-            Constraint::Min(10),                      // Main content
-            Constraint::Length(footer_height as u16), // Dynamic footer height
-            Constraint::Length(1),                    // Input dialog
+            Constraint::Length(5),             // Header
+            Constraint::Min(10),               // Main content
+            Constraint::Length(footer_height), // Dynamic footer height
+            Constraint::Length(1),             // Input dialog
         ])
         .split(f.size());
 
@@ -218,10 +527,120 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_footer(f, chunks[2], app);
 
-    // Draw modal input dialogs (target editing now inline at top)
-    if app.input_mode == InputMode::FilteringRequests {
+    if let Some(notice) = &app.notice {
+        let color = if notice.starts_with("Error:") {
+            Color::Red
+        } else {
+            Color::Green
+        };
+        f.render_widget(
+            Paragraph::new(notice.as_str()).style(Style::default().fg(color)),
+            chunks[3],
+        );
+    }
+
+    if app.editor.is_some() {
+        draw_text_editor(f, app);
+    } else if app.input_mode == InputMode::FilteringRequests {
         draw_input_dialog(f, app, "Filter Requests", "Filter");
     }
+}
+
+fn draw_text_editor(f: &mut Frame, app: &App) {
+    let Some(editor) = &app.editor else {
+        return;
+    };
+
+    let area = f.size();
+    let popup = Rect {
+        x: area.x + 2.min(area.width / 2),
+        y: area.y + 2.min(area.height / 2),
+        width: area.width.saturating_sub(4).max(1),
+        height: area.height.saturating_sub(4).max(1),
+    };
+    let mode = match editor.mode {
+        EditorMode::Normal => "NORMAL",
+        EditorMode::Insert => "INSERT",
+        EditorMode::Command => "COMMAND",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("{} — {}", editor.target.title(), mode))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
+    if inner.height == 0 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let visible_lines = chunks[0].height as usize;
+    let scroll = editor.row.saturating_sub(visible_lines.saturating_sub(1));
+    let lines = editor
+        .lines
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_lines)
+        .map(|(index, line)| {
+            let style = if index == editor.row {
+                Style::default().bg(Color::Rgb(35, 35, 35))
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>4} │ ", index + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(line.clone(), style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let status = if let Some(error) = &editor.error {
+        Span::styled(error.clone(), Style::default().fg(Color::Red))
+    } else if editor.mode == EditorMode::Command {
+        Span::styled(
+            format!(":{}", editor.command),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if let Some(operator) = editor.pending_operator {
+        Span::styled(
+            format!("{}…  motion or {} for line", operator.key(), operator.key()),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if editor.pending_g {
+        Span::styled("g…  g for first line", Style::default().fg(Color::Yellow))
+    } else {
+        Span::styled(
+            "i/a/I/A/o/O · w/b/e · d/c/y+motion · dd/cc/yy · u · p/P · :wq",
+            Style::default().fg(Color::Gray),
+        )
+    };
+    f.render_widget(Paragraph::new(Line::from(status)), chunks[1]);
+
+    let cursor_x = chunks[0]
+        .x
+        .saturating_add(7 + editor.column as u16)
+        .min(chunks[0].right().saturating_sub(1));
+    let cursor_y = chunks[0]
+        .y
+        .saturating_add(editor.row.saturating_sub(scroll) as u16)
+        .min(chunks[0].bottom().saturating_sub(1));
+    f.set_cursor(cursor_x, cursor_y);
+}
+
+fn footer_height(app: &App, width: u16) -> u16 {
+    let keybinds = get_keybinds_for_mode(app);
+    let lines = arrange_keybinds_responsive(keybinds, width as usize);
+    (lines.len() + 2).max(3) as u16
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -383,7 +802,7 @@ fn draw_status_header(f: &mut Frame, area: Rect, app: &App) {
     let info_line = Line::from(vec![
         Span::styled("Port:", label_style),
         Span::raw(format!(" {}", app.proxy_config.listen_port)),
-        Span::raw("    "),
+        Span::raw(format!("  RPC: {}  ", app.control_port)),
         Span::styled("Mode:", label_style),
         Span::styled(format!(" {}", mode_text), Style::default().fg(mode_color)),
     ]);
@@ -612,8 +1031,109 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
-    let content = if let Some(exchange) = app.get_selected_exchange() {
+pub fn detail_line_count(app: &App, panel: Focus) -> Option<usize> {
+    detail_lines_text(app, panel).map(|lines| lines.len())
+}
+
+pub fn detail_lines_text(app: &App, panel: Focus) -> Option<Vec<String>> {
+    let lines = match panel {
+        Focus::RequestSection => request_detail_lines(app),
+        Focus::ResponseSection => response_detail_lines(app),
+        Focus::MessageList | Focus::StatusHeader => return None,
+    };
+
+    Some(lines.iter().map(line_text).collect())
+}
+
+pub fn detail_line_text(
+    app: &App,
+    panel: Focus,
+    start_line: usize,
+    end_line: usize,
+) -> Option<Vec<String>> {
+    let lines = detail_lines_text(app, panel)?;
+    if start_line == 0 || end_line < start_line || end_line > lines.len() {
+        return None;
+    }
+
+    Some(lines[start_line - 1..end_line].to_vec())
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn highlight_selected_lines(
+    lines: Vec<Line<'static>>,
+    app: &App,
+    panel: Focus,
+) -> Vec<Line<'static>> {
+    let Some(selection) = &app.line_selection else {
+        return lines;
+    };
+    if selection.panel != panel {
+        return lines;
+    }
+
+    let style = Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let line_number = index + 1;
+            if (selection.start_line..=selection.end_line).contains(&line_number) {
+                line.style(style)
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
+fn number_detail_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let number_width = lines.len().max(1).to_string().len();
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let mut spans = vec![Span::styled(
+                format!("{:>number_width$} │ ", index + 1),
+                Style::default().fg(Color::DarkGray),
+            )];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+fn detail_gutter_width(line_count: usize) -> usize {
+    line_count.max(1).to_string().len() + 3
+}
+
+fn detail_title(title: &str, app: &App, panel: Focus) -> String {
+    let Some(selection) = &app.line_selection else {
+        return title.to_string();
+    };
+    if selection.panel != panel {
+        return title.to_string();
+    }
+    if selection.start_line == selection.end_line {
+        return format!("{title} • line {}", selection.start_line);
+    }
+
+    format!(
+        "{title} • lines {}-{}",
+        selection.start_line, selection.end_line
+    )
+}
+
+pub fn request_detail_lines(app: &App) -> Vec<Line<'static>> {
+    if let Some(exchange) = app.get_selected_exchange() {
         let mut lines = Vec::new();
 
         // Basic exchange info
@@ -704,7 +1224,12 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
         lines
     } else {
         vec![Line::from("No request selected")]
-    };
+    }
+}
+
+fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
+    let content = number_detail_lines(request_detail_lines(app));
+    let content = highlight_selected_lines(content, app, Focus::RequestSection);
 
     // Calculate visible area for scrolling
     let inner_area = area.inner(&Margin {
@@ -715,7 +1240,8 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     let total_lines = content.len();
 
     // Apply scrolling offset
-    let start_line = app.request_details_scroll;
+    let max_scroll = total_lines.saturating_sub(visible_lines);
+    let start_line = app.request_details_scroll.min(max_scroll);
     let end_line = std::cmp::min(start_line + visible_lines, total_lines);
     let visible_content = if start_line < total_lines {
         content[start_line..end_line].to_vec()
@@ -724,14 +1250,13 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Create title with scroll indicator
-    let base_title = "Request Details";
+    let base_title = detail_title("Request Details", app, Focus::RequestSection);
 
     let scroll_info = if total_lines > visible_lines {
-        let progress = ((app.request_details_scroll as f32 / (total_lines - visible_lines) as f32)
-            * 100.0) as u8;
+        let progress = ((start_line as f32 / max_scroll as f32) * 100.0) as u8;
         format!("{} ({}% - vim: j/k/d/u/G/g)", base_title, progress)
     } else {
-        base_title.to_string()
+        base_title
     };
 
     let details_block = if matches!(app.focus, Focus::RequestSection) {
@@ -754,8 +1279,7 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(details, area);
 
     if total_lines > visible_lines {
-        let mut scrollbar_state =
-            ScrollbarState::new(total_lines).position(app.request_details_scroll);
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(start_line);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -787,8 +1311,8 @@ fn draw_details_split(f: &mut Frame, area: Rect, app: &App) {
     draw_response_details(f, chunks[1], app);
 }
 
-fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
-    let content = if let Some(exchange) = app.get_selected_exchange() {
+pub fn response_detail_lines(app: &App) -> Vec<Line<'static>> {
+    if let Some(exchange) = app.get_selected_exchange() {
         let mut lines = Vec::new();
 
         // Response section with tabs
@@ -858,7 +1382,12 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
         lines
     } else {
         vec![Line::from("No request selected")]
-    };
+    }
+}
+
+fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
+    let content = number_detail_lines(response_detail_lines(app));
+    let content = highlight_selected_lines(content, app, Focus::ResponseSection);
 
     // Calculate visible area for scrolling
     let inner_area = area.inner(&Margin {
@@ -869,7 +1398,8 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
     let total_lines = content.len();
 
     // Apply scrolling offset
-    let start_line = app.response_details_scroll;
+    let max_scroll = total_lines.saturating_sub(visible_lines);
+    let start_line = app.response_details_scroll.min(max_scroll);
     let end_line = std::cmp::min(start_line + visible_lines, total_lines);
     let visible_content = if start_line < total_lines {
         content[start_line..end_line].to_vec()
@@ -878,14 +1408,13 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Create title with scroll indicator
-    let base_title = "Response Details";
+    let base_title = detail_title("Response Details", app, Focus::ResponseSection);
 
     let scroll_info = if total_lines > visible_lines {
-        let progress = ((app.response_details_scroll as f32 / (total_lines - visible_lines) as f32)
-            * 100.0) as u8;
+        let progress = ((start_line as f32 / max_scroll as f32) * 100.0) as u8;
         format!("{} ({}% - vim: j/k/d/u/G/g)", base_title, progress)
     } else {
-        base_title.to_string()
+        base_title
     };
 
     let details_block = if matches!(app.focus, Focus::ResponseSection) {
@@ -908,8 +1437,7 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(details, area);
 
     if total_lines > visible_lines {
-        let mut scrollbar_state =
-            ScrollbarState::new(total_lines).position(app.response_details_scroll);
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(start_line);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -972,6 +1500,7 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
         KeybindInfo::new("s", "start/stop proxy", 1),
         // Navigation keybinds (priority 2)
         KeybindInfo::new("Tab/Shift+Tab", "navigate", 2),
+        KeybindInfo::new("Enter", "copy markdown", 2),
         KeybindInfo::new("^n/^p", "navigate", 2),
         KeybindInfo::new("t", "edit target", 2),
         KeybindInfo::new("/", "filter", 2),
@@ -1249,7 +1778,7 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let pending_block = if matches!(app.app_mode, AppMode::Paused | AppMode::Intercepting) {
+    let pending_block = if matches!(app.focus, Focus::MessageList) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!("Pending Requests ({})", app.pending_requests.len()))
@@ -1430,7 +1959,7 @@ fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
         "Request Details".to_string()
     };
 
-    let details_block = if matches!(app.app_mode, AppMode::Paused | AppMode::Intercepting) {
+    let details_block = if matches!(app.focus, Focus::RequestSection) {
         Block::default()
             .borders(Borders::ALL)
             .title(scroll_info)
@@ -1466,6 +1995,202 @@ fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
                 horizontal: 0,
             }),
             &mut scrollbar_state,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{JsonRpcMessage, MessageDirection};
+
+    fn app_with_request() -> App {
+        let mut app = App::new();
+        app.add_message(JsonRpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: Some("eth_call".to_string()),
+            params: Some(serde_json::json!([])),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: MessageDirection::Request,
+            transport: TransportType::Http,
+            headers: None,
+        });
+        app.add_message(JsonRpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: None,
+            params: None,
+            result: Some(serde_json::json!("0x1")),
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: MessageDirection::Response,
+            transport: TransportType::Http,
+            headers: None,
+        });
+        app
+    }
+
+    fn normal_panels(area: Rect, app: &App) -> (Rect, Rect, Rect) {
+        let screen = screen_chunks(area, app);
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(screen[1]);
+        let details = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(main[1]);
+
+        (main[0], details[0], details[1])
+    }
+
+    #[test]
+    fn clicking_a_request_row_selects_it() {
+        let app = app_with_request();
+        let area = Rect::new(0, 0, 120, 40);
+        let (requests, _, _) = normal_panels(area, &app);
+
+        assert_eq!(
+            mouse_action(area, &app, requests.x + 2, requests.y + 2),
+            Some(MouseAction::SelectExchange(0))
+        );
+    }
+
+    #[test]
+    fn clicking_detail_tabs_selects_them() {
+        let app = app_with_request();
+        let area = Rect::new(0, 0, 120, 40);
+        let (_, request, response) = normal_panels(area, &app);
+        let request_gutter = detail_gutter_width(request_detail_lines(&app).len()) as u16;
+        let response_gutter = detail_gutter_width(response_detail_lines(&app).len()) as u16;
+
+        assert_eq!(
+            mouse_action(area, &app, request.x + 1 + request_gutter, request.y + 6,),
+            Some(MouseAction::SelectRequestTab(0))
+        );
+        assert_eq!(
+            mouse_action(
+                area,
+                &app,
+                response.x + 11 + response_gutter,
+                response.y + 2,
+            ),
+            Some(MouseAction::SelectResponseTab(1))
+        );
+    }
+
+    #[test]
+    fn clicking_detail_content_selects_a_line() {
+        let app = app_with_request();
+        let area = Rect::new(0, 0, 120, 40);
+        let (_, request, response) = normal_panels(area, &app);
+
+        assert_eq!(
+            mouse_action(area, &app, request.x + 20, request.y + 3),
+            Some(MouseAction::SelectLine {
+                panel: Focus::RequestSection,
+                line: 3,
+            })
+        );
+        assert_eq!(
+            mouse_action(area, &app, response.x + 20, response.y + 3),
+            Some(MouseAction::SelectLine {
+                panel: Focus::ResponseSection,
+                line: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn selected_line_text_matches_the_highlighted_content() {
+        let mut app = app_with_request();
+        let text = detail_line_text(&app, Focus::RequestSection, 2, 2).unwrap();
+        app.select_lines(Focus::RequestSection, 2, 2, text.clone());
+
+        let lines =
+            highlight_selected_lines(request_detail_lines(&app), &app, Focus::RequestSection);
+
+        assert_eq!(text, vec!["Method: eth_call"]);
+        assert_eq!(lines[1].style.bg, Some(Color::DarkGray));
+        assert_eq!(app.request_details_scroll, 0);
+    }
+
+    #[test]
+    fn visible_line_numbers_match_get_panel_without_changing_its_text() {
+        let app = app_with_request();
+        let raw = detail_lines_text(&app, Focus::RequestSection).unwrap();
+        let numbered = number_detail_lines(request_detail_lines(&app));
+
+        assert_eq!(raw[1], "Method: eth_call");
+        assert_eq!(line_text(&numbered[1]), " 2 │ Method: eth_call");
+    }
+
+    #[test]
+    fn extending_a_selection_keeps_the_original_anchor() {
+        let mut app = app_with_request();
+        let text = detail_line_text(&app, Focus::RequestSection, 3, 3).unwrap();
+        app.select_lines(Focus::RequestSection, 3, 3, text);
+
+        assert_eq!(
+            app.line_selection_range(Focus::RequestSection, 1, true),
+            (3, 1, 3)
+        );
+        let text = detail_line_text(&app, Focus::RequestSection, 1, 3).unwrap();
+        app.select_lines_from_anchor(Focus::RequestSection, 3, 1, 3, text);
+        assert_eq!(
+            app.line_selection_range(Focus::RequestSection, 5, true),
+            (3, 3, 5)
+        );
+    }
+
+    #[test]
+    fn clicking_header_controls_activates_them() {
+        let app = app_with_request();
+        let area = Rect::new(0, 0, 120, 40);
+        let screen = screen_chunks(area, &app);
+        let header = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(screen[0]);
+        let target_start = header[0].x + 11;
+        let filter_start = target_start + "Press t to set target".len() as u16 + 4;
+
+        assert_eq!(
+            mouse_action(area, &app, target_start, header[0].y + 1),
+            Some(MouseAction::EditTarget)
+        );
+        assert_eq!(
+            mouse_action(area, &app, filter_start, header[0].y + 1),
+            Some(MouseAction::EditFilter)
+        );
+        assert_eq!(
+            mouse_action(area, &app, header[1].x + 2, header[1].y + 1),
+            Some(MouseAction::SetProxyRunning(true))
+        );
+        assert_eq!(
+            mouse_action(area, &app, header[1].x + 11, header[1].y + 1),
+            Some(MouseAction::SetProxyRunning(false))
+        );
+    }
+
+    #[test]
+    fn hovering_panels_reports_their_focus() {
+        let app = app_with_request();
+        let area = Rect::new(0, 0, 120, 40);
+        let (requests, request, response) = normal_panels(area, &app);
+
+        assert_eq!(
+            panel_focus(area, &app, requests.x + 2, requests.y + 2),
+            Some(Focus::MessageList)
+        );
+        assert_eq!(
+            panel_focus(area, &app, request.x + 2, request.y + 2),
+            Some(Focus::RequestSection)
+        );
+        assert_eq!(
+            panel_focus(area, &app, response.x + 2, response.y + 2),
+            Some(Focus::ResponseSection)
         );
     }
 }

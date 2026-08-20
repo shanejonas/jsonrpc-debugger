@@ -1,4 +1,4 @@
-name: CI/CD
+name: CI
 
 on:
   push:
@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -22,7 +25,7 @@ jobs:
         components: rustfmt, clippy
     
     - name: Cache cargo registry
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -38,101 +41,11 @@ jobs:
     
     - name: Run tests
       run: cargo test --verbose
+
+    - name: Validate OpenRPC document
+      run: |
+        jq empty openrpc.json
+        cargo test control::tests::discovery_is_an_openrpc_document
     
     - name: Build release
       run: cargo build --release --verbose
-
-  publish:
-    name: Publish to crates.io
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: write
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-    
-    - name: Cache cargo registry
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    
-    - name: Auto-bump version and check
-      id: version-check
-      run: |
-        # Get the current version from Cargo.toml
-        CURRENT_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-        echo "original_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-        
-        # Check if this version exists on crates.io
-        echo "Checking if version $CURRENT_VERSION exists on crates.io..."
-        # Use cargo search and check for exact version match
-        SEARCH_RESULT=$(cargo search jsonrpc-debugger --limit 1 2>/dev/null || echo "")
-        if echo "$SEARCH_RESULT" | grep -q "jsonrpc-debugger.*\"$CURRENT_VERSION\""; then
-          echo "Version $CURRENT_VERSION already exists, auto-bumping patch version..."
-          
-          # Parse version components
-          IFS='.' read -r major minor patch <<< "$CURRENT_VERSION"
-          NEW_PATCH=$((patch + 1))
-          NEW_VERSION="${major}.${minor}.${NEW_PATCH}"
-          
-          # Update Cargo.toml with new version
-          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" Cargo.toml
-          
-          echo "current_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "version_bumped=true" >> $GITHUB_OUTPUT
-          echo "Bumped version from $CURRENT_VERSION to $NEW_VERSION"
-        else
-          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-          echo "version_bumped=false" >> $GITHUB_OUTPUT
-          echo "Version $CURRENT_VERSION is new, will publish as-is"
-        fi
-    
-    - name: Update Cargo.lock after version bump
-      if: steps.version-check.outputs.version_bumped == 'true'
-      run: cargo update --workspace
-    
-    - name: Commit version bump
-      if: steps.version-check.outputs.version_bumped == 'true'
-      run: |
-        git config user.name "${{ github.actor }}"
-        git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
-        git add Cargo.toml Cargo.lock
-        git commit -m "Bump version to ${{ steps.version-check.outputs.current_version }} [skip ci]"
-        git push
-    
-    - name: Publish to crates.io
-      run: cargo publish
-      env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-    
-    - name: Create GitHub release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: v${{ steps.version-check.outputs.current_version }}
-        name: Release v${{ steps.version-check.outputs.current_version }}
-        body: |
-          ## Changes
-          
-          See the [CHANGELOG](CHANGELOG.md) for details.
-          
-          ## Installation
-          
-          ```bash
-          cargo install jsonrpc-debugger
-          ```
-          
-          Or install from GitHub:
-          
-          ```bash
-          cargo install --git https://github.com/shanejonas/jsonrpc-debugger
-          ```
-        draft: false
-        prerelease: false 
