@@ -1,6 +1,6 @@
 [package]
 name = "jsonrpc-debugger"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 authors = ["Shane Jonas <shane@shanejonas.com>"]
 description = "A terminal-based JSON-RPC debugger with interception capabilities"
@@ -26,8 +26,8 @@ serde_json = "1.0"
 reqwest = { version = "0.11", features = ["json", "gzip", "deflate", "brotli"] }
 tokio-tungstenite = "0.21"
 anyhow = "1.0"
+base64 = "0.21"
 clap = { version = "4.0", features = ["derive"] }
 warp = "0.3"
 uuid = { version = "1.17.0", features = ["v4"] }
-tempfile = "3.20.0"
 flate2 = "1.0"

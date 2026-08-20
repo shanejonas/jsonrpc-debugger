@@ -384,3 +384,115 @@ fn test_filtering_functionality() {
         .count();
     assert_eq!(case_insensitive_count, 3);
 }
+
+#[test]
+fn focused_request_list_copies_as_markdown_table() {
+    let mut app = App::new();
+    app.add_message(JsonRpcMessage {
+        id: Some(serde_json::json!(1)),
+        method: Some("eth|call".to_string()),
+        params: Some(serde_json::json!([])),
+        result: None,
+        error: None,
+        timestamp: std::time::SystemTime::now(),
+        direction: MessageDirection::Request,
+        transport: TransportType::Http,
+        headers: None,
+    });
+
+    assert_eq!(
+        app.focused_markdown().unwrap(),
+        "| Status | Transport | Method | ID | Duration |\n\
+         | --- | --- | --- | --- | --- |\n\
+         | Pending | HTTP | eth\\|call | 1 | - |"
+    );
+}
+
+#[test]
+fn focused_details_copy_the_selected_tab_as_markdown() {
+    let mut app = App::new();
+    app.add_message(JsonRpcMessage {
+        id: Some(serde_json::json!(1)),
+        method: Some("eth_call".to_string()),
+        params: Some(serde_json::json!([{"to": "0x123"}])),
+        result: None,
+        error: None,
+        timestamp: std::time::SystemTime::now(),
+        direction: MessageDirection::Request,
+        transport: TransportType::Http,
+        headers: Some(HashMap::from([(
+            "Content-Type".to_string(),
+            "application/json".to_string(),
+        )])),
+    });
+
+    app.focus = Focus::RequestSection;
+    let body = app.focused_markdown().unwrap();
+    assert!(body.starts_with("# Request\n"));
+    assert!(body.contains("## Body\n\n```json"));
+    assert!(body.contains("\"method\": \"eth_call\""));
+
+    app.request_tab = 0;
+    let headers = app.focused_markdown().unwrap();
+    assert!(headers.contains("| Header | Value |"));
+    assert!(headers.contains("| Content-Type | application/json |"));
+
+    app.focus = Focus::ResponseSection;
+    assert!(app.focused_markdown().is_none());
+}
+
+#[test]
+fn inline_editor_edits_multiline_unicode_text() {
+    let mut editor = TextEditor::new(EditorTarget::NewRequest, "aé\ncd".to_string());
+
+    editor.move_right();
+    editor.insert('X');
+    assert_eq!(editor.content(), "aXé\ncd");
+
+    editor.newline();
+    assert_eq!(editor.content(), "aX\né\ncd");
+
+    editor.backspace();
+    assert_eq!(editor.content(), "aXé\ncd");
+
+    editor.move_to_end();
+    editor.delete();
+    assert_eq!(editor.content(), "aXécd");
+}
+
+#[test]
+fn inline_editor_word_motions_are_unicode_and_punctuation_aware() {
+    let mut editor = TextEditor::new(EditorTarget::NewRequest, "éclair 東京".to_string());
+
+    editor.move_word_forward();
+    assert_eq!((editor.row, editor.column), (0, 7));
+
+    editor.move_word_backward();
+    assert_eq!((editor.row, editor.column), (0, 0));
+
+    let mut editor = TextEditor::new(EditorTarget::NewRequest, r#"{"key": 1}"#.to_string());
+    editor.move_word_forward();
+    assert_eq!((editor.row, editor.column), (0, 2));
+
+    let editor = TextEditor::new(EditorTarget::NewRequest, "value\n".to_string());
+    assert_eq!(editor.content(), "value\n");
+}
+
+#[test]
+fn new_requests_are_validated_before_background_send() {
+    let mut app = App::new();
+    app.proxy_config.target_url = "http://localhost:8090".to_string();
+    let body = r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#.to_string();
+
+    let request = app.prepare_new_request(body.clone()).unwrap();
+    assert_eq!(request.url, "http://localhost:8080");
+    assert_eq!(request.body, body);
+
+    app.app_mode = AppMode::Paused;
+    let request = app
+        .prepare_new_request(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#.to_string())
+        .unwrap();
+    assert_eq!(request.url, "http://localhost:8090");
+
+    assert!(app.prepare_new_request("{}".to_string()).is_err());
+}

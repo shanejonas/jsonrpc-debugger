@@ -46,7 +46,7 @@ pub enum InputMode {
     FilteringRequests,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     MessageList,
     RequestSection,
@@ -54,7 +54,601 @@ pub enum Focus {
     StatusHeader,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineSelection {
+    pub panel: Focus,
+    pub anchor_line: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorTarget {
+    PendingRequest,
+    PendingHeaders,
+    PendingResponse,
+    NewRequest,
+}
+
+impl EditorTarget {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::PendingRequest => "Edit Request",
+            Self::PendingHeaders => "Edit Headers",
+            Self::PendingResponse => "Complete Request",
+            Self::NewRequest => "New Request",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMode {
+    Normal,
+    Insert,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorOperator {
+    Change,
+    Delete,
+    Yank,
+}
+
+impl EditorOperator {
+    pub fn key(self) -> char {
+        match self {
+            Self::Change => 'c',
+            Self::Delete => 'd',
+            Self::Yank => 'y',
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMotion {
+    Left,
+    Right,
+    WordForward,
+    WordBackward,
+    WordEnd,
+    LineStart,
+    LineEnd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorSnapshot {
+    content: String,
+    row: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone)]
+enum EditorRegister {
+    Empty,
+    Characters(String),
+    Lines(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Keyword,
+    Punctuation,
+    Whitespace,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextEditor {
+    pub target: EditorTarget,
+    pub lines: Vec<String>,
+    pub row: usize,
+    pub column: usize,
+    pub mode: EditorMode,
+    pub command: String,
+    pub error: Option<String>,
+    pub pending_operator: Option<EditorOperator>,
+    pub pending_g: bool,
+    register: EditorRegister,
+    undo: Vec<EditorSnapshot>,
+    insert_snapshot: Option<EditorSnapshot>,
+}
+
+impl TextEditor {
+    pub fn new(target: EditorTarget, content: String) -> Self {
+        let lines = content.split('\n').map(str::to_string).collect();
+
+        Self {
+            target,
+            lines,
+            row: 0,
+            column: 0,
+            mode: EditorMode::Normal,
+            command: String::new(),
+            error: None,
+            pending_operator: None,
+            pending_g: false,
+            register: EditorRegister::Empty,
+            undo: Vec::new(),
+            insert_snapshot: None,
+        }
+    }
+
+    pub fn content(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    pub fn move_left(&mut self) {
+        self.column = self.column.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        self.column = (self.column + 1).min(self.line_length());
+    }
+
+    pub fn move_up(&mut self) {
+        self.row = self.row.saturating_sub(1);
+        self.clamp_column();
+    }
+
+    pub fn move_down(&mut self) {
+        self.row = (self.row + 1).min(self.lines.len() - 1);
+        self.clamp_column();
+    }
+
+    pub fn move_to_start(&mut self) {
+        self.column = 0;
+    }
+
+    pub fn move_to_end(&mut self) {
+        self.column = self.line_length();
+    }
+
+    pub fn move_to_first_non_blank(&mut self) {
+        self.column = self.lines[self.row]
+            .chars()
+            .position(|character| !character.is_whitespace())
+            .unwrap_or(0);
+    }
+
+    pub fn move_to_top(&mut self) {
+        self.row = 0;
+        self.clamp_column();
+    }
+
+    pub fn move_to_bottom(&mut self) {
+        self.row = self.lines.len() - 1;
+        self.clamp_column();
+    }
+
+    pub fn move_word_forward(&mut self) {
+        let characters = self.content().chars().collect::<Vec<_>>();
+        let offset = next_word_start(&characters, self.cursor_offset());
+        self.set_cursor_offset(offset);
+    }
+
+    pub fn move_word_backward(&mut self) {
+        let characters = self.content().chars().collect::<Vec<_>>();
+        let offset = previous_word_start(&characters, self.cursor_offset());
+        self.set_cursor_offset(offset);
+    }
+
+    pub fn move_word_end(&mut self) {
+        let characters = self.content().chars().collect::<Vec<_>>();
+        let offset = next_word_end(&characters, self.cursor_offset());
+        self.set_cursor_offset(offset);
+    }
+
+    pub fn move_with(&mut self, motion: EditorMotion) {
+        match motion {
+            EditorMotion::Left => self.move_left(),
+            EditorMotion::Right => {
+                self.column = (self.column + 1).min(self.line_length().saturating_sub(1));
+            }
+            EditorMotion::WordForward => self.move_word_forward(),
+            EditorMotion::WordBackward => self.move_word_backward(),
+            EditorMotion::WordEnd => self.move_word_end(),
+            EditorMotion::LineStart => self.move_to_start(),
+            EditorMotion::LineEnd => {
+                self.column = self.line_length().saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn start_insert(&mut self) {
+        self.insert_snapshot = Some(self.snapshot());
+        self.mode = EditorMode::Insert;
+        self.clear_pending();
+    }
+
+    pub fn finish_insert(&mut self) {
+        self.mode = EditorMode::Normal;
+        let Some(snapshot) = self.insert_snapshot.take() else {
+            return;
+        };
+        if snapshot.content != self.content() {
+            self.column = self.column.saturating_sub(1);
+            self.undo.push(snapshot);
+        }
+    }
+
+    pub fn open_line_below(&mut self) {
+        let snapshot = self.snapshot();
+        self.row += 1;
+        self.column = 0;
+        self.lines.insert(self.row, String::new());
+        self.insert_snapshot = Some(snapshot);
+        self.mode = EditorMode::Insert;
+        self.clear_pending();
+    }
+
+    pub fn open_line_above(&mut self) {
+        let snapshot = self.snapshot();
+        self.column = 0;
+        self.lines.insert(self.row, String::new());
+        self.insert_snapshot = Some(snapshot);
+        self.mode = EditorMode::Insert;
+        self.clear_pending();
+    }
+
+    pub fn insert(&mut self, character: char) {
+        let byte = char_to_byte(&self.lines[self.row], self.column);
+        self.lines[self.row].insert(byte, character);
+        self.column += 1;
+    }
+
+    pub fn newline(&mut self) {
+        let byte = char_to_byte(&self.lines[self.row], self.column);
+        let next_line = self.lines[self.row].split_off(byte);
+        self.row += 1;
+        self.column = 0;
+        self.lines.insert(self.row, next_line);
+    }
+
+    pub fn backspace(&mut self) {
+        if self.column > 0 {
+            let end = char_to_byte(&self.lines[self.row], self.column);
+            let start = char_to_byte(&self.lines[self.row], self.column - 1);
+            self.lines[self.row].replace_range(start..end, "");
+            self.column -= 1;
+            return;
+        }
+        if self.row == 0 {
+            return;
+        }
+
+        let current = self.lines.remove(self.row);
+        self.row -= 1;
+        self.column = self.line_length();
+        self.lines[self.row].push_str(&current);
+    }
+
+    pub fn delete(&mut self) {
+        if self.column < self.line_length() {
+            let start = char_to_byte(&self.lines[self.row], self.column);
+            let end = char_to_byte(&self.lines[self.row], self.column + 1);
+            self.lines[self.row].replace_range(start..end, "");
+            return;
+        }
+        if self.row + 1 >= self.lines.len() {
+            return;
+        }
+
+        let next = self.lines.remove(self.row + 1);
+        self.lines[self.row].push_str(&next);
+    }
+
+    pub fn delete_character(&mut self) {
+        if self.column >= self.line_length() {
+            return;
+        }
+
+        let start = self.cursor_offset();
+        self.register =
+            EditorRegister::Characters(self.content().chars().skip(start).take(1).collect());
+        self.delete_range(start, start + 1, false);
+    }
+
+    pub fn delete_previous_character(&mut self) {
+        if self.column == 0 {
+            return;
+        }
+
+        let end = self.cursor_offset();
+        self.register =
+            EditorRegister::Characters(self.content().chars().skip(end - 1).take(1).collect());
+        self.delete_range(end - 1, end, false);
+    }
+
+    pub fn apply_operator(&mut self, operator: EditorOperator, motion: EditorMotion) {
+        let characters = self.content().chars().collect::<Vec<_>>();
+        let cursor = self.cursor_offset();
+        let (start, end) =
+            operator_range(&characters, cursor, operator, motion, self.line_bounds());
+        self.clear_pending();
+
+        if start == end {
+            if operator == EditorOperator::Change {
+                self.start_insert();
+            }
+            return;
+        }
+
+        let selected = characters[start..end].iter().collect::<String>();
+        self.register = EditorRegister::Characters(selected);
+        if operator == EditorOperator::Yank {
+            return;
+        }
+
+        self.delete_range(start, end, operator == EditorOperator::Change);
+    }
+
+    pub fn apply_line_operator(&mut self, operator: EditorOperator) {
+        self.clear_pending();
+        let line = self.lines[self.row].clone();
+        self.register = EditorRegister::Lines(vec![line]);
+        if operator == EditorOperator::Yank {
+            return;
+        }
+
+        let snapshot = self.snapshot();
+        if operator == EditorOperator::Change {
+            self.lines[self.row].clear();
+            self.column = 0;
+            self.insert_snapshot = Some(snapshot);
+            self.mode = EditorMode::Insert;
+            return;
+        }
+
+        if self.lines.len() == 1 {
+            self.lines[0].clear();
+        } else {
+            self.lines.remove(self.row);
+            self.row = self.row.min(self.lines.len() - 1);
+        }
+        self.column = 0;
+        self.undo.push(snapshot);
+    }
+
+    pub fn paste(&mut self, after: bool) {
+        let register = self.register.clone();
+        match register {
+            EditorRegister::Empty => {}
+            EditorRegister::Characters(value) => self.paste_characters(&value, after),
+            EditorRegister::Lines(lines) => self.paste_lines(lines, after),
+        }
+    }
+
+    pub fn undo(&mut self) {
+        let Some(snapshot) = self.undo.pop() else {
+            return;
+        };
+
+        self.restore(snapshot);
+        self.clear_pending();
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.pending_operator = None;
+        self.pending_g = false;
+    }
+
+    fn paste_characters(&mut self, value: &str, after: bool) {
+        if value.is_empty() {
+            return;
+        }
+
+        let snapshot = self.snapshot();
+        let mut characters = self.content().chars().collect::<Vec<_>>();
+        let cursor = self.cursor_offset();
+        let insert_at = if after && self.column < self.line_length() {
+            cursor + 1
+        } else {
+            cursor
+        };
+        let inserted = value.chars().collect::<Vec<_>>();
+        characters.splice(insert_at..insert_at, inserted.iter().copied());
+
+        self.replace_content(characters.iter().collect(), insert_at + inserted.len() - 1);
+        self.undo.push(snapshot);
+    }
+
+    fn paste_lines(&mut self, lines: Vec<String>, after: bool) {
+        if lines.is_empty() {
+            return;
+        }
+
+        let snapshot = self.snapshot();
+        if self.lines.len() == 1 && self.lines[0].is_empty() {
+            self.lines = lines;
+            self.row = self.lines.len() - 1;
+            self.column = 0;
+            self.undo.push(snapshot);
+            return;
+        }
+
+        let insert_at = self.row + usize::from(after);
+        let inserted = lines.len();
+        self.lines.splice(insert_at..insert_at, lines);
+        self.row = insert_at + inserted - 1;
+        self.column = 0;
+        self.undo.push(snapshot);
+    }
+
+    fn delete_range(&mut self, start: usize, end: usize, change: bool) {
+        let snapshot = self.snapshot();
+        let mut characters = self.content().chars().collect::<Vec<_>>();
+        characters.drain(start..end);
+        self.replace_content(characters.iter().collect(), start);
+
+        if change {
+            self.insert_snapshot = Some(snapshot);
+            self.mode = EditorMode::Insert;
+        } else {
+            self.undo.push(snapshot);
+        }
+    }
+
+    fn cursor_offset(&self) -> usize {
+        self.lines[..self.row]
+            .iter()
+            .map(|line| line.chars().count() + 1)
+            .sum::<usize>()
+            + self.column
+    }
+
+    fn set_cursor_offset(&mut self, mut offset: usize) {
+        for (row, line) in self.lines.iter().enumerate() {
+            let line_length = line.chars().count();
+            if offset <= line_length {
+                self.row = row;
+                self.column = offset;
+                return;
+            }
+            offset = offset.saturating_sub(line_length + 1);
+        }
+
+        self.row = self.lines.len() - 1;
+        self.column = self.line_length();
+    }
+
+    fn line_bounds(&self) -> (usize, usize) {
+        let cursor = self.cursor_offset();
+        (
+            cursor.saturating_sub(self.column),
+            cursor + self.line_length().saturating_sub(self.column),
+        )
+    }
+
+    fn snapshot(&self) -> EditorSnapshot {
+        EditorSnapshot {
+            content: self.content(),
+            row: self.row,
+            column: self.column,
+        }
+    }
+
+    fn restore(&mut self, snapshot: EditorSnapshot) {
+        self.lines = snapshot.content.split('\n').map(str::to_string).collect();
+        self.row = snapshot.row.min(self.lines.len() - 1);
+        self.column = snapshot.column.min(self.line_length());
+    }
+
+    fn replace_content(&mut self, content: String, cursor: usize) {
+        self.lines = content.split('\n').map(str::to_string).collect();
+        self.set_cursor_offset(cursor);
+    }
+
+    fn line_length(&self) -> usize {
+        self.lines[self.row].chars().count()
+    }
+
+    fn clamp_column(&mut self) {
+        self.column = self.column.min(self.line_length());
+    }
+}
+
+fn operator_range(
+    characters: &[char],
+    cursor: usize,
+    operator: EditorOperator,
+    motion: EditorMotion,
+    line_bounds: (usize, usize),
+) -> (usize, usize) {
+    match motion {
+        EditorMotion::Left => (cursor.saturating_sub(1), cursor),
+        EditorMotion::Right => (cursor, (cursor + 1).min(characters.len())),
+        EditorMotion::WordBackward => (previous_word_start(characters, cursor), cursor),
+        EditorMotion::WordForward
+            if operator == EditorOperator::Change
+                && cursor < characters.len()
+                && word_class(characters[cursor]) != WordClass::Whitespace =>
+        {
+            let end = next_word_end(characters, cursor);
+            (cursor, (end + 1).min(characters.len()))
+        }
+        EditorMotion::WordForward => (cursor, next_word_start(characters, cursor)),
+        EditorMotion::WordEnd => {
+            let end = next_word_end(characters, cursor);
+            (cursor, (end + 1).min(characters.len()))
+        }
+        EditorMotion::LineStart => (line_bounds.0, cursor),
+        EditorMotion::LineEnd => (cursor, line_bounds.1),
+    }
+}
+
+fn next_word_start(characters: &[char], mut offset: usize) -> usize {
+    if offset >= characters.len() {
+        return characters.len();
+    }
+
+    let class = word_class(characters[offset]);
+    if class != WordClass::Whitespace {
+        while offset < characters.len() && word_class(characters[offset]) == class {
+            offset += 1;
+        }
+    }
+    while offset < characters.len() && word_class(characters[offset]) == WordClass::Whitespace {
+        offset += 1;
+    }
+
+    offset
+}
+
+fn previous_word_start(characters: &[char], offset: usize) -> usize {
+    if offset == 0 || characters.is_empty() {
+        return 0;
+    }
+
+    let mut offset = offset.min(characters.len()) - 1;
+    while offset > 0 && word_class(characters[offset]) == WordClass::Whitespace {
+        offset -= 1;
+    }
+    let class = word_class(characters[offset]);
+    while offset > 0 && word_class(characters[offset - 1]) == class {
+        offset -= 1;
+    }
+
+    offset
+}
+
+fn next_word_end(characters: &[char], offset: usize) -> usize {
+    if offset >= characters.len() {
+        return characters.len();
+    }
+
+    let mut offset = (offset + 1).min(characters.len() - 1);
+    while offset < characters.len() - 1 && word_class(characters[offset]) == WordClass::Whitespace {
+        offset += 1;
+    }
+    let class = word_class(characters[offset]);
+    while offset < characters.len() - 1 && word_class(characters[offset + 1]) == class {
+        offset += 1;
+    }
+
+    offset
+}
+
+fn word_class(character: char) -> WordClass {
+    if character.is_whitespace() {
+        return WordClass::Whitespace;
+    }
+    if character.is_alphanumeric() || character == '_' {
+        return WordClass::Keyword;
+    }
+
+    WordClass::Punctuation
+}
+
+fn char_to_byte(value: &str, index: usize) -> usize {
+    value
+        .char_indices()
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(value.len())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
     Normal,       // Regular proxy mode
     Paused,       // All requests paused
@@ -102,6 +696,17 @@ pub struct App {
     pub focus: Focus,                          // New field for tracking which element is active
     pub request_tab: usize,                    // 0 = Headers, 1 = Body
     pub response_tab: usize,                   // 0 = Headers, 1 = Body
+    pub line_selection: Option<LineSelection>,
+    pub editor: Option<TextEditor>,
+    pub notice: Option<String>,
+    pub control_port: u16,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundRequest {
+    pub url: String,
+    pub body: String,
 }
 
 #[derive(Debug)]
@@ -110,6 +715,117 @@ pub struct ProxyConfig {
     pub listen_port: u16,
     pub target_url: String,
     pub transport: TransportType,
+}
+
+fn exchange_status(exchange: &JsonRpcExchange) -> &'static str {
+    match &exchange.response {
+        None => "Pending",
+        Some(response) if response.error.is_some() => "Error",
+        Some(_) => "Success",
+    }
+}
+
+fn transport_name(transport: &TransportType) -> &'static str {
+    match transport {
+        TransportType::Http => "HTTP",
+        TransportType::WebSocket => "WebSocket",
+    }
+}
+
+fn display_id(id: Option<&serde_json::Value>) -> String {
+    match id {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+fn exchange_duration(exchange: &JsonRpcExchange) -> String {
+    let (Some(request), Some(response)) = (&exchange.request, &exchange.response) else {
+        return "-".to_string();
+    };
+    let Ok(duration) = response.timestamp.duration_since(request.timestamp) else {
+        return "-".to_string();
+    };
+
+    if duration.as_millis() < 1000 {
+        return format!("{}ms", duration.as_millis());
+    }
+
+    format!("{:.2}s", duration.as_secs_f64())
+}
+
+fn markdown_cell(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
+}
+
+fn exchange_heading(title: &str, exchange: &JsonRpcExchange) -> String {
+    format!(
+        "# {title}\n\n- Transport: {}\n- Method: {}\n- ID: {}\n",
+        transport_name(&exchange.transport),
+        exchange.method.as_deref().unwrap_or("unknown"),
+        display_id(exchange.id.as_ref()),
+    )
+}
+
+fn headers_markdown(headers: Option<&HashMap<String, String>>) -> String {
+    let Some(headers) = headers else {
+        return "\n## Headers\n\n_No headers captured._".to_string();
+    };
+    if headers.is_empty() {
+        return "\n## Headers\n\n_No headers._".to_string();
+    }
+
+    let mut headers = headers.iter().collect::<Vec<_>>();
+    headers.sort_by_key(|(name, _)| *name);
+
+    let rows = headers
+        .into_iter()
+        .map(|(name, value)| format!("| {} | {} |", markdown_cell(name), markdown_cell(value)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("\n## Headers\n\n| Header | Value |\n| --- | --- |\n{rows}")
+}
+
+fn json_markdown(value: &serde_json::Value) -> String {
+    let json = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    format!("\n## Body\n\n```json\n{json}\n```")
+}
+
+fn request_json(request: &JsonRpcMessage) -> serde_json::Value {
+    let mut json = serde_json::Map::new();
+    json.insert("jsonrpc".to_string(), serde_json::json!("2.0"));
+    if let Some(id) = &request.id {
+        json.insert("id".to_string(), id.clone());
+    }
+    if let Some(method) = &request.method {
+        json.insert("method".to_string(), serde_json::json!(method));
+    }
+    if let Some(params) = &request.params {
+        json.insert("params".to_string(), params.clone());
+    }
+
+    serde_json::Value::Object(json)
+}
+
+fn response_json(response: &JsonRpcMessage) -> serde_json::Value {
+    let mut json = serde_json::Map::new();
+    json.insert("jsonrpc".to_string(), serde_json::json!("2.0"));
+    if let Some(id) = &response.id {
+        json.insert("id".to_string(), id.clone());
+    }
+    if let Some(result) = &response.result {
+        json.insert("result".to_string(), result.clone());
+    }
+    if let Some(error) = &response.error {
+        json.insert("error".to_string(), error.clone());
+    }
+
+    serde_json::Value::Object(json)
 }
 
 impl Default for App {
@@ -152,54 +868,36 @@ impl App {
             focus: Focus::MessageList,
             request_tab: 1,  // Body selected by default
             response_tab: 1, // Body selected by default
+            line_selection: None,
+            editor: None,
+            notice: None,
+            control_port: 8081,
+            revision: 0,
         }
     }
 
     pub fn new_with_receiver(receiver: mpsc::UnboundedReceiver<JsonRpcMessage>) -> Self {
-        let mut table_state = TableState::default();
-        table_state.select(Some(0));
-
-        Self {
-            exchanges: Vec::new(),
-            selected_exchange: 0,
-            filter_text: String::new(),
-            table_state,
-            details_scroll: 0,
-            request_details_scroll: 0,
-            response_details_scroll: 0,
-            details_tab: 0,
-            request_details_tab: 0,
-            response_details_tab: 0,
-            intercept_details_scroll: 0,
-            proxy_config: ProxyConfig {
-                listen_port: 8080,
-                target_url: "".to_string(),
-                transport: TransportType::Http,
-            },
-            is_running: true,
-            message_receiver: Some(receiver),
-            input_mode: InputMode::Normal,
-            input_buffer: String::new(),
-            app_mode: AppMode::Normal,
-            pending_requests: Vec::new(),
-            selected_pending: 0,
-            request_editor_buffer: String::new(),
-            focus: Focus::MessageList,
-            request_tab: 1,  // Body selected by default
-            response_tab: 1, // Body selected by default
-        }
+        let mut app = Self::new();
+        app.message_receiver = Some(receiver);
+        app
     }
 
-    pub fn check_for_new_messages(&mut self) {
-        if let Some(receiver) = &mut self.message_receiver {
-            let mut new_messages = Vec::new();
-            while let Ok(message) = receiver.try_recv() {
-                new_messages.push(message);
-            }
-            for message in new_messages {
-                self.add_message(message);
-            }
+    pub fn check_for_new_messages(&mut self) -> bool {
+        let Some(receiver) = &mut self.message_receiver else {
+            return false;
+        };
+
+        let mut new_messages = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            new_messages.push(message);
         }
+
+        let received_messages = !new_messages.is_empty();
+        for message in new_messages {
+            self.add_message(message);
+        }
+
+        received_messages
     }
 
     pub fn add_message(&mut self, mut message: JsonRpcMessage) {
@@ -253,10 +951,240 @@ impl App {
                 }
             }
         }
+        self.mark_changed();
     }
 
     pub fn get_selected_exchange(&self) -> Option<&JsonRpcExchange> {
         self.exchanges.get(self.selected_exchange)
+    }
+
+    pub fn filtered_exchange_indices(&self) -> Vec<usize> {
+        self.exchanges
+            .iter()
+            .enumerate()
+            .filter(|(_, exchange)| {
+                self.filter_text.is_empty()
+                    || exchange
+                        .method
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains(&self.filter_text)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub fn select_exchange(&mut self, index: usize) {
+        if index >= self.exchanges.len() {
+            return;
+        }
+
+        self.selected_exchange = index;
+        self.table_state.select(Some(index));
+        self.request_details_scroll = 0;
+        self.response_details_scroll = 0;
+        self.line_selection = None;
+        self.mark_changed();
+    }
+
+    pub fn select_lines(
+        &mut self,
+        panel: Focus,
+        start_line: usize,
+        end_line: usize,
+        text: Vec<String>,
+    ) {
+        self.select_lines_from_anchor(panel, start_line, start_line, end_line, text);
+    }
+
+    pub fn select_lines_from_anchor(
+        &mut self,
+        panel: Focus,
+        anchor_line: usize,
+        start_line: usize,
+        end_line: usize,
+        text: Vec<String>,
+    ) {
+        if matches!(panel, Focus::MessageList | Focus::StatusHeader) {
+            return;
+        }
+
+        self.focus = panel;
+        self.line_selection = Some(LineSelection {
+            panel,
+            anchor_line,
+            start_line,
+            end_line,
+            text,
+        });
+        self.mark_changed();
+    }
+
+    pub fn line_selection_range(
+        &self,
+        panel: Focus,
+        line: usize,
+        extend: bool,
+    ) -> (usize, usize, usize) {
+        let anchor = if extend {
+            self.line_selection
+                .as_ref()
+                .filter(|selection| selection.panel == panel)
+                .map(|selection| selection.anchor_line)
+                .unwrap_or(line)
+        } else {
+            line
+        };
+
+        (anchor, anchor.min(line), anchor.max(line))
+    }
+
+    pub fn reveal_lines(
+        &mut self,
+        panel: Focus,
+        start_line: usize,
+        end_line: usize,
+        text: Vec<String>,
+    ) {
+        self.select_lines(panel, start_line, end_line, text);
+        match panel {
+            Focus::RequestSection => self.request_details_scroll = start_line.saturating_sub(1),
+            Focus::ResponseSection => self.response_details_scroll = start_line.saturating_sub(1),
+            Focus::MessageList | Focus::StatusHeader => {}
+        }
+    }
+
+    pub fn clear_line_selection(&mut self) {
+        if self.line_selection.is_none() {
+            return;
+        }
+        self.line_selection = None;
+        self.mark_changed();
+    }
+
+    pub fn set_focus(&mut self, focus: Focus) {
+        if self.focus == focus {
+            return;
+        }
+        self.focus = focus;
+        self.mark_changed();
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn mark_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn append_exchanges(&mut self, exchanges: Vec<JsonRpcExchange>) {
+        if exchanges.is_empty() {
+            return;
+        }
+
+        self.exchanges.extend(exchanges);
+        self.select_exchange(self.exchanges.len() - 1);
+    }
+
+    pub fn scroll_panel_lines(&mut self, panel: Focus, lines: i64, total_lines: usize) {
+        let previous_focus = self.focus;
+        self.focus = panel;
+        let scroll_changed = {
+            let scroll = match panel {
+                Focus::RequestSection => &mut self.request_details_scroll,
+                Focus::ResponseSection => &mut self.response_details_scroll,
+                Focus::MessageList | Focus::StatusHeader => return,
+            };
+            let previous_scroll = *scroll;
+            let distance = usize::try_from(lines.unsigned_abs()).unwrap_or(usize::MAX);
+            let max_scroll = total_lines.saturating_sub(1);
+            *scroll = (*scroll).min(max_scroll);
+            *scroll = if lines >= 0 {
+                scroll.saturating_add(distance).min(max_scroll)
+            } else {
+                scroll.saturating_sub(distance)
+            };
+            previous_scroll != *scroll
+        };
+        if previous_focus != self.focus || scroll_changed {
+            self.mark_changed();
+        }
+    }
+
+    pub fn focused_markdown(&self) -> Option<String> {
+        match self.focus {
+            Focus::MessageList => Some(self.requests_markdown()),
+            Focus::RequestSection => self.request_markdown(),
+            Focus::ResponseSection => self.response_markdown(),
+            Focus::StatusHeader => Some(self.status_markdown()),
+        }
+    }
+
+    fn requests_markdown(&self) -> String {
+        let mut lines = vec![
+            "| Status | Transport | Method | ID | Duration |".to_string(),
+            "| --- | --- | --- | --- | --- |".to_string(),
+        ];
+
+        for index in self.filtered_exchange_indices() {
+            let exchange = &self.exchanges[index];
+            lines.push(format!(
+                "| {} | {} | {} | {} | {} |",
+                exchange_status(exchange),
+                transport_name(&exchange.transport),
+                markdown_cell(exchange.method.as_deref().unwrap_or("unknown")),
+                markdown_cell(&display_id(exchange.id.as_ref())),
+                exchange_duration(exchange),
+            ));
+        }
+
+        lines.join("\n")
+    }
+
+    fn request_markdown(&self) -> Option<String> {
+        let exchange = self.get_selected_exchange()?;
+        let request = exchange.request.as_ref()?;
+        let mut markdown = exchange_heading("Request", exchange);
+
+        if self.request_tab == 0 {
+            markdown.push_str(&headers_markdown(request.headers.as_ref()));
+        } else {
+            markdown.push_str(&json_markdown(&request_json(request)));
+        }
+
+        Some(markdown)
+    }
+
+    fn response_markdown(&self) -> Option<String> {
+        let exchange = self.get_selected_exchange()?;
+        let response = exchange.response.as_ref()?;
+        let mut markdown = "# Response\n".to_string();
+
+        if self.response_tab == 0 {
+            markdown.push_str(&headers_markdown(response.headers.as_ref()));
+        } else {
+            markdown.push_str(&json_markdown(&response_json(response)));
+        }
+
+        Some(markdown)
+    }
+
+    fn status_markdown(&self) -> String {
+        let state = if self.is_running {
+            "Running"
+        } else {
+            "Stopped"
+        };
+        let mode = match self.app_mode {
+            AppMode::Normal => "Normal".to_string(),
+            AppMode::Paused => "Paused".to_string(),
+            AppMode::Intercepting => format!("Intercepting ({})", self.pending_requests.len()),
+        };
+        format!(
+            "# Status\n\n- State: {state}\n- Proxy port: {}\n- Control port: {}\n- Mode: {mode}",
+            self.proxy_config.listen_port, self.control_port
+        )
     }
 
     pub fn select_next(&mut self) {
@@ -269,6 +1197,8 @@ impl App {
             self.details_tab = 0;
             self.request_details_tab = 0;
             self.response_details_tab = 0;
+            self.line_selection = None;
+            self.mark_changed();
         }
     }
 
@@ -286,11 +1216,14 @@ impl App {
             self.details_tab = 0;
             self.request_details_tab = 0;
             self.response_details_tab = 0;
+            self.line_selection = None;
+            self.mark_changed();
         }
     }
 
     pub fn toggle_proxy(&mut self) {
         self.is_running = !self.is_running;
+        self.mark_changed();
     }
 
     pub fn scroll_details_up(&mut self) {
@@ -377,6 +1310,7 @@ impl App {
         self.reset_details_scroll();
         self.request_details_scroll = 0;
         self.response_details_scroll = 0;
+        self.mark_changed();
     }
 
     pub fn switch_focus_reverse(&mut self) {
@@ -389,6 +1323,7 @@ impl App {
         self.reset_details_scroll();
         self.request_details_scroll = 0;
         self.response_details_scroll = 0;
+        self.mark_changed();
     }
 
     pub fn is_message_list_focused(&self) -> bool {
@@ -409,22 +1344,30 @@ impl App {
 
     pub fn next_request_tab(&mut self) {
         self.request_tab = 1 - self.request_tab; // Toggle between 0 and 1
-        self.reset_details_scroll();
+        self.request_details_scroll = 0;
+        self.line_selection = None;
+        self.mark_changed();
     }
 
     pub fn previous_request_tab(&mut self) {
         self.request_tab = 1 - self.request_tab; // Toggle between 0 and 1
-        self.reset_details_scroll();
+        self.request_details_scroll = 0;
+        self.line_selection = None;
+        self.mark_changed();
     }
 
     pub fn next_response_tab(&mut self) {
         self.response_tab = 1 - self.response_tab; // Toggle between 0 and 1
-        self.reset_details_scroll();
+        self.response_details_scroll = 0;
+        self.line_selection = None;
+        self.mark_changed();
     }
 
     pub fn previous_response_tab(&mut self) {
         self.response_tab = 1 - self.response_tab; // Toggle between 0 and 1
-        self.reset_details_scroll();
+        self.response_details_scroll = 0;
+        self.line_selection = None;
+        self.mark_changed();
     }
 
     // Filtering requests methods
@@ -442,6 +1385,7 @@ impl App {
         self.filter_text = self.input_buffer.clone();
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
+        self.mark_changed();
     }
 
     // Get content lines for proper scrolling calculations
@@ -462,6 +1406,7 @@ impl App {
         }
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
+        self.mark_changed();
     }
 
     pub fn handle_input_char(&mut self, c: char) {
@@ -497,7 +1442,7 @@ impl App {
             line_count += 1; // Tabs line
 
             if let Some(request) = &exchange.request {
-                match self.request_details_tab {
+                match self.request_tab {
                     0 => match &request.headers {
                         Some(headers) if !headers.is_empty() => {
                             line_count += headers.len();
@@ -542,7 +1487,7 @@ impl App {
             line_count += 1; // Tabs line
 
             if let Some(response) = &exchange.response {
-                match self.response_details_tab {
+                match self.response_tab {
                     0 => match &response.headers {
                         Some(headers) if !headers.is_empty() => {
                             line_count += headers.len();
@@ -604,7 +1549,7 @@ impl App {
             line_count += 1; // Tabs line
 
             if let Some(request) = &exchange.request {
-                match self.request_details_tab {
+                match self.request_tab {
                     0 => match &request.headers {
                         Some(headers) if !headers.is_empty() => {
                             line_count += headers.len();
@@ -658,7 +1603,7 @@ impl App {
             line_count += 1; // Tabs line
 
             if let Some(response) = &exchange.response {
-                match self.response_details_tab {
+                match self.response_tab {
                     0 => match &response.headers {
                         Some(headers) if !headers.is_empty() => {
                             line_count += headers.len();
@@ -700,19 +1645,42 @@ impl App {
         }
     }
 
+    pub fn get_intercept_details_content_lines(&self) -> usize {
+        let Some(pending) = self.get_selected_pending() else {
+            return 1;
+        };
+
+        let headers = pending
+            .modified_headers
+            .as_ref()
+            .or(pending.original_request.headers.as_ref());
+        let header_lines = headers.map(HashMap::len).unwrap_or(1)
+            + usize::from(pending.modified_headers.is_some());
+        let request = pending
+            .modified_request
+            .clone()
+            .or_else(|| self.get_pending_request_json())
+            .unwrap_or_default();
+
+        13 + header_lines + request.lines().count().max(1)
+    }
+
     // Pause/Intercept functionality
     pub fn toggle_pause_mode(&mut self) {
+        self.line_selection = None;
         self.app_mode = match self.app_mode {
             AppMode::Normal => AppMode::Paused,
             AppMode::Paused => AppMode::Normal,
             AppMode::Intercepting => AppMode::Normal,
         };
+        self.mark_changed();
     }
 
     pub fn select_next_pending(&mut self) {
         if !self.pending_requests.is_empty() {
             self.selected_pending = (self.selected_pending + 1) % self.pending_requests.len();
             self.reset_intercept_details_scroll();
+            self.mark_changed();
         }
     }
 
@@ -724,6 +1692,7 @@ impl App {
                 self.selected_pending - 1
             };
             self.reset_intercept_details_scroll();
+            self.mark_changed();
         }
     }
 
@@ -751,6 +1720,7 @@ impl App {
             };
 
             let _ = pending.decision_sender.send(decision);
+            self.mark_changed();
         }
     }
 
@@ -763,10 +1733,12 @@ impl App {
 
             // Send block decision to proxy
             let _ = pending.decision_sender.send(ProxyDecision::Block);
+            self.mark_changed();
         }
     }
 
     pub fn resume_all_requests(&mut self) {
+        let changed = !self.pending_requests.is_empty() || self.app_mode != AppMode::Normal;
         for pending in self.pending_requests.drain(..) {
             let _ = pending
                 .decision_sender
@@ -774,6 +1746,9 @@ impl App {
         }
         self.selected_pending = 0;
         self.app_mode = AppMode::Normal;
+        if changed {
+            self.mark_changed();
+        }
     }
 
     pub fn get_pending_request_json(&self) -> Option<String> {
@@ -791,6 +1766,11 @@ impl App {
         } else {
             None
         }
+    }
+
+    pub fn open_editor(&mut self, target: EditorTarget, content: String) {
+        self.editor = Some(TextEditor::new(target, content));
+        self.notice = None;
     }
 
     pub fn apply_edited_json(&mut self, edited_json: String) -> Result<(), String> {
@@ -813,6 +1793,7 @@ impl App {
 
         // Store the modified request
         self.pending_requests[self.selected_pending].modified_request = Some(edited_json);
+        self.mark_changed();
 
         Ok(())
     }
@@ -876,6 +1857,7 @@ impl App {
 
         // Store the modified headers
         self.pending_requests[self.selected_pending].modified_headers = Some(headers);
+        self.mark_changed();
 
         Ok(())
     }
@@ -935,12 +1917,12 @@ impl App {
         let _ = pending
             .decision_sender
             .send(ProxyDecision::Complete(parsed));
+        self.mark_changed();
 
         Ok(())
     }
 
-    pub async fn send_new_request(&self, request_json: String) -> Result<(), String> {
-        // Parse the request JSON
+    pub fn prepare_new_request(&self, request_json: String) -> Result<OutboundRequest, String> {
         let parsed: serde_json::Value =
             serde_json::from_str(&request_json).map_err(|e| format!("Invalid JSON: {}", e))?;
 
@@ -958,29 +1940,35 @@ impl App {
             return Err("Target URL is not set. Press 't' to set a target URL first.".to_string());
         }
 
-        let client = reqwest::Client::new();
-
-        // If we're in paused mode, send directly to target to avoid interception
-        // Otherwise, send through proxy for normal logging
         let url = if matches!(self.app_mode, AppMode::Paused | AppMode::Intercepting) {
-            &self.proxy_config.target_url
+            self.proxy_config.target_url.clone()
         } else {
-            // Send through proxy for normal logging
-            &format!("http://localhost:{}", self.proxy_config.listen_port)
+            format!("http://localhost:{}", self.proxy_config.listen_port)
         };
 
-        let response = client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .body(request_json)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send request: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Request failed with status: {}", response.status()));
-        }
-
-        Ok(())
+        Ok(OutboundRequest {
+            url,
+            body: request_json,
+        })
     }
+}
+
+pub async fn send_new_request(request: OutboundRequest) -> Result<serde_json::Value, String> {
+    let response = reqwest::Client::new()
+        .post(request.url)
+        .header("Content-Type", "application/json")
+        .body(request.body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Request failed with status: {status}"));
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|error| format!("Invalid JSON response: {error}"))
 }

@@ -160,7 +160,8 @@ fn test_message_channel_integration() {
     let mut app = App::new_with_receiver(receiver);
 
     // Check for new messages
-    app.check_for_new_messages();
+    assert!(app.check_for_new_messages());
+    assert!(!app.check_for_new_messages());
 
     // Should have one exchange with our request
     assert_eq!(app.exchanges.len(), 1);
@@ -211,7 +212,7 @@ fn test_multiple_message_handling() {
     }
 
     // Check for new messages
-    app.check_for_new_messages();
+    assert!(app.check_for_new_messages());
 
     // Should have all the new exchanges (one per request)
     assert_eq!(app.exchanges.len(), initial_count + 5);

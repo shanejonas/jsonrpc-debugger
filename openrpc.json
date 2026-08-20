@@ -1,0 +1,207 @@
+{
+  "openrpc": "1.3.2",
+  "info": {
+    "title": "jsonrpc-debugger control plane",
+    "version": "0.2.0"
+  },
+  "servers": [
+    {
+      "name": "local",
+      "url": "http://127.0.0.1:8081"
+    }
+  ],
+  "methods": [
+    {
+      "name": "rpc.discover",
+      "summary": "Describe this control plane",
+      "params": [],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.getState",
+      "summary": "Read debugger and GUI state",
+      "params": [],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.waitForChange",
+      "summary": "Wait until the debugger revision changes or the timeout expires",
+      "params": [
+        { "name": "afterRevision", "required": true, "schema": { "type": "integer", "minimum": 0 } },
+        { "name": "timeoutMs", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 60000 } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.getPanel",
+      "summary": "Read numbered request or response panel lines",
+      "params": [
+        { "name": "panel", "required": true, "schema": { "type": "string", "enum": ["request", "response"] } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.getHistory",
+      "summary": "Read recent JSON-RPC exchanges",
+      "params": [
+        { "name": "limit", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 1000 } }
+      ],
+      "result": { "name": "result", "schema": { "type": "array" } }
+    },
+    {
+      "name": "debugger.exportSession",
+      "summary": "Export portable debugger history",
+      "params": [],
+      "result": { "name": "result", "schema": { "$ref": "#/components/schemas/Session" } }
+    },
+    {
+      "name": "debugger.replaySession",
+      "summary": "Append a session to visible history without forwarding requests",
+      "params": [
+        { "name": "session", "required": true, "schema": { "$ref": "#/components/schemas/Session" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.sendRequest",
+      "summary": "Send a JSON-RPC request through the debugger and return its response",
+      "params": [
+        { "name": "request", "required": true, "schema": { "type": "object" } }
+      ],
+      "result": { "name": "result", "schema": {} }
+    },
+    {
+      "name": "debugger.selectExchange",
+      "summary": "Select a history row in the TUI",
+      "params": [
+        { "name": "index", "required": true, "schema": { "type": "integer", "minimum": 0 } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.setFocus",
+      "summary": "Focus a TUI panel",
+      "params": [
+        { "name": "panel", "required": true, "schema": { "type": "string", "enum": ["history", "request", "response", "status"] } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.revealLines",
+      "summary": "Focus and reveal highlighted request or response lines",
+      "params": [
+        { "name": "panel", "required": true, "schema": { "type": "string", "enum": ["request", "response"] } },
+        { "name": "startLine", "required": true, "schema": { "type": "integer", "minimum": 1 } },
+        { "name": "endLine", "required": false, "schema": { "type": "integer", "minimum": 1 } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.clearLineSelection",
+      "summary": "Clear the highlighted line reference",
+      "params": [],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.scrollPanel",
+      "summary": "Scroll a TUI panel by a signed line count",
+      "params": [
+        { "name": "panel", "required": true, "schema": { "type": "string", "enum": ["history", "request", "response"] } },
+        { "name": "lines", "required": true, "schema": { "type": "integer" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.setTarget",
+      "summary": "Set the proxy target URL",
+      "params": [
+        { "name": "url", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.setFilter",
+      "summary": "Filter history by method name",
+      "params": [
+        { "name": "text", "required": true, "schema": { "type": "string" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.setPaused",
+      "summary": "Enable or disable request interception",
+      "params": [
+        { "name": "paused", "required": true, "schema": { "type": "boolean" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.getPending",
+      "summary": "Read intercepted requests",
+      "params": [],
+      "result": { "name": "result", "schema": { "type": "array" } }
+    },
+    {
+      "name": "debugger.resolvePending",
+      "summary": "Allow, block, or complete an intercepted request",
+      "params": [
+        { "name": "id", "required": true, "schema": { "type": "string" } },
+        { "name": "action", "required": true, "schema": { "type": "string", "enum": ["allow", "block", "complete"] } },
+        { "name": "request", "required": false, "schema": { "type": "object" } },
+        { "name": "headers", "required": false, "schema": { "type": "object", "additionalProperties": { "type": "string" } } },
+        { "name": "response", "required": false, "schema": { "type": "object" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    }
+  ],
+  "components": {
+    "schemas": {
+      "Session": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schemaVersion", "exportedAtMs", "target", "exchanges"],
+        "properties": {
+          "schemaVersion": { "type": "integer", "enum": [1] },
+          "exportedAtMs": { "type": "integer", "minimum": 0 },
+          "target": { "type": "string" },
+          "exchanges": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SessionExchange" }
+          }
+        }
+      },
+      "SessionExchange": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["transport"],
+        "properties": {
+          "transport": { "type": "string", "enum": ["http", "websocket"] },
+          "request": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["body", "timestampMs"],
+            "properties": {
+              "body": { "type": "object" },
+              "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+              "timestampMs": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "response": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["body", "timestampMs"],
+            "properties": {
+              "body": { "type": "object" },
+              "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+              "timestampMs": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "anyOf": [
+          { "required": ["request"] },
+          { "required": ["response"] }
+        ]
+      }
+    }
+  }
+}
