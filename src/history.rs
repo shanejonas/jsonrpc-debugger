@@ -317,10 +317,10 @@ impl HistoryStore {
         }
 
         let transaction = self.connection.transaction()?;
-        let mut sequence = next_sequence(&transaction, session_id)?;
-        for exchange in exchanges {
+        for (sequence, exchange) in
+            (next_sequence(&transaction, session_id)?..).zip(exchanges.iter())
+        {
             insert_exchange(&transaction, session_id, sequence, exchange)?;
-            sequence += 1;
         }
         transaction.execute(
             "UPDATE sessions SET updated_at_ms = ?2 WHERE id = ?1",
