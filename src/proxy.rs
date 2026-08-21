@@ -1,11 +1,14 @@
 use crate::app::{
     AppMode, JsonRpcMessage, MessageDirection, PendingRequest, ProxyDecision, TransportType,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex},
+};
 use uuid::Uuid;
 
 use tokio::sync::{mpsc, oneshot};
@@ -56,6 +59,11 @@ impl ProxyServer {
     }
 
     pub async fn start(&self) -> Result<()> {
+        self.bind()?.await;
+        Ok(())
+    }
+
+    pub fn bind(&self) -> Result<impl Future<Output = ()> + 'static> {
         let target_url = self.target_url.clone();
         let client = self.client.clone();
         let message_sender = self.message_sender.clone();
@@ -94,13 +102,11 @@ impl ProxyServer {
 
         let routes = proxy_route.with(cors);
 
-        // Use a simpler approach - just run the server
-        // The task abort from main.rs will handle shutdown
-        warp::serve(routes)
-            .run(([127, 0, 0, 1], self.listen_port))
-            .await;
-
-        Ok(())
+        let address = ([127, 0, 0, 1], self.listen_port);
+        let (_, server) = warp::serve(routes)
+            .try_bind_ephemeral(address)
+            .with_context(|| format!("bind proxy port {}", self.listen_port))?;
+        Ok(server)
     }
 }
 

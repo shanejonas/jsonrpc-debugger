@@ -36,17 +36,54 @@
       "name": "debugger.getPanel",
       "summary": "Read numbered request or response panel lines",
       "params": [
-        { "name": "panel", "required": true, "schema": { "type": "string", "enum": ["request", "response"] } }
+        { "name": "panel", "required": true, "schema": { "type": "string", "enum": ["request", "response"] } },
+        { "name": "exchangeIndex", "required": false, "schema": { "type": "integer", "minimum": 0 } },
+        { "name": "tab", "required": false, "schema": { "type": "string", "enum": ["headers", "body"] } }
       ],
       "result": { "name": "result", "schema": { "type": "object" } }
     },
     {
       "name": "debugger.getHistory",
-      "summary": "Read recent JSON-RPC exchanges",
+      "summary": "Read persistent JSON-RPC exchanges from the active or named session",
+      "params": [
+        { "name": "limit", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 1000 } },
+        { "name": "sessionId", "required": false, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "before", "required": false, "schema": { "type": "integer", "minimum": 0 } }
+      ],
+      "result": { "name": "result", "schema": { "type": "array" } }
+    },
+    {
+      "name": "debugger.listSessions",
+      "summary": "List persistent debugger sessions newest first",
       "params": [
         { "name": "limit", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 1000 } }
       ],
-      "result": { "name": "result", "schema": { "type": "array" } }
+      "result": { "name": "result", "schema": { "type": "array", "items": { "$ref": "#/components/schemas/SessionSummary" } } }
+    },
+    {
+      "name": "debugger.createSession",
+      "summary": "Create and select an empty debugger session",
+      "params": [
+        { "name": "name", "required": false, "schema": { "type": "string" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.selectSession",
+      "summary": "Select a persistent session in the TUI",
+      "params": [
+        { "name": "sessionId", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.renameSession",
+      "summary": "Rename a persistent debugger session",
+      "params": [
+        { "name": "sessionId", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "name", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 80 } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
     },
     {
       "name": "debugger.exportSession",
@@ -87,6 +124,14 @@
       "result": { "name": "result", "schema": { "type": "object" } }
     },
     {
+      "name": "debugger.setFullscreen",
+      "summary": "Expand or restore the focused TUI panel",
+      "params": [
+        { "name": "fullscreen", "required": true, "schema": { "type": "boolean" } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
       "name": "debugger.revealLines",
       "summary": "Focus and reveal highlighted request or response lines",
       "params": [
@@ -100,6 +145,27 @@
       "name": "debugger.clearLineSelection",
       "summary": "Clear the highlighted line reference",
       "params": [],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.annotateLines",
+      "summary": "Persist an annotation without changing the visible TUI state",
+      "params": [
+        { "name": "panel", "required": true, "schema": { "type": "string", "enum": ["request", "response"] } },
+        { "name": "startLine", "required": true, "schema": { "type": "integer", "minimum": 1 } },
+        { "name": "endLine", "required": false, "schema": { "type": "integer", "minimum": 1 } },
+        { "name": "message", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 160 } },
+        { "name": "exchangeIndex", "required": false, "schema": { "type": "integer", "minimum": 0 } },
+        { "name": "tab", "required": false, "schema": { "type": "string", "enum": ["headers", "body"] } }
+      ],
+      "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.removeAnnotation",
+      "summary": "Delete one annotation by ID",
+      "params": [
+        { "name": "annotationId", "required": true, "schema": { "type": "string", "minLength": 1 } }
+      ],
       "result": { "name": "result", "schema": { "type": "object" } }
     },
     {
@@ -121,7 +187,7 @@
     },
     {
       "name": "debugger.setFilter",
-      "summary": "Filter history by method name",
+      "summary": "Filter history by method name or request ID",
       "params": [
         { "name": "text", "required": true, "schema": { "type": "string" } }
       ],
@@ -156,6 +222,19 @@
   ],
   "components": {
     "schemas": {
+      "SessionSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "target", "createdAtMs", "updatedAtMs", "exchangeCount"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "target": { "type": "string" },
+          "createdAtMs": { "type": "integer", "minimum": 0 },
+          "updatedAtMs": { "type": "integer", "minimum": 0 },
+          "exchangeCount": { "type": "integer", "minimum": 0 }
+        }
+      },
       "Session": {
         "type": "object",
         "additionalProperties": false,

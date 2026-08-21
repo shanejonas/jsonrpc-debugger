@@ -1,11 +1,13 @@
 use crate::app::{
-    App, AppMode, Focus, JsonRpcExchange, JsonRpcMessage, MessageDirection, TransportType,
+    App, AppMode, DetailTab, Focus, JsonRpcExchange, JsonRpcMessage, LineAnnotation,
+    MessageDirection, Overlay, SessionSummary, TransportType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     convert::Infallible,
+    future::Future,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -21,9 +23,26 @@ pub enum ControlAction {
     },
     GetPanel {
         focus: Focus,
+        exchange_index: Option<usize>,
+        tab: Option<DetailTab>,
     },
     GetHistory {
         limit: usize,
+        session_id: Option<String>,
+        before: Option<usize>,
+    },
+    ListSessions {
+        limit: usize,
+    },
+    CreateSession {
+        name: Option<String>,
+    },
+    SelectSession {
+        id: String,
+    },
+    RenameSession {
+        id: String,
+        name: String,
     },
     ExportSession,
     ReplaySession {
@@ -38,12 +57,26 @@ pub enum ControlAction {
     SetFocus {
         focus: Focus,
     },
+    SetFullscreen {
+        fullscreen: bool,
+    },
     RevealLines {
         focus: Focus,
         start_line: usize,
         end_line: usize,
     },
+    AnnotateLines {
+        focus: Focus,
+        exchange_index: Option<usize>,
+        tab: Option<DetailTab>,
+        start_line: usize,
+        end_line: usize,
+        message: String,
+    },
     ClearLineSelection,
+    RemoveAnnotation {
+        id: String,
+    },
     ScrollPanel {
         focus: Focus,
         lines: i64,
@@ -148,7 +181,10 @@ impl ControlError {
     }
 }
 
-pub async fn serve(port: u16, sender: mpsc::UnboundedSender<ControlCommand>) -> Result<(), String> {
+pub fn bind(
+    port: u16,
+    sender: mpsc::UnboundedSender<ControlCommand>,
+) -> Result<impl Future<Output = ()> + 'static, String> {
     let sender = warp::any().map(move || sender.clone());
     let route = warp::post()
         .and(warp::path::end())
@@ -157,9 +193,10 @@ pub async fn serve(port: u16, sender: mpsc::UnboundedSender<ControlCommand>) -> 
         .and(sender)
         .and_then(handle_request);
 
-    warp::serve(route).try_bind(([127, 0, 0, 1], port)).await;
-
-    Ok(())
+    let (_, server) = warp::serve(route)
+        .try_bind_ephemeral(([127, 0, 0, 1], port))
+        .map_err(|error| format!("bind control port {port}: {error}"))?;
+    Ok(server)
 }
 
 async fn handle_request(
@@ -232,9 +269,28 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
         }),
         "debugger.getPanel" => Ok(ControlAction::GetPanel {
             focus: parse_detail_focus(required_string(params, 0, "panel")?)?,
+            exchange_index: optional_usize(params, 1, "exchangeIndex")?,
+            tab: optional_string(params, 2, "tab")?
+                .map(parse_detail_tab)
+                .transpose()?,
         }),
         "debugger.getHistory" => Ok(ControlAction::GetHistory {
             limit: optional_usize(params, 0, "limit")?.unwrap_or(100).min(1000),
+            session_id: optional_string(params, 1, "sessionId")?.map(str::to_string),
+            before: optional_usize(params, 2, "before")?,
+        }),
+        "debugger.listSessions" => Ok(ControlAction::ListSessions {
+            limit: optional_usize(params, 0, "limit")?.unwrap_or(100).min(1000),
+        }),
+        "debugger.createSession" => Ok(ControlAction::CreateSession {
+            name: optional_string(params, 0, "name")?.map(str::to_string),
+        }),
+        "debugger.selectSession" => Ok(ControlAction::SelectSession {
+            id: required_string(params, 0, "sessionId")?.to_string(),
+        }),
+        "debugger.renameSession" => Ok(ControlAction::RenameSession {
+            id: required_string(params, 0, "sessionId")?.to_string(),
+            name: required_string(params, 1, "name")?.to_string(),
         }),
         "debugger.exportSession" => Ok(ControlAction::ExportSession),
         "debugger.replaySession" => Ok(ControlAction::ReplaySession {
@@ -251,6 +307,9 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
         "debugger.setFocus" => Ok(ControlAction::SetFocus {
             focus: parse_focus(required_string(params, 0, "panel")?)?,
         }),
+        "debugger.setFullscreen" => Ok(ControlAction::SetFullscreen {
+            fullscreen: required_bool(params, 0, "fullscreen")?,
+        }),
         "debugger.revealLines" => {
             let start_line = required_usize(params, 1, "startLine")?;
             Ok(ControlAction::RevealLines {
@@ -259,7 +318,23 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
                 end_line: optional_usize(params, 2, "endLine")?.unwrap_or(start_line),
             })
         }
+        "debugger.annotateLines" => {
+            let start_line = required_usize(params, 1, "startLine")?;
+            Ok(ControlAction::AnnotateLines {
+                focus: parse_detail_focus(required_string(params, 0, "panel")?)?,
+                exchange_index: optional_usize(params, 4, "exchangeIndex")?,
+                tab: optional_string(params, 5, "tab")?
+                    .map(parse_detail_tab)
+                    .transpose()?,
+                start_line,
+                end_line: optional_usize(params, 2, "endLine")?.unwrap_or(start_line),
+                message: required_string(params, 3, "message")?.to_string(),
+            })
+        }
         "debugger.clearLineSelection" => Ok(ControlAction::ClearLineSelection),
+        "debugger.removeAnnotation" => Ok(ControlAction::RemoveAnnotation {
+            id: required_string(params, 0, "annotationId")?.to_string(),
+        }),
         "debugger.scrollPanel" => Ok(ControlAction::ScrollPanel {
             focus: parse_scroll_focus(required_string(params, 0, "panel")?)?,
             lines: required_i64(params, 1, "lines")?,
@@ -328,6 +403,20 @@ fn required_string<'a>(
 ) -> Result<&'a str, ControlError> {
     required(params, index, name)?
         .as_str()
+        .ok_or_else(|| ControlError::invalid_params(format!("{name} must be a string")))
+}
+
+fn optional_string<'a>(
+    params: &'a Value,
+    index: usize,
+    name: &str,
+) -> Result<Option<&'a str>, ControlError> {
+    let Some(value) = optional(params, index, name) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
         .ok_or_else(|| ControlError::invalid_params(format!("{name} must be a string")))
 }
 
@@ -412,6 +501,14 @@ fn parse_detail_focus(panel: &str) -> Result<Focus, ControlError> {
     }
 }
 
+fn parse_detail_tab(tab: &str) -> Result<DetailTab, ControlError> {
+    match tab {
+        "headers" => Ok(DetailTab::Headers),
+        "body" => Ok(DetailTab::Body),
+        _ => Err(ControlError::invalid_params("tab must be headers or body")),
+    }
+}
+
 fn parse_scroll_focus(panel: &str) -> Result<Focus, ControlError> {
     match panel {
         "history" => Ok(Focus::MessageList),
@@ -440,6 +537,12 @@ pub fn state(app: &App) -> Value {
             "text": selection.text.join("\n"),
         })
     });
+    let annotations = app
+        .annotations
+        .iter()
+        .filter(|annotation| annotation.exchange_index == app.selected_exchange)
+        .map(annotation_value)
+        .collect::<Vec<_>>();
     json!({
         "revision": app.revision(),
         "running": app.is_running,
@@ -449,7 +552,15 @@ pub fn state(app: &App) -> Value {
         "target": app.proxy_config.target_url,
         "filter": app.filter_text,
         "focus": focus_name(app.focus),
+        "fullscreen": app.panel_fullscreen,
         "lineSelection": line_selection,
+        "visualSelectionActive": app.visual_selection_active,
+        "annotations": annotations,
+        "activeAnnotationId": app.active_annotation_id,
+        "cursor": {
+            "requestLine": app.request_details_cursor_line,
+            "responseLine": app.response_details_cursor_line,
+        },
         "scroll": {
             "request": app.request_details_scroll,
             "response": app.response_details_scroll,
@@ -461,6 +572,8 @@ pub fn state(app: &App) -> Value {
         "selectedExchange": app.selected_exchange,
         "exchangeCount": app.exchanges.len(),
         "pendingCount": app.pending_requests.len(),
+        "overlay": overlay_name(app.overlay),
+        "session": app.session,
     })
 }
 
@@ -483,18 +596,20 @@ pub fn panel(focus: Focus, lines: Vec<String>) -> Value {
     })
 }
 
-pub fn history(app: &App, limit: usize) -> Value {
-    let start = app.exchanges.len().saturating_sub(limit);
+pub fn stored_history(exchanges: Vec<(usize, JsonRpcExchange)>) -> Value {
     Value::Array(
-        app.exchanges
-            .iter()
-            .enumerate()
-            .skip(start)
-            .map(|(index, exchange)| exchange_value(index, exchange))
+        exchanges
+            .into_iter()
+            .map(|(index, exchange)| exchange_value(index, &exchange))
             .collect(),
     )
 }
 
+pub fn sessions(sessions: Vec<SessionSummary>) -> Value {
+    serde_json::to_value(sessions).expect("session summaries are serializable")
+}
+
+#[cfg(test)]
 pub fn export_session(app: &App) -> Session {
     Session {
         schema_version: 1,
@@ -677,6 +792,15 @@ fn exchange_value(index: usize, exchange: &JsonRpcExchange) -> Value {
     })
 }
 
+fn overlay_name(overlay: Overlay) -> &'static str {
+    match overlay {
+        Overlay::None => "none",
+        Overlay::Prefix => "commands",
+        Overlay::Help => "help",
+        Overlay::Sessions => "sessions",
+    }
+}
+
 fn message_value(message: &JsonRpcMessage) -> Value {
     json!({
         "body": message_body(message),
@@ -730,6 +854,26 @@ fn focus_name(focus: Focus) -> &'static str {
     }
 }
 
+fn annotation_value(annotation: &LineAnnotation) -> Value {
+    json!({
+        "id": annotation.id,
+        "exchangeIndex": annotation.exchange_index,
+        "panel": focus_name(annotation.panel),
+        "tab": match annotation.tab {
+            DetailTab::Headers => "headers",
+            DetailTab::Body => "body",
+        },
+        "startLine": annotation.start_line,
+        "endLine": annotation.end_line,
+        "message": annotation.message,
+        "text": annotation.text.join("\n"),
+    })
+}
+
+pub fn annotation(annotation: &LineAnnotation) -> Value {
+    annotation_value(annotation)
+}
+
 fn transport_name(transport: &TransportType) -> &'static str {
     match transport {
         TransportType::Http => "http",
@@ -769,6 +913,17 @@ mod tests {
                 focus: Focus::RequestSection
             })
         ));
+
+        let fullscreen = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "debugger.setFullscreen",
+            "params": {"fullscreen": true},
+        });
+        assert!(matches!(
+            parse_request(&fullscreen),
+            Ok(ControlAction::SetFullscreen { fullscreen: true })
+        ));
     }
 
     #[test]
@@ -778,7 +933,7 @@ mod tests {
         assert_eq!(document["openrpc"], "1.3.2");
         assert_eq!(document["servers"][0]["url"], "http://127.0.0.1:8081");
         assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(document["methods"].as_array().unwrap().len(), 18);
+        assert_eq!(document["methods"].as_array().unwrap().len(), 25);
         assert!(document["methods"]
             .as_array()
             .unwrap()
@@ -789,10 +944,31 @@ mod tests {
             .unwrap()
             .iter()
             .any(|method| method["name"] == "debugger.replaySession"));
+        assert!(document["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method["name"] == "debugger.renameSession"));
+        assert!(document["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method["name"] == "debugger.removeAnnotation"));
+        assert!(document["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method["name"] == "debugger.setFullscreen"));
     }
 
     #[test]
     fn parses_line_selection_and_scrolling() {
+        let panel = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "debugger.getPanel",
+            "params": {"panel": "response", "exchangeIndex": 7, "tab": "headers"},
+        });
         let reveal = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -805,6 +981,34 @@ mod tests {
             "method": "debugger.scrollPanel",
             "params": {"panel": "response", "lines": -4},
         });
+        let annotate = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "debugger.annotateLines",
+            "params": {
+                "panel": "response",
+                "startLine": 10,
+                "endLine": 14,
+                "message": "This fee is unusually high",
+                "exchangeIndex": 7,
+                "tab": "body",
+            },
+        });
+        let remove = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "debugger.removeAnnotation",
+            "params": {"annotationId": "note-1"},
+        });
+
+        assert!(matches!(
+            parse_request(&panel),
+            Ok(ControlAction::GetPanel {
+                focus: Focus::ResponseSection,
+                exchange_index: Some(7),
+                tab: Some(DetailTab::Headers),
+            })
+        ));
 
         assert!(matches!(
             parse_request(&reveal),
@@ -820,6 +1024,21 @@ mod tests {
                 focus: Focus::ResponseSection,
                 lines: -4,
             })
+        ));
+        assert!(matches!(
+            parse_request(&annotate),
+            Ok(ControlAction::AnnotateLines {
+                focus: Focus::ResponseSection,
+                exchange_index: Some(7),
+                tab: Some(DetailTab::Body),
+                start_line: 10,
+                end_line: 14,
+                message,
+            }) if message == "This fee is unusually high"
+        ));
+        assert!(matches!(
+            parse_request(&remove),
+            Ok(ControlAction::RemoveAnnotation { id }) if id == "note-1"
         ));
     }
 
@@ -842,6 +1061,24 @@ mod tests {
                 "exchanges": [],
             }},
         });
+        let history = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "debugger.getHistory",
+            "params": {"limit": 25, "sessionId": "saved", "before": 40},
+        });
+        let select = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "debugger.selectSession",
+            "params": {"sessionId": "saved"},
+        });
+        let rename = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "debugger.renameSession",
+            "params": {"sessionId": "saved", "name": "Refund investigation"},
+        });
 
         assert!(matches!(
             parse_request(&wait),
@@ -854,18 +1091,53 @@ mod tests {
             parse_request(&replay),
             Ok(ControlAction::ReplaySession { .. })
         ));
+        assert!(matches!(
+            parse_request(&history),
+            Ok(ControlAction::GetHistory {
+                limit: 25,
+                session_id: Some(id),
+                before: Some(40),
+            }) if id == "saved"
+        ));
+        assert!(matches!(
+            parse_request(&select),
+            Ok(ControlAction::SelectSession { id }) if id == "saved"
+        ));
+        assert!(matches!(
+            parse_request(&rename),
+            Ok(ControlAction::RenameSession { id, name })
+                if id == "saved" && name == "Refund investigation"
+        ));
     }
 
     #[test]
-    fn state_exposes_the_shared_line_reference() {
+    fn annotation_and_shared_line_reference_are_independent() {
         let mut app = App::new();
+        app.add_annotation(LineAnnotation {
+            id: "annotation-1".to_string(),
+            exchange_index: 0,
+            panel: Focus::ResponseSection,
+            tab: DetailTab::Body,
+            start_line: 3,
+            end_line: 4,
+            message: "Compare these values".to_string(),
+            text: vec!["first".to_string(), "second".to_string()],
+        });
+
+        let annotated = state(&app);
+        assert_eq!(annotated["focus"], "history");
+        assert_eq!(annotated["fullscreen"], false);
+        assert_eq!(annotated["scroll"]["response"], 0);
+        assert!(annotated["lineSelection"].is_null());
+        assert!(annotated["activeAnnotationId"].is_null());
+        assert_eq!(annotated["annotations"][0]["id"], "annotation-1");
+
         app.reveal_lines(
             Focus::ResponseSection,
             3,
             4,
             vec!["first".to_string(), "second".to_string()],
         );
-
         let state = state(&app);
 
         assert_eq!(state["focus"], "response");
@@ -874,6 +1146,11 @@ mod tests {
         assert_eq!(state["lineSelection"]["startLine"], 3);
         assert_eq!(state["lineSelection"]["endLine"], 4);
         assert_eq!(state["lineSelection"]["text"], "first\nsecond");
+        assert_eq!(state["annotations"][0]["id"], "annotation-1");
+        assert_eq!(state["annotations"][0]["message"], "Compare these values");
+        assert_eq!(state["annotations"][0]["text"], "first\nsecond");
+        assert!(state["activeAnnotationId"].is_null());
+        assert_eq!(state["cursor"]["responseLine"], 4);
 
         let panel = panel(
             Focus::ResponseSection,
@@ -935,5 +1212,14 @@ mod tests {
             ..session
         })
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_an_occupied_control_port() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, _receiver) = mpsc::unbounded_channel();
+
+        assert!(bind(port, sender).is_err());
     }
 }

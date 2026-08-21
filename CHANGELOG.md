@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-21
+
+### Added
+
+- Durable SQLite sessions in `~/.config/jsonrpc-debugger/sqlite.db`, with a session picker and paged history over the agent API.
+- `debugger.listSessions`, `debugger.createSession`, and `debugger.selectSession` control methods.
+- A `Ctrl-B` command prefix and `Ctrl-B ?` keybind help.
+- Persistent line annotations with per-ID deletion over the agent API.
+- Amber scrollbar markers and `Ctrl-B a` annotation prompts for visual selections.
+- Inline notes for single lines and diagnostic rows for multiline ranges.
+- Named session prompts, `Ctrl-B R` rename, and `debugger.renameSession`.
+- Focused-panel fullscreen with `Ctrl-B z` and agent control.
+
+### Changed
+
+- Global TUI commands now live behind `Ctrl-B`. Actions for a focused intercepted request remain direct.
+- Line highlights are temporary references. Annotations persist independently in session history.
+- Request filters match method names and IDs.
+
 ## [0.2.0] - 2026-08-20
 
 ### Added

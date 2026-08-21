@@ -54,19 +54,34 @@ The TUI shows request history beside the selected request and response. It suppo
 | Select a line | Click its line number |
 | Select a line range | Click, then Shift-click |
 | Copy the focused panel as Markdown | `Enter` |
-| Pause new requests | `p` |
+| Open commands / keybinds | `Ctrl-B` / `Ctrl-B ?` |
+| Fullscreen the focused panel | `Ctrl-B z` |
+| Open saved sessions / start a new one | `Ctrl-B s` / `Ctrl-B n` |
+| Rename the current session | `Ctrl-B R` |
+| Annotate a Vim selection | `v`, select lines, then `Ctrl-B a` |
+| Delete the focused annotation | `Ctrl-B d` |
+| Pause new requests | `Ctrl-B p` |
 | Allow or block an intercepted request | `a` / `b` |
 | Edit a request body or headers | `e` / `h` |
-| Create a request or custom response | `c` |
-| Quit | `q` |
+| Complete an intercepted request | `c` |
+| Create a request | `Ctrl-B c` |
+| Quit | `Ctrl-B q` or `Ctrl-C` |
 
 The request list copies as a Markdown table. Request bodies, responses, headers, and status copy as Markdown.
 
 The inline editor supports normal Vim motions and operators such as `w`, `b`, `e`, `cw`, `dw`, `dd`, `u`, and `p`. Save with `:w`; cancel with `:q!`.
 
+History and line annotations survive restarts in `~/.config/jsonrpc-debugger/sqlite.db`. One-line notes sit beside their source line. Range notes sit below the selection. Amber scrollbar ticks show annotations above and below the current view. Set `XDG_CONFIG_HOME` or `JSONRPC_DEBUGGER_CONFIG_DIR` to move the database.
+
 ## Let an agent drive it
 
 The control plane is itself a JSON-RPC 2.0 server. An agent can operate the debugger while you watch the same actions happen in the TUI.
+
+Print the agent skill bundled with your installed version:
+
+```bash
+jsonrpc-debugger --skill
+```
 
 Ask the running debugger what it supports:
 
@@ -87,19 +102,22 @@ curl http://127.0.0.1:8081 \
 An agent can:
 
 - Read state, history, pending requests, and numbered panel content.
+- List old sessions and page through their persistent history without changing the TUI.
 - Wait for revisions without polling.
 - Send requests through the debugger.
 - Select exchanges, focus panels, scroll, and highlight line ranges.
+- Add persistent line annotations and remove them by ID.
 - Change the target or filter and control interception.
-- Export a session or replay one without forwarding its requests.
+- Create, select, or rename sessions.
+- Export portable history or replay it without forwarding requests.
 
-Line selections are shared. Click a suspicious response line, tell the agent to inspect the selected line, and it reads the same reference from `debugger.getState`. The agent can reveal another line or range and bring it into view for you.
+Line selections are shared but temporary. Annotations stick to their exchange until a person presses `Ctrl-B d` or an agent removes one by ID. Highlights can move without erasing the notes around them.
 
-Use the [`jsonrpc-debugger` agent skill](https://github.com/shanejonas/agent-skills/tree/main/skills/jsonrpc-debugger) for typed call and demo scripts. The complete API lives in [`openrpc.json`](openrpc.json) and is available at runtime through `rpc.discover`.
+The complete API lives in [`openrpc.json`](openrpc.json) and is available at runtime through `rpc.discover`.
 
 ## Intercept requests
 
-Press `p` or call `debugger.setPaused`. New requests wait in the debugger until a person or agent allows, blocks, edits, or completes them with a custom response.
+Press `Ctrl-B p` or call `debugger.setPaused`. New requests wait in the debugger until a person or agent allows, blocks, edits, or completes them with a custom response. Those focused actions stay on direct keys because they only apply while a request is waiting.
 
 ## Develop
 
