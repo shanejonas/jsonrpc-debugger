@@ -19,12 +19,20 @@ use tokio::time::Instant;
 
 mod app;
 mod control;
+mod history;
 mod proxy;
 mod ui;
 
-use app::{App, AppMode, EditorMode, EditorMotion, EditorOperator, EditorTarget, TextEditor};
+use app::{
+    App, AppMode, EditorMode, EditorMotion, EditorOperator, EditorTarget, LineAnnotation, Overlay,
+    TextEditor,
+};
 use control::{ControlAction, ControlCommand, ControlError, PendingDecision};
+use history::HistoryStore;
 use proxy::{ProxyServer, ProxyState};
+use uuid::Uuid;
+
+const AGENT_SKILL: &str = include_str!("../skills/jsonrpc-debugger/SKILL.md");
 
 #[derive(Parser)]
 #[command(name = "jsonrpc-debugger", version)]
@@ -41,6 +49,10 @@ struct Cli {
     /// Port for the local JSON-RPC control plane (defaults to proxy port + 1)
     #[arg(long)]
     control_port: Option<u16>,
+
+    /// Print agent instructions and exit
+    #[arg(long)]
+    skill: bool,
 }
 
 fn copy_to_clipboard(
@@ -87,6 +99,7 @@ struct ChangeWaiter {
 }
 
 struct Runtime {
+    history: HistoryStore,
     message_sender: mpsc::UnboundedSender<app::JsonRpcMessage>,
     shared_app_mode: Arc<Mutex<AppMode>>,
     pending_receiver: mpsc::UnboundedReceiver<app::PendingRequest>,
@@ -293,14 +306,28 @@ fn save_editor(app: &mut App, request_result_sender: &mpsc::UnboundedSender<Resu
     }
 }
 
+struct ControlContext<'a> {
+    terminal_area: ratatui::layout::Rect,
+    proxy_server: &'a mut Option<JoinHandle<()>>,
+    message_sender: &'a mpsc::UnboundedSender<app::JsonRpcMessage>,
+    proxy_state: &'a ProxyState,
+    request_result_sender: &'a mpsc::UnboundedSender<Result<(), String>>,
+    history: &'a mut HistoryStore,
+}
+
 async fn handle_control_command(
     app: &mut App,
     command: ControlCommand,
-    proxy_server: &mut Option<JoinHandle<()>>,
-    message_sender: &mpsc::UnboundedSender<app::JsonRpcMessage>,
-    proxy_state: &ProxyState,
-    request_result_sender: &mpsc::UnboundedSender<Result<(), String>>,
+    context: ControlContext<'_>,
 ) {
+    let ControlContext {
+        terminal_area,
+        proxy_server,
+        message_sender,
+        proxy_state,
+        request_result_sender,
+        history,
+    } = context;
     let ControlCommand { action, reply } = command;
     let result = match action {
         ControlAction::Discover => Ok(control::discovery(app.control_port)),
@@ -308,31 +335,77 @@ async fn handle_control_command(
         ControlAction::WaitForChange { .. } => {
             unreachable!("wait commands are registered by run_app")
         }
-        ControlAction::GetPanel { focus } => {
+        ControlAction::GetPanel {
+            focus,
+            exchange_index,
+            tab,
+        } => {
             if app.app_mode != AppMode::Normal {
                 Err(ControlError::invalid_params(
                     "line references require normal mode",
                 ))
             } else {
-                match ui::detail_lines_text(app, focus) {
-                    Some(lines) => Ok(control::panel(focus, lines)),
-                    None => Err(ControlError::invalid_params(
-                        "panel must be request or response",
-                    )),
-                }
+                detail_lines_at(app, focus, exchange_index, tab)
+                    .map(|lines| control::panel(focus, lines))
             }
         }
-        ControlAction::GetHistory { limit } => Ok(control::history(app, limit)),
-        ControlAction::ExportSession => Ok(serde_json::to_value(control::export_session(app))
-            .expect("session values are serializable")),
+        ControlAction::GetHistory {
+            limit,
+            session_id,
+            before,
+        } => active_session_id(app)
+            .map(|active| session_id.as_deref().unwrap_or(active))
+            .ok_or_else(|| ControlError::runtime("No active session"))
+            .and_then(|session_id| {
+                history
+                    .history(session_id, limit, before)
+                    .map(control::stored_history)
+                    .map_err(|error| ControlError::runtime(error.to_string()))
+            }),
+        ControlAction::ListSessions { limit } => history
+            .list_sessions(limit)
+            .map(control::sessions)
+            .map_err(|error| ControlError::runtime(error.to_string())),
+        ControlAction::CreateSession { name } => {
+            create_session(app, history, name.as_deref()).map(|_| control::state(app))
+        }
+        ControlAction::SelectSession { id } => match select_session(app, history, &id) {
+            Ok(target_changed) => {
+                if target_changed && app.is_running {
+                    restart_proxy(app, proxy_server, message_sender, proxy_state).await;
+                }
+                Ok(control::state(app))
+            }
+            Err(error) => Err(error),
+        },
+        ControlAction::RenameSession { id, name } => {
+            rename_session(app, history, &id, &name).map(|_| control::state(app))
+        }
+        ControlAction::ExportSession => active_session_id(app)
+            .ok_or_else(|| ControlError::runtime("No active session"))
+            .and_then(|session_id| {
+                history
+                    .export_session(session_id)
+                    .and_then(|session| serde_json::to_value(session).map_err(Into::into))
+                    .map_err(|error| ControlError::runtime(error.to_string()))
+            }),
         ControlAction::ReplaySession { session } => match control::replay_session(session) {
             Ok(exchanges) => {
                 let imported = exchanges.len();
-                app.append_exchanges(exchanges);
-                Ok(serde_json::json!({
-                    "imported": imported,
-                    "state": control::state(app),
-                }))
+                active_session_id(app)
+                    .ok_or_else(|| ControlError::runtime("No active session"))
+                    .and_then(|session_id| {
+                        history
+                            .append_exchanges(session_id, &exchanges)
+                            .map_err(|error| ControlError::runtime(error.to_string()))
+                    })
+                    .map(|_| {
+                        app.append_exchanges(exchanges);
+                        serde_json::json!({
+                            "imported": imported,
+                            "state": control::state(app),
+                        })
+                    })
             }
             Err(error) => Err(error),
         },
@@ -371,6 +444,10 @@ async fn handle_control_command(
             app.set_focus(focus);
             Ok(control::state(app))
         }
+        ControlAction::SetFullscreen { fullscreen } => {
+            app.set_panel_fullscreen(fullscreen);
+            Ok(control::state(app))
+        }
         ControlAction::RevealLines {
             focus,
             start_line,
@@ -385,6 +462,15 @@ async fn handle_control_command(
                 match ui::detail_line_text(app, focus, start_line, end_line) {
                     Some(text) => {
                         app.reveal_lines(focus, start_line, end_line, text);
+                        center_detail_range(
+                            app,
+                            terminal_area,
+                            focus,
+                            start_line,
+                            end_line,
+                            total_lines,
+                            None,
+                        );
                         Ok(control::state(app))
                     }
                     None => Err(ControlError::invalid_params(format!(
@@ -393,13 +479,45 @@ async fn handle_control_command(
                 }
             }
         }
+        ControlAction::AnnotateLines {
+            focus,
+            exchange_index,
+            tab,
+            start_line,
+            end_line,
+            message,
+        } => match build_annotation(
+            app,
+            focus,
+            exchange_index,
+            tab,
+            start_line,
+            end_line,
+            &message,
+        ) {
+            Ok(annotation) => {
+                let value = control::annotation(&annotation);
+                match persist_annotation(app, history, annotation) {
+                    Ok(()) => Ok(serde_json::json!({
+                        "annotation": value,
+                        "state": control::state(app),
+                    })),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        },
         ControlAction::ClearLineSelection => {
             app.clear_line_selection();
             Ok(control::state(app))
         }
+        ControlAction::RemoveAnnotation { id } => {
+            remove_annotation(app, history, &id).map(|_| control::state(app))
+        }
         ControlAction::ScrollPanel { focus, lines } => {
             if focus == app::Focus::MessageList {
-                scroll_history(app, lines);
+                let visible_rows = ui::panel_visible_lines(terminal_area, app, focus);
+                scroll_history(app, lines, visible_rows);
                 Ok(control::state(app))
             } else if app.app_mode != AppMode::Normal {
                 Err(ControlError::invalid_params(
@@ -418,7 +536,18 @@ async fn handle_control_command(
             } else {
                 let changed = app.proxy_config.target_url != url;
                 if changed {
+                    if let Some(session_id) = active_session_id(app) {
+                        if let Err(error) = history.update_target(session_id, url) {
+                            return send_control_reply(
+                                reply,
+                                Err(ControlError::runtime(error.to_string())),
+                            );
+                        }
+                    }
                     app.proxy_config.target_url = url.to_string();
+                    if let Some(session) = &mut app.session {
+                        session.target = url.to_string();
+                    }
                     app.mark_changed();
                 }
                 if changed && app.is_running {
@@ -457,20 +586,261 @@ async fn handle_control_command(
     let _ = reply.send(result);
 }
 
-fn scroll_history(app: &mut App, lines: i64) {
-    app.focus = app::Focus::MessageList;
-    match app.app_mode {
-        AppMode::Normal => {
-            let indices = app.filtered_exchange_indices();
-            let Some(current) = indices
+fn center_detail_range(
+    app: &mut App,
+    terminal_area: ratatui::layout::Rect,
+    panel: app::Focus,
+    start_line: usize,
+    end_line: usize,
+    total_lines: usize,
+    annotation_id: Option<&str>,
+) {
+    let visible_lines = ui::panel_visible_lines(terminal_area, app, panel).max(1);
+    let annotations = app
+        .visible_annotations(panel)
+        .filter(|annotation| {
+            annotation.start_line != annotation.end_line && annotation.end_line <= total_lines
+        })
+        .collect::<Vec<_>>();
+    let annotations_before = |line: usize| {
+        annotations
+            .iter()
+            .filter(|annotation| annotation.end_line < line)
+            .count()
+    };
+    let range_start = start_line.saturating_sub(1) + annotations_before(start_line);
+    let source_range_end = end_line.saturating_sub(1) + annotations_before(end_line);
+    let range_end = annotation_id
+        .and_then(|id| {
+            annotations
                 .iter()
-                .position(|index| *index == app.selected_exchange)
-            else {
-                return;
-            };
-            let selected = offset_index(current, lines, indices.len());
-            app.select_exchange(indices[selected]);
-        }
+                .filter(|annotation| annotation.end_line == end_line)
+                .position(|annotation| annotation.id == id)
+                .map(|position| end_line + annotations_before(end_line) + position)
+        })
+        .unwrap_or(source_range_end);
+    let display_total = total_lines + annotations.len();
+    let range_center = range_start + range_end.saturating_sub(range_start) / 2;
+    let viewport_center = visible_lines.saturating_sub(1) / 2;
+    let display_scroll = range_center
+        .saturating_sub(viewport_center)
+        .min(display_total.saturating_sub(visible_lines));
+    let source_scroll = (0..total_lines)
+        .take_while(|source| {
+            *source
+                + annotations
+                    .iter()
+                    .filter(|annotation| annotation.end_line <= *source)
+                    .count()
+                <= display_scroll
+        })
+        .last()
+        .unwrap_or(0);
+    let scroll = match panel {
+        app::Focus::RequestSection => &mut app.request_details_scroll,
+        app::Focus::ResponseSection => &mut app.response_details_scroll,
+        app::Focus::MessageList | app::Focus::StatusHeader => return,
+    };
+    if *scroll == source_scroll {
+        return;
+    }
+    *scroll = source_scroll;
+    app.mark_changed();
+}
+
+fn send_control_reply(
+    reply: oneshot::Sender<control::ControlResult>,
+    result: control::ControlResult,
+) {
+    let _ = reply.send(result);
+}
+
+fn active_session_id(app: &App) -> Option<&str> {
+    app.session.as_ref().map(|session| session.id.as_str())
+}
+
+fn build_annotation(
+    app: &App,
+    panel: app::Focus,
+    exchange_index: Option<usize>,
+    tab: Option<app::DetailTab>,
+    start_line: usize,
+    end_line: usize,
+    message: &str,
+) -> Result<LineAnnotation, ControlError> {
+    if app.app_mode != AppMode::Normal {
+        return Err(ControlError::invalid_params(
+            "line annotations require normal mode",
+        ));
+    }
+    let message = message.trim();
+    if message.is_empty() || message.chars().count() > 160 || message.chars().any(char::is_control)
+    {
+        return Err(ControlError::invalid_params(
+            "message must be one line containing 1 to 160 characters",
+        ));
+    }
+
+    let exchange_index = exchange_index.unwrap_or(app.selected_exchange);
+    let tab = tab
+        .or_else(|| app.detail_tab(panel))
+        .ok_or_else(|| ControlError::invalid_params("annotation panel must show details"))?;
+    let lines = detail_lines_at(app, panel, Some(exchange_index), Some(tab))?;
+    let total_lines = lines.len();
+    let text = (start_line > 0 && end_line >= start_line && end_line <= total_lines)
+        .then(|| lines[start_line - 1..end_line].to_vec())
+        .ok_or_else(|| {
+            ControlError::invalid_params(format!("line range must be within 1..={total_lines}"))
+        })?;
+
+    Ok(LineAnnotation {
+        id: Uuid::new_v4().to_string(),
+        exchange_index,
+        panel,
+        tab,
+        start_line,
+        end_line,
+        message: message.to_string(),
+        text,
+    })
+}
+
+fn detail_lines_at(
+    app: &App,
+    panel: app::Focus,
+    exchange_index: Option<usize>,
+    tab: Option<app::DetailTab>,
+) -> Result<Vec<String>, ControlError> {
+    let exchange_index = exchange_index.unwrap_or(app.selected_exchange);
+    if exchange_index >= app.exchanges.len() {
+        return Err(ControlError::invalid_params(format!(
+            "Exchange index {exchange_index} does not exist"
+        )));
+    }
+    let tab = tab
+        .or_else(|| app.detail_tab(panel))
+        .ok_or_else(|| ControlError::invalid_params("panel must be request or response"))?;
+    ui::detail_lines_text_at(app, panel, exchange_index, tab)
+        .ok_or_else(|| ControlError::invalid_params("panel must be request or response"))
+}
+
+fn annotate_visual_selection(
+    app: &mut App,
+    history: &HistoryStore,
+    _terminal_area: ratatui::layout::Rect,
+    message: &str,
+) -> Result<(), ControlError> {
+    let selection = app
+        .line_selection
+        .as_ref()
+        .filter(|_| app.visual_selection_active)
+        .cloned()
+        .ok_or_else(|| ControlError::invalid_params("No visual selection"))?;
+    let annotation = build_annotation(
+        app,
+        selection.panel,
+        Some(app.selected_exchange),
+        app.detail_tab(selection.panel),
+        selection.start_line,
+        selection.end_line,
+        message,
+    )?;
+    persist_annotation(app, history, annotation)?;
+    app.visual_selection_active = false;
+    app.mark_changed();
+    Ok(())
+}
+
+fn persist_annotation(
+    app: &mut App,
+    history: &HistoryStore,
+    annotation: LineAnnotation,
+) -> Result<(), ControlError> {
+    let session_id = active_session_id(app)
+        .ok_or_else(|| ControlError::runtime("No active session"))?
+        .to_string();
+    history
+        .add_annotation(&session_id, &annotation)
+        .map_err(|error| ControlError::runtime(error.to_string()))?;
+    app.add_annotation(annotation);
+    Ok(())
+}
+
+fn remove_annotation(
+    app: &mut App,
+    history: &HistoryStore,
+    annotation_id: &str,
+) -> Result<(), ControlError> {
+    let session_id = active_session_id(app)
+        .ok_or_else(|| ControlError::runtime("No active session"))?
+        .to_string();
+    let removed = history
+        .remove_annotation(&session_id, annotation_id)
+        .map_err(|error| ControlError::runtime(error.to_string()))?;
+    if !removed {
+        return Err(ControlError::invalid_params(format!(
+            "Annotation not found: {annotation_id}"
+        )));
+    }
+    app.remove_annotation(annotation_id);
+    Ok(())
+}
+
+fn rename_session(
+    app: &mut App,
+    history: &HistoryStore,
+    session_id: &str,
+    name: &str,
+) -> Result<(), ControlError> {
+    let name = name.trim();
+    let renamed = history
+        .rename_session(session_id, name)
+        .map_err(|error| ControlError::invalid_params(error.to_string()))?;
+    if !renamed {
+        return Err(ControlError::invalid_params(format!(
+            "Session not found: {session_id}"
+        )));
+    }
+    app.rename_session(session_id, name.to_string());
+    Ok(())
+}
+
+fn create_session(
+    app: &mut App,
+    history: &mut HistoryStore,
+    name: Option<&str>,
+) -> Result<(), ControlError> {
+    if !app.pending_requests.is_empty() {
+        return Err(ControlError::runtime(
+            "Resolve pending requests before changing sessions",
+        ));
+    }
+    let session = history
+        .create_session(name, &app.proxy_config.target_url)
+        .map_err(|error| ControlError::runtime(error.to_string()))?;
+    app.activate_session(session, Vec::new(), Vec::new());
+    Ok(())
+}
+
+fn select_session(app: &mut App, history: &HistoryStore, id: &str) -> Result<bool, ControlError> {
+    if !app.pending_requests.is_empty() {
+        return Err(ControlError::runtime(
+            "Resolve pending requests before changing sessions",
+        ));
+    }
+    let (session, exchanges, annotations) = history
+        .load_session(id)
+        .map_err(|error| ControlError::runtime(error.to_string()))?;
+    let target_changed = app.proxy_config.target_url != session.target;
+    app.proxy_config.target_url = session.target.clone();
+    app.activate_session(session, exchanges, annotations);
+    Ok(target_changed)
+}
+
+fn scroll_history(app: &mut App, lines: i64, visible_rows: usize) {
+    app.set_focus(app::Focus::MessageList);
+    match app.app_mode {
+        AppMode::Normal => app.scroll_history(lines, visible_rows),
         AppMode::Paused | AppMode::Intercepting => {
             if app.pending_requests.is_empty() {
                 return;
@@ -545,17 +915,16 @@ fn allow_pending_request(
 async fn main() -> Result<()> {
     // Parse command line arguments
     let cli = Cli::parse();
+    if cli.skill {
+        print!("{AGENT_SKILL}");
+        return Ok(());
+    }
+
     let control_port = cli
         .control_port
         .or_else(|| cli.port.checked_add(1))
         .ok_or_else(|| anyhow::anyhow!("--control-port is required when --port is 65535"))?;
-
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let target = cli.target.unwrap_or_default();
 
     // Create message channel for proxy communication
     let (message_sender, message_receiver) = mpsc::unbounded_channel();
@@ -565,7 +934,6 @@ async fn main() -> Result<()> {
 
     // Create the local agent control plane.
     let (control_sender, control_receiver) = mpsc::unbounded_channel();
-    let control_handle = tokio::spawn(control::serve(control_port, control_sender));
 
     // Create shared state for pause/intercept
     let shared_app_mode = Arc::new(Mutex::new(AppMode::Normal));
@@ -574,31 +942,41 @@ async fn main() -> Result<()> {
         pending_sender,
     };
 
+    // Bind both ports before entering the TUI. A second debugger must not send through
+    // or expose the control plane of an older process that owns the same ports.
+    let initial_server = ProxyServer::new(cli.port, target.clone(), message_sender.clone())
+        .with_state(proxy_state.clone());
+    let initial_proxy_server = initial_server.bind()?;
+    let control_server = control::bind(control_port, control_sender).map_err(anyhow::Error::msg)?;
+
+    let mut history = HistoryStore::open_default()?;
+    let session = history.create_session(None, &target)?;
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let initial_proxy_handle = tokio::spawn(initial_proxy_server);
+    let control_handle = tokio::spawn(async move {
+        control_server.await;
+        Ok(())
+    });
+
     // Create app with receiver, using CLI arguments
     let mut app = App::new_with_receiver(message_receiver);
 
     // Override default config with CLI arguments
     app.proxy_config.listen_port = cli.port;
     app.control_port = control_port;
-    if let Some(target) = cli.target {
-        app.proxy_config.target_url = target;
-    }
-
-    // Start the proxy server immediately since app.is_running is true by default
-    let initial_server = ProxyServer::new(
-        app.proxy_config.listen_port,
-        app.proxy_config.target_url.clone(),
-        message_sender.clone(),
-    )
-    .with_state(proxy_state.clone());
-    let initial_proxy_handle = tokio::spawn(async move {
-        if let Err(_e) = initial_server.start().await {
-            // Silent error handling
-        }
-    });
+    app.proxy_config.target_url = target;
+    app.activate_session(session, Vec::new(), Vec::new());
 
     let (request_result_sender, request_result_receiver) = mpsc::unbounded_channel();
     let runtime = Runtime {
+        history,
         message_sender,
         shared_app_mode,
         pending_receiver,
@@ -637,7 +1015,23 @@ async fn run_app(
 
     loop {
         // Check for new messages from proxy
-        let received_messages = app.check_for_new_messages();
+        let messages = app.take_new_messages();
+        let received_messages = !messages.is_empty();
+        for message in messages {
+            let active_session_id = app
+                .session
+                .as_ref()
+                .map(|session| session.id.as_str())
+                .unwrap_or_default();
+            match runtime.history.record_message(active_session_id, &message) {
+                Ok(session_id) if session_id == active_session_id => app.add_message(message),
+                Ok(_) => {}
+                Err(error) => {
+                    app.notice = Some(format!("Error: save history: {error}"));
+                    app.add_message(message);
+                }
+            }
+        }
 
         // Sync app mode with shared state
         if let Ok(mut shared_mode) = runtime.shared_app_mode.try_lock() {
@@ -670,10 +1064,14 @@ async fn run_app(
             handle_control_command(
                 &mut app,
                 command,
-                &mut runtime.proxy_server,
-                &runtime.message_sender,
-                &runtime.proxy_state,
-                &runtime.request_result_sender,
+                ControlContext {
+                    terminal_area: terminal.size()?,
+                    proxy_server: &mut runtime.proxy_server,
+                    message_sender: &runtime.message_sender,
+                    proxy_state: &runtime.proxy_state,
+                    request_result_sender: &runtime.request_result_sender,
+                    history: &mut runtime.history,
+                },
             )
             .await;
             received_control_command = true;
@@ -693,6 +1091,58 @@ async fn run_app(
         if event::poll(std::time::Duration::from_millis(50))? {
             should_draw = true;
             let input_event = event::read()?;
+
+            if matches!(
+                &input_event,
+                Event::Key(key)
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+            ) {
+                stop_proxy(&mut runtime.proxy_server).await;
+                return Ok(());
+            }
+
+            if app.editor.is_none()
+                && app.input_mode == app::InputMode::Normal
+                && matches!(
+                    &input_event,
+                    Event::Key(key)
+                        if key.code == KeyCode::Char('b')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                )
+            {
+                if app.overlay == Overlay::Prefix {
+                    app.close_overlay();
+                } else {
+                    app.show_prefix();
+                }
+                continue;
+            }
+
+            if app.overlay != Overlay::None {
+                match input_event {
+                    Event::Key(key) => {
+                        if handle_overlay_key(terminal, &mut app, &mut runtime, key).await? {
+                            return Ok(());
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        handle_mouse_event(
+                            terminal,
+                            &mut app,
+                            mouse,
+                            &mut runtime.proxy_server,
+                            &runtime.message_sender,
+                            &runtime.proxy_state,
+                            &mut runtime.history,
+                        )
+                        .await?;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             if app.editor.is_some() {
                 let action = match input_event {
                     Event::Key(key) => app
@@ -737,6 +1187,7 @@ async fn run_app(
                     &mut runtime.proxy_server,
                     &runtime.message_sender,
                     &runtime.proxy_state,
+                    &mut runtime.history,
                 )
                 .await?;
                 continue;
@@ -763,10 +1214,52 @@ async fn run_app(
                         }
                         continue;
                     }
+                    app::InputMode::AnnotatingSelection => {
+                        match key.code {
+                            KeyCode::Enter => {
+                                let message = app.input_buffer.clone();
+                                match annotate_visual_selection(
+                                    &mut app,
+                                    &runtime.history,
+                                    terminal.size()?,
+                                    &message,
+                                ) {
+                                    Ok(()) => {
+                                        app.cancel_editing();
+                                        app.notice = Some("Annotation added".to_string());
+                                    }
+                                    Err(error) => {
+                                        app.notice = Some(format!("Error: {}", error.message));
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => app.cancel_editing(),
+                            KeyCode::Backspace => app.handle_backspace(),
+                            KeyCode::Char(c) => app.handle_input_char(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
                     app::InputMode::EditingTarget => {
                         match key.code {
                             KeyCode::Enter => {
+                                let target = app.input_buffer.trim().to_string();
+                                let session_id = active_session_id(&app).map(str::to_string);
+                                if !target.is_empty() {
+                                    if let Some(session_id) = session_id {
+                                        if let Err(error) =
+                                            runtime.history.update_target(&session_id, &target)
+                                        {
+                                            app.notice =
+                                                Some(format!("Error: save target: {error}"));
+                                            continue;
+                                        }
+                                    }
+                                }
                                 app.confirm_target_edit();
+                                if let Some(session) = &mut app.session {
+                                    session.target = app.proxy_config.target_url.clone();
+                                }
                                 // If proxy is running, restart it with new target
                                 if app.is_running {
                                     restart_proxy(
@@ -792,6 +1285,64 @@ async fn run_app(
                         }
                         continue;
                     }
+                    app::InputMode::NamingSession => {
+                        match key.code {
+                            KeyCode::Enter => {
+                                let name = app.input_buffer.trim().to_string();
+                                let name = (!name.is_empty()).then_some(name);
+                                match create_session(
+                                    &mut app,
+                                    &mut runtime.history,
+                                    name.as_deref(),
+                                ) {
+                                    Ok(()) => {
+                                        app.cancel_editing();
+                                        app.notice = Some("Session created".to_string());
+                                    }
+                                    Err(error) => {
+                                        app.notice = Some(format!("Error: {}", error.message));
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => app.cancel_editing(),
+                            KeyCode::Backspace => app.handle_backspace(),
+                            KeyCode::Char(c) => app.handle_input_char(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    app::InputMode::RenamingSession => {
+                        match key.code {
+                            KeyCode::Enter => {
+                                let session_id = active_session_id(&app).map(str::to_string);
+                                let name = app.input_buffer.clone();
+                                match session_id {
+                                    Some(session_id) => match rename_session(
+                                        &mut app,
+                                        &runtime.history,
+                                        &session_id,
+                                        &name,
+                                    ) {
+                                        Ok(()) => {
+                                            app.cancel_editing();
+                                            app.notice = Some("Session renamed".to_string());
+                                        }
+                                        Err(error) => {
+                                            app.notice = Some(format!("Error: {}", error.message));
+                                        }
+                                    },
+                                    None => {
+                                        app.notice = Some("Error: No active session".to_string())
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => app.cancel_editing(),
+                            KeyCode::Backspace => app.handle_backspace(),
+                            KeyCode::Char(c) => app.handle_input_char(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
 
                     app::InputMode::Normal => {
                         // Continue to normal key handling below
@@ -800,34 +1351,20 @@ async fn run_app(
 
                 // Normal mode key handling
                 match key.code {
+                    KeyCode::Esc => {
+                        app.clear_line_selection();
+                    }
                     KeyCode::Enter => {
                         if app.app_mode == AppMode::Normal {
                             copy_focused_panel(terminal, &app)?;
                         }
-                    }
-                    KeyCode::Char('q') => {
-                        // Clean shutdown
-                        if let Some(handle) = runtime.proxy_server.take() {
-                            handle.abort();
-                            // Give it a moment to clean up
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        return Ok(());
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        // Clean shutdown
-                        if let Some(handle) = runtime.proxy_server.take() {
-                            handle.abort();
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        return Ok(());
                     }
                     KeyCode::Up => match app.app_mode {
                         app::AppMode::Normal => {
                             if app.is_message_list_focused() {
                                 app.select_previous();
                             } else {
-                                scroll_focused_details(&mut app, -1, terminal.size()?);
+                                move_focused_detail_cursor(&mut app, -1, terminal.size()?);
                             }
                         }
                         app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -838,14 +1375,8 @@ async fn run_app(
                         app::AppMode::Normal => {
                             if app.is_message_list_focused() {
                                 app.select_next();
-                            } else if app.is_request_section_focused() {
-                                if app.get_selected_exchange().is_some() {
-                                    app.request_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
-                                }
-                            } else if app.is_response_section_focused()
-                                && app.get_selected_exchange().is_some()
-                            {
-                                app.response_details_scroll += 1; // Allow unlimited scrolling, UI will clamp
+                            } else {
+                                move_focused_detail_cursor(&mut app, 1, terminal.size()?);
                             }
                         }
                         app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -920,14 +1451,8 @@ async fn run_app(
                         app::AppMode::Normal => {
                             if app.is_message_list_focused() {
                                 app.select_previous();
-                            } else if app.is_request_section_focused() {
-                                if app.request_details_scroll > 0 {
-                                    app.request_details_scroll -= 1;
-                                }
-                            } else if app.is_response_section_focused()
-                                && app.response_details_scroll > 0
-                            {
-                                app.response_details_scroll -= 1;
+                            } else {
+                                move_focused_detail_cursor(&mut app, -1, terminal.size()?);
                             }
                         }
                         app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -940,7 +1465,7 @@ async fn run_app(
                                 if app.is_message_list_focused() {
                                     app.select_next();
                                 } else {
-                                    scroll_focused_details(&mut app, 1, terminal.size()?);
+                                    move_focused_detail_cursor(&mut app, 1, terminal.size()?);
                                 }
                             }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -950,7 +1475,7 @@ async fn run_app(
                     }
                     KeyCode::Char('u') => match app.app_mode {
                         app::AppMode::Normal => {
-                            scroll_focused_details(&mut app, -10, terminal.size()?);
+                            move_focused_detail_cursor(&mut app, -10, terminal.size()?);
                         }
                         app::AppMode::Paused | app::AppMode::Intercepting => {
                             app.page_up_intercept_details()
@@ -958,7 +1483,7 @@ async fn run_app(
                     },
                     KeyCode::Char('d') => match app.app_mode {
                         app::AppMode::Normal => {
-                            scroll_focused_details(&mut app, 10, terminal.size()?);
+                            move_focused_detail_cursor(&mut app, 10, terminal.size()?);
                         }
                         app::AppMode::Paused | app::AppMode::Intercepting => {
                             app.page_down_intercept_details();
@@ -967,7 +1492,7 @@ async fn run_app(
                     KeyCode::Char('G') => {
                         match app.app_mode {
                             app::AppMode::Normal => {
-                                scroll_focused_details(&mut app, i64::MAX, terminal.size()?);
+                                move_focused_detail_cursor(&mut app, i64::MAX, terminal.size()?);
                             }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
                                 // For intercept mode, use a large number as max_lines
@@ -977,17 +1502,17 @@ async fn run_app(
                     }
                     KeyCode::Char('g') => match app.app_mode {
                         app::AppMode::Normal => {
-                            scroll_focused_details(&mut app, i64::MIN, terminal.size()?);
+                            move_focused_detail_cursor(&mut app, i64::MIN, terminal.size()?);
                         }
                         app::AppMode::Paused | app::AppMode::Intercepting => {
                             app.goto_top_intercept_details()
                         }
                     },
-                    KeyCode::Char('t') => {
-                        app.start_editing_target();
-                    }
                     KeyCode::Char('/') => {
                         app.start_filtering_requests();
+                    }
+                    KeyCode::Char('v') if app.app_mode == AppMode::Normal => {
+                        toggle_visual_selection(&mut app);
                     }
                     KeyCode::Char('n') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                         match app.app_mode {
@@ -995,7 +1520,7 @@ async fn run_app(
                                 if app.is_message_list_focused() {
                                     app.select_next();
                                 } else {
-                                    scroll_focused_details(&mut app, 1, terminal.size()?);
+                                    move_focused_detail_cursor(&mut app, 1, terminal.size()?);
                                 }
                             }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -1009,7 +1534,7 @@ async fn run_app(
                                 if app.is_message_list_focused() {
                                     app.select_previous();
                                 } else {
-                                    scroll_focused_details(&mut app, -1, terminal.size()?);
+                                    move_focused_detail_cursor(&mut app, -1, terminal.size()?);
                                 }
                             }
                             app::AppMode::Paused | app::AppMode::Intercepting => {
@@ -1017,31 +1542,15 @@ async fn run_app(
                             }
                         }
                     }
-                    KeyCode::Char('s') => {
-                        let desired_running = !app.is_running;
-                        if set_proxy_running(
-                            &mut app,
-                            desired_running,
-                            &mut runtime.proxy_server,
-                            &runtime.message_sender,
-                            &runtime.proxy_state,
-                        )
-                        .await
-                        {
-                            terminal.clear()?;
-                            terminal.draw(|f| ui::draw(f, &app))?;
-                        }
-                    }
-                    // Pause/Intercept key bindings
-                    KeyCode::Char('p') => {
-                        app.toggle_pause_mode();
-                        terminal.clear()?;
-                    }
-                    KeyCode::Char('a') => {
+                    KeyCode::Char('a')
+                        if app.app_mode != AppMode::Normal && !app.pending_requests.is_empty() =>
+                    {
                         // Allow selected pending request
                         app.allow_selected_request();
                     }
-                    KeyCode::Char('e') => {
+                    KeyCode::Char('e')
+                        if app.app_mode != AppMode::Normal && !app.pending_requests.is_empty() =>
+                    {
                         if let Some(content) = app.get_pending_request_json() {
                             app.open_editor(EditorTarget::PendingRequest, content);
                         }
@@ -1083,30 +1592,22 @@ async fn run_app(
                             }
                         }
                     }
-                    KeyCode::Char('c') => {
-                        if (app.app_mode == AppMode::Paused
-                            || app.app_mode == AppMode::Intercepting)
-                            && !app.pending_requests.is_empty()
-                        {
-                            if let Some(content) = app.get_pending_response_template() {
-                                app.open_editor(EditorTarget::PendingResponse, content);
-                            }
-                        } else {
-                            let content = r#"{
-  "jsonrpc": "2.0",
-  "method": "your_method",
-  "params": [],
-  "id": 1
-}"#
-                            .to_string();
-                            app.open_editor(EditorTarget::NewRequest, content);
+                    KeyCode::Char('c')
+                        if app.app_mode != AppMode::Normal && !app.pending_requests.is_empty() =>
+                    {
+                        if let Some(content) = app.get_pending_response_template() {
+                            app.open_editor(EditorTarget::PendingResponse, content);
                         }
                     }
-                    KeyCode::Char('b') => {
+                    KeyCode::Char('b')
+                        if app.app_mode != AppMode::Normal && !app.pending_requests.is_empty() =>
+                    {
                         // Block selected pending request
                         app.block_selected_request();
                     }
-                    KeyCode::Char('r') => {
+                    KeyCode::Char('r')
+                        if app.app_mode != AppMode::Normal && !app.pending_requests.is_empty() =>
+                    {
                         // Resume all pending requests
                         app.resume_all_requests();
                         terminal.clear()?;
@@ -1171,6 +1672,144 @@ async fn run_app(
     }
 }
 
+async fn handle_overlay_key(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    runtime: &mut Runtime,
+    key: KeyEvent,
+) -> Result<bool> {
+    match app.overlay {
+        Overlay::Prefix => match key.code {
+            _ if is_fullscreen_key(&key) => {
+                app.close_overlay();
+                app.set_panel_fullscreen(!app.panel_fullscreen);
+            }
+            KeyCode::Char('?') => app.show_help(),
+            KeyCode::Char('a') if app.visual_selection_active && app.line_selection.is_some() => {
+                app.close_overlay();
+                app.start_annotating_selection();
+            }
+            KeyCode::Char('d') => {
+                app.close_overlay();
+                let annotation_id = app
+                    .annotation_to_delete()
+                    .map(|annotation| annotation.id.clone());
+                match annotation_id {
+                    Some(id) => match remove_annotation(app, &runtime.history, &id) {
+                        Ok(()) => app.notice = Some("Annotation deleted".to_string()),
+                        Err(error) => app.notice = Some(format!("Error: {}", error.message)),
+                    },
+                    None => app.notice = Some("No annotation under cursor".to_string()),
+                }
+            }
+            KeyCode::Char('s') => match runtime.history.list_sessions(1000) {
+                Ok(sessions) => app.show_sessions(sessions),
+                Err(error) => {
+                    app.close_overlay();
+                    app.notice = Some(format!("Error: list sessions: {error}"));
+                }
+            },
+            KeyCode::Char('n') => {
+                app.close_overlay();
+                app.start_naming_session();
+            }
+            KeyCode::Char('R') => {
+                app.close_overlay();
+                app.start_renaming_session();
+            }
+            KeyCode::Char('c') => {
+                app.close_overlay();
+                open_new_request(app);
+            }
+            KeyCode::Char('p') => {
+                app.close_overlay();
+                app.toggle_pause_mode();
+                terminal.clear()?;
+            }
+            KeyCode::Char('t') => {
+                app.close_overlay();
+                app.start_editing_target();
+            }
+            KeyCode::Char('x') => {
+                app.close_overlay();
+                let desired_running = !app.is_running;
+                if set_proxy_running(
+                    app,
+                    desired_running,
+                    &mut runtime.proxy_server,
+                    &runtime.message_sender,
+                    &runtime.proxy_state,
+                )
+                .await
+                {
+                    terminal.clear()?;
+                }
+            }
+            KeyCode::Char('q') => {
+                stop_proxy(&mut runtime.proxy_server).await;
+                return Ok(true);
+            }
+            KeyCode::Esc => app.close_overlay(),
+            _ => app.close_overlay(),
+        },
+        Overlay::Help => app.close_overlay(),
+        Overlay::Sessions => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.select_previous_session(),
+            KeyCode::Down | KeyCode::Char('j') => app.select_next_session(),
+            KeyCode::Enter => {
+                let session_id = app
+                    .sessions
+                    .get(app.selected_session)
+                    .map(|session| session.id.clone());
+                if let Some(session_id) = session_id {
+                    match select_session(app, &runtime.history, &session_id) {
+                        Ok(target_changed) if target_changed && app.is_running => {
+                            restart_proxy(
+                                app,
+                                &mut runtime.proxy_server,
+                                &runtime.message_sender,
+                                &runtime.proxy_state,
+                            )
+                            .await;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            app.notice = Some(format!("Error: {}", error.message));
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.close_overlay(),
+            _ => {}
+        },
+        Overlay::None => {}
+    }
+
+    Ok(false)
+}
+
+fn is_fullscreen_key(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('z')
+}
+
+fn open_new_request(app: &mut App) {
+    let content = r#"{
+  "jsonrpc": "2.0",
+  "method": "your_method",
+  "params": [],
+  "id": 1
+}"#
+    .to_string();
+    app.open_editor(EditorTarget::NewRequest, content);
+}
+
+async fn stop_proxy(proxy_server: &mut Option<JoinHandle<()>>) {
+    if let Some(handle) = proxy_server.take() {
+        handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 fn register_change_waiter(
     app: &App,
     command: ControlCommand,
@@ -1225,8 +1864,44 @@ async fn handle_mouse_event(
     proxy_server: &mut Option<JoinHandle<()>>,
     message_sender: &mpsc::UnboundedSender<app::JsonRpcMessage>,
     proxy_state: &ProxyState,
+    history: &mut HistoryStore,
 ) -> Result<()> {
     let area = terminal.size()?;
+
+    if app.overlay != Overlay::None {
+        match mouse.kind {
+            MouseEventKind::ScrollUp if app.overlay == Overlay::Sessions => {
+                app.select_previous_session();
+            }
+            MouseEventKind::ScrollDown if app.overlay == Overlay::Sessions => {
+                app.select_next_session();
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                match ui::mouse_action(area, app, mouse.column, mouse.row) {
+                    Some(ui::MouseAction::SelectSession(index)) => {
+                        let session_id = app.sessions.get(index).map(|session| session.id.clone());
+                        if let Some(session_id) = session_id {
+                            match select_session(app, history, &session_id) {
+                                Ok(target_changed) if target_changed && app.is_running => {
+                                    restart_proxy(app, proxy_server, message_sender, proxy_state)
+                                        .await;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    app.notice = Some(format!("Error: {}", error.message));
+                                }
+                            }
+                        }
+                    }
+                    Some(ui::MouseAction::CloseOverlay) => app.close_overlay(),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     let hovered_focus = ui::panel_focus(area, app, mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Moved => {
@@ -1267,7 +1942,13 @@ async fn handle_mouse_event(
         }
         ui::MouseAction::SelectExchange(index) => {
             app.set_focus(app::Focus::MessageList);
+            let history_scroll = app.history_scroll_offset(ui::panel_visible_lines(
+                area,
+                app,
+                app::Focus::MessageList,
+            ));
             app.select_exchange(index);
+            app.history_scroll = Some(history_scroll);
         }
         ui::MouseAction::SelectPending(index) => {
             app.set_focus(app::Focus::MessageList);
@@ -1279,6 +1960,7 @@ async fn handle_mouse_event(
             app.set_focus(app::Focus::RequestSection);
             app.request_tab = tab;
             app.request_details_scroll = 0;
+            app.request_details_cursor_line = 1;
             app.clear_line_selection();
             app.mark_changed();
         }
@@ -1286,10 +1968,12 @@ async fn handle_mouse_event(
             app.set_focus(app::Focus::ResponseSection);
             app.response_tab = tab;
             app.response_details_scroll = 0;
+            app.response_details_cursor_line = 1;
             app.clear_line_selection();
             app.mark_changed();
         }
         ui::MouseAction::SelectLine { panel, line } => {
+            app.finish_visual_selection();
             let extend = mouse.modifiers.contains(KeyModifiers::SHIFT);
             let (anchor, start_line, end_line) = app.line_selection_range(panel, line, extend);
             let Some(text) = ui::detail_line_text(app, panel, start_line, end_line) else {
@@ -1297,6 +1981,8 @@ async fn handle_mouse_event(
             };
             app.select_lines_from_anchor(panel, anchor, start_line, end_line, text);
         }
+        ui::MouseAction::SelectAnnotation { id } => app.focus_annotation(&id),
+        ui::MouseAction::SelectSession(_) | ui::MouseAction::CloseOverlay => {}
         ui::MouseAction::Focus(focus) => app.set_focus(focus),
     }
 
@@ -1307,58 +1993,151 @@ fn scroll_panel(app: &mut App, focus: app::Focus, down: bool, visible_lines: usi
     const LINES_PER_TICK: usize = 3;
 
     if focus == app::Focus::MessageList {
-        for _ in 0..LINES_PER_TICK {
-            match (app.app_mode, down) {
-                (AppMode::Normal, true) => app.select_next(),
-                (AppMode::Normal, false) => app.select_previous(),
-                (AppMode::Paused | AppMode::Intercepting, true) => app.select_next_pending(),
-                (AppMode::Paused | AppMode::Intercepting, false) => app.select_previous_pending(),
+        match app.app_mode {
+            AppMode::Normal => {
+                let lines = if down {
+                    LINES_PER_TICK as i64
+                } else {
+                    -(LINES_PER_TICK as i64)
+                };
+                app.scroll_history(lines, visible_lines);
+            }
+            AppMode::Paused | AppMode::Intercepting => {
+                for _ in 0..LINES_PER_TICK {
+                    if down {
+                        app.select_next_pending();
+                    } else {
+                        app.select_previous_pending();
+                    }
+                }
             }
         }
         return;
     }
 
     let max_scroll = match (app.app_mode, focus) {
-        (AppMode::Normal, app::Focus::RequestSection) => app
-            .get_request_details_content_lines()
-            .saturating_sub(visible_lines),
-        (AppMode::Normal, app::Focus::ResponseSection) => app
-            .get_response_details_content_lines()
-            .saturating_sub(visible_lines),
+        (AppMode::Normal, app::Focus::RequestSection) => ui::detail_max_source_scroll(
+            app,
+            focus,
+            app.get_request_details_content_lines(),
+            visible_lines,
+        ),
+        (AppMode::Normal, app::Focus::ResponseSection) => ui::detail_max_source_scroll(
+            app,
+            focus,
+            app.get_response_details_content_lines(),
+            visible_lines,
+        ),
         (AppMode::Paused | AppMode::Intercepting, app::Focus::RequestSection) => app
             .get_intercept_details_content_lines()
             .saturating_sub(visible_lines),
         _ => return,
     };
 
-    let scroll = match (app.app_mode, focus) {
-        (AppMode::Normal, app::Focus::RequestSection) => &mut app.request_details_scroll,
-        (AppMode::Normal, app::Focus::ResponseSection) => &mut app.response_details_scroll,
-        (AppMode::Paused | AppMode::Intercepting, app::Focus::RequestSection) => {
-            &mut app.intercept_details_scroll
+    let (previous_scroll, current_scroll) = {
+        let scroll = match (app.app_mode, focus) {
+            (AppMode::Normal, app::Focus::RequestSection) => &mut app.request_details_scroll,
+            (AppMode::Normal, app::Focus::ResponseSection) => &mut app.response_details_scroll,
+            (AppMode::Paused | AppMode::Intercepting, app::Focus::RequestSection) => {
+                &mut app.intercept_details_scroll
+            }
+            _ => return,
+        };
+        let previous_scroll = *scroll;
+        *scroll = if down {
+            scroll.saturating_add(LINES_PER_TICK).min(max_scroll)
+        } else {
+            scroll.saturating_sub(LINES_PER_TICK)
+        };
+        (previous_scroll, *scroll)
+    };
+    if previous_scroll != current_scroll {
+        let moved = current_scroll.abs_diff(previous_scroll);
+        match (app.app_mode, focus, down) {
+            (AppMode::Normal, app::Focus::RequestSection, true) => {
+                app.request_details_cursor_line = app
+                    .request_details_cursor_line
+                    .saturating_add(moved)
+                    .min(app.get_request_details_content_lines().max(1));
+            }
+            (AppMode::Normal, app::Focus::RequestSection, false) => {
+                app.request_details_cursor_line =
+                    app.request_details_cursor_line.saturating_sub(moved).max(1);
+            }
+            (AppMode::Normal, app::Focus::ResponseSection, true) => {
+                app.response_details_cursor_line = app
+                    .response_details_cursor_line
+                    .saturating_add(moved)
+                    .min(app.get_response_details_content_lines().max(1));
+            }
+            (AppMode::Normal, app::Focus::ResponseSection, false) => {
+                app.response_details_cursor_line = app
+                    .response_details_cursor_line
+                    .saturating_sub(moved)
+                    .max(1);
+            }
+            _ => {}
         }
-        _ => return,
-    };
-    let previous_scroll = *scroll;
-    *scroll = if down {
-        scroll.saturating_add(LINES_PER_TICK).min(max_scroll)
-    } else {
-        scroll.saturating_sub(LINES_PER_TICK)
-    };
-    if previous_scroll != *scroll {
+        extend_visual_selection(app, focus);
         app.mark_changed();
     }
 }
 
-fn scroll_focused_details(app: &mut App, lines: i64, area: ratatui::layout::Rect) {
-    let focus = app.focus;
-    let Some(total_lines) = ui::detail_line_count(app, focus) else {
+fn move_focused_detail_cursor(app: &mut App, lines: i64, area: ratatui::layout::Rect) {
+    let panel = app.focus;
+    let Some(total_lines) = ui::detail_line_count(app, panel) else {
         return;
     };
-    let visible_lines = ui::panel_visible_lines(area, app, focus);
-    let scroll_positions = total_lines.saturating_sub(visible_lines).saturating_add(1);
+    let visible_lines = ui::panel_visible_lines(area, app, panel);
+    app.move_detail_cursor(panel, lines, total_lines, visible_lines);
+    extend_visual_selection(app, panel);
+}
 
-    app.scroll_panel_lines(focus, lines, scroll_positions);
+fn extend_visual_selection(app: &mut App, panel: app::Focus) {
+    if !app.visual_selection_active {
+        return;
+    }
+    let Some(anchor_line) = app
+        .line_selection
+        .as_ref()
+        .filter(|selection| selection.panel == panel)
+        .map(|selection| selection.anchor_line)
+    else {
+        return;
+    };
+    let Some(cursor_line) = app.detail_cursor_line(panel) else {
+        return;
+    };
+    let start_line = anchor_line.min(cursor_line);
+    let end_line = anchor_line.max(cursor_line);
+    let Some(text) = ui::detail_line_text(app, panel, start_line, end_line) else {
+        return;
+    };
+
+    app.select_lines_from_anchor(panel, anchor_line, start_line, end_line, text);
+}
+
+fn toggle_visual_selection(app: &mut App) {
+    let panel = app.focus;
+    if !matches!(
+        panel,
+        app::Focus::RequestSection | app::Focus::ResponseSection
+    ) {
+        return;
+    }
+    if app.visual_selection_active {
+        app.clear_line_selection();
+        return;
+    }
+
+    let Some(cursor_line) = app.detail_cursor_line(panel) else {
+        return;
+    };
+    let Some(text) = ui::detail_line_text(app, panel, cursor_line, cursor_line) else {
+        return;
+    };
+    app.select_lines(panel, cursor_line, cursor_line, text);
+    app.start_visual_selection();
 }
 
 async fn restart_proxy(
@@ -1426,6 +2205,12 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn fullscreen_prefix_key_is_z() {
+        assert!(is_fullscreen_key(&key(KeyCode::Char('z'))));
+        assert!(!is_fullscreen_key(&key(KeyCode::Esc)));
     }
 
     #[test]
@@ -1532,7 +2317,6 @@ mod tests {
             transport: app::TransportType::Http,
             headers: None,
         });
-
         scroll_panel(&mut app, app::Focus::RequestSection, true, 2);
         assert_eq!(app.request_details_scroll, 3);
 
@@ -1541,7 +2325,31 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_scroll_stops_at_the_visible_bottom() {
+    fn mouse_wheel_scrolls_request_list_without_changing_selection() {
+        let mut app = App::new();
+        for id in 0..6 {
+            app.add_message(app::JsonRpcMessage {
+                id: Some(serde_json::json!(id)),
+                method: Some(format!("request_{id}")),
+                params: Some(serde_json::json!([])),
+                result: None,
+                error: None,
+                timestamp: std::time::SystemTime::now(),
+                direction: app::MessageDirection::Request,
+                transport: app::TransportType::Http,
+                headers: None,
+            });
+        }
+        app.select_exchange(1);
+
+        scroll_panel(&mut app, app::Focus::MessageList, true, 2);
+
+        assert_eq!(app.selected_exchange, 1);
+        assert_eq!(app.history_scroll, Some(3));
+    }
+
+    #[test]
+    fn keyboard_cursor_stops_at_the_bottom_and_keeps_it_visible() {
         let mut app = App::new();
         app.add_message(app::JsonRpcMessage {
             id: Some(serde_json::json!(1)),
@@ -1561,11 +2369,154 @@ mod tests {
             .unwrap()
             .saturating_sub(visible_lines);
 
-        scroll_focused_details(&mut app, i64::MAX, area);
+        let total_lines = ui::detail_line_count(&app, app.focus).unwrap();
+        move_focused_detail_cursor(&mut app, i64::MAX, area);
+        assert_eq!(app.request_details_cursor_line, total_lines);
         assert_eq!(app.request_details_scroll, bottom);
 
-        scroll_focused_details(&mut app, -1, area);
-        assert_eq!(app.request_details_scroll, bottom.saturating_sub(1));
+        move_focused_detail_cursor(&mut app, -1, area);
+        assert_eq!(app.request_details_cursor_line, total_lines - 1);
+        assert_eq!(app.request_details_scroll, bottom);
+    }
+
+    #[test]
+    fn visual_selection_extends_from_its_keyboard_anchor() {
+        let mut app = App::new();
+        app.add_message(app::JsonRpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: Some("eth_call".to_string()),
+            params: Some(serde_json::json!([])),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: app::MessageDirection::Request,
+            transport: app::TransportType::Http,
+            headers: None,
+        });
+        app.focus = app::Focus::RequestSection;
+        let area = ratatui::layout::Rect::new(0, 0, 120, 24);
+
+        toggle_visual_selection(&mut app);
+        move_focused_detail_cursor(&mut app, 2, area);
+
+        let selection = app.line_selection.as_ref().unwrap();
+        assert_eq!(app.request_details_cursor_line, 3);
+        assert_eq!(selection.anchor_line, 1);
+        assert_eq!((selection.start_line, selection.end_line), (1, 3));
+        assert_eq!(selection.text.len(), 3);
+
+        toggle_visual_selection(&mut app);
+        assert!(app.line_selection.is_none());
+    }
+
+    #[test]
+    fn visual_selection_annotation_uses_the_persistent_annotation_path() {
+        let mut history = HistoryStore::in_memory().unwrap();
+        let mut app = App::new();
+        app.session = Some(
+            history
+                .create_session(Some("test"), "http://localhost:8090")
+                .unwrap(),
+        );
+        app.add_message(app::JsonRpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: Some("eth_call".to_string()),
+            params: Some(serde_json::json!([])),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: app::MessageDirection::Request,
+            transport: app::TransportType::Http,
+            headers: None,
+        });
+        app.focus = app::Focus::RequestSection;
+        let text = ui::detail_line_text(&app, app.focus, 2, 2).unwrap();
+        app.select_lines(app::Focus::RequestSection, 2, 2, text);
+        app.start_visual_selection();
+
+        annotate_visual_selection(
+            &mut app,
+            &history,
+            ratatui::layout::Rect::new(0, 0, 120, 24),
+            "Check this method",
+        )
+        .unwrap();
+
+        assert_eq!(app.annotations[0].message, "Check this method");
+        assert!(!app.visual_selection_active);
+        let session_id = app.session.as_ref().unwrap().id.as_str();
+        assert_eq!(history.annotations(session_id).unwrap(), app.annotations);
+    }
+
+    #[test]
+    fn scrolling_does_not_change_a_fixed_line_reference() {
+        let mut app = App::new();
+        app.add_message(app::JsonRpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: Some("eth_call".to_string()),
+            params: Some(serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8])),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: app::MessageDirection::Request,
+            transport: app::TransportType::Http,
+            headers: None,
+        });
+        let text = ui::detail_line_text(&app, app::Focus::RequestSection, 2, 3).unwrap();
+        app.reveal_lines(app::Focus::RequestSection, 2, 3, text.clone());
+        app.add_annotation(LineAnnotation {
+            id: "annotation-1".to_string(),
+            exchange_index: 0,
+            panel: app::Focus::RequestSection,
+            tab: app::DetailTab::Body,
+            start_line: 2,
+            end_line: 3,
+            message: "Inspect this range".to_string(),
+            text,
+        });
+
+        scroll_panel(&mut app, app::Focus::RequestSection, true, 2);
+
+        let selection = app.line_selection.as_ref().unwrap();
+        assert!(!app.visual_selection_active);
+        assert_eq!((selection.start_line, selection.end_line), (2, 3));
+        assert_eq!(
+            app.annotations
+                .first()
+                .map(|annotation| (annotation.start_line, annotation.end_line)),
+            Some((2, 3))
+        );
+    }
+
+    #[test]
+    fn agent_line_reference_is_centered_in_the_panel() {
+        let mut app = App::new();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        let visible_lines = ui::panel_visible_lines(area, &app, app::Focus::ResponseSection);
+        app.add_annotation(LineAnnotation {
+            id: "annotation-1".to_string(),
+            exchange_index: 0,
+            panel: app::Focus::ResponseSection,
+            tab: app::DetailTab::Body,
+            start_line: 17,
+            end_line: 21,
+            message: "Inspect this range".to_string(),
+            text: Vec::new(),
+        });
+
+        center_detail_range(
+            &mut app,
+            area,
+            app::Focus::ResponseSection,
+            17,
+            21,
+            50,
+            Some("annotation-1"),
+        );
+
+        let display_scroll = app.response_details_scroll;
+        let viewport_center = display_scroll + visible_lines.saturating_sub(1) / 2;
+        assert_eq!(viewport_center, 18);
     }
 
     #[tokio::test]
@@ -1625,6 +2576,17 @@ mod tests {
             transport: app::TransportType::Http,
             headers: None,
         });
+        app.add_message(app::JsonRpcMessage {
+            id: Some(serde_json::json!(2)),
+            method: Some("net_version".to_string()),
+            params: Some(serde_json::json!([])),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: app::MessageDirection::Request,
+            transport: app::TransportType::Http,
+            headers: None,
+        });
         let (message_sender, _) = mpsc::unbounded_channel();
         let (pending_sender, _) = mpsc::unbounded_channel();
         let proxy_state = ProxyState {
@@ -1634,6 +2596,13 @@ mod tests {
         let (notice_sender, _) = mpsc::unbounded_channel();
         let (reply, result) = tokio::sync::oneshot::channel();
         let mut proxy_server = None;
+        let mut history = HistoryStore::in_memory().unwrap();
+        app.session = Some(
+            history
+                .create_session(Some("test"), "http://localhost:8090")
+                .unwrap(),
+        );
+        let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
 
         handle_control_command(
             &mut app,
@@ -1643,10 +2612,14 @@ mod tests {
                 },
                 reply,
             },
-            &mut proxy_server,
-            &message_sender,
-            &proxy_state,
-            &notice_sender,
+            ControlContext {
+                terminal_area,
+                proxy_server: &mut proxy_server,
+                message_sender: &message_sender,
+                proxy_state: &proxy_state,
+                request_result_sender: &notice_sender,
+                history: &mut history,
+            },
         )
         .await;
 
@@ -1664,15 +2637,106 @@ mod tests {
                 },
                 reply,
             },
-            &mut proxy_server,
-            &message_sender,
-            &proxy_state,
-            &notice_sender,
+            ControlContext {
+                terminal_area,
+                proxy_server: &mut proxy_server,
+                message_sender: &message_sender,
+                proxy_state: &proxy_state,
+                request_result_sender: &notice_sender,
+                history: &mut history,
+            },
         )
         .await;
 
         let state = result.await.unwrap().unwrap();
         assert_eq!(state["lineSelection"]["text"], "Method: eth_call");
-        assert_eq!(app.request_details_scroll, 1);
+        assert_eq!(app.request_details_scroll, 0);
+        let viewport = control::state(&app);
+
+        let (reply, result) = tokio::sync::oneshot::channel();
+        handle_control_command(
+            &mut app,
+            ControlCommand {
+                action: ControlAction::AnnotateLines {
+                    focus: app::Focus::RequestSection,
+                    exchange_index: Some(1),
+                    tab: Some(app::DetailTab::Body),
+                    start_line: 2,
+                    end_line: 2,
+                    message: "Inspect this method".to_string(),
+                },
+                reply,
+            },
+            ControlContext {
+                terminal_area,
+                proxy_server: &mut proxy_server,
+                message_sender: &message_sender,
+                proxy_state: &proxy_state,
+                request_result_sender: &notice_sender,
+                history: &mut history,
+            },
+        )
+        .await;
+
+        let result = result.await.unwrap().unwrap();
+        let annotation = &result["annotation"];
+        let state = &result["state"];
+        assert_eq!(annotation["message"], "Inspect this method");
+        assert_eq!(annotation["text"], "Method: net_version");
+        assert_eq!(annotation["exchangeIndex"], 1);
+        assert_eq!(state["selectedExchange"], viewport["selectedExchange"]);
+        assert_eq!(state["focus"], viewport["focus"]);
+        assert_eq!(state["scroll"], viewport["scroll"]);
+        assert_eq!(state["tabs"], viewport["tabs"]);
+        assert_eq!(state["lineSelection"], viewport["lineSelection"]);
+        let annotation_id = annotation["id"].as_str().unwrap().to_string();
+
+        let session_id = app.session.as_ref().unwrap().id.clone();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        handle_control_command(
+            &mut app,
+            ControlCommand {
+                action: ControlAction::RenameSession {
+                    id: session_id,
+                    name: "Renamed test".to_string(),
+                },
+                reply,
+            },
+            ControlContext {
+                terminal_area,
+                proxy_server: &mut proxy_server,
+                message_sender: &message_sender,
+                proxy_state: &proxy_state,
+                request_result_sender: &notice_sender,
+                history: &mut history,
+            },
+        )
+        .await;
+        assert_eq!(
+            result.await.unwrap().unwrap()["session"]["name"],
+            "Renamed test"
+        );
+
+        let (reply, result) = tokio::sync::oneshot::channel();
+        handle_control_command(
+            &mut app,
+            ControlCommand {
+                action: ControlAction::RemoveAnnotation { id: annotation_id },
+                reply,
+            },
+            ControlContext {
+                terminal_area,
+                proxy_server: &mut proxy_server,
+                message_sender: &message_sender,
+                proxy_state: &proxy_state,
+                request_result_sender: &notice_sender,
+                history: &mut history,
+            },
+        )
+        .await;
+        assert!(result.await.unwrap().unwrap()["annotations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 }

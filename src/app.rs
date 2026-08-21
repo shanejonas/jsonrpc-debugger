@@ -1,4 +1,3 @@
-use ratatui::widgets::TableState;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
@@ -44,6 +43,9 @@ pub enum InputMode {
     Normal,
     EditingTarget,
     FilteringRequests,
+    AnnotatingSelection,
+    NamingSession,
+    RenamingSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,12 +56,49 @@ pub enum Focus {
     StatusHeader,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailTab {
+    Headers,
+    Body,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    Prefix,
+    Help,
+    Sessions,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub id: String,
+    pub name: String,
+    pub target: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub exchange_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineSelection {
     pub panel: Focus,
     pub anchor_line: usize,
     pub start_line: usize,
     pub end_line: usize,
+    pub text: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineAnnotation {
+    pub id: String,
+    pub exchange_index: usize,
+    pub panel: Focus,
+    pub tab: DetailTab,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub message: String,
     pub text: Vec<String>,
 }
 
@@ -676,10 +715,12 @@ pub struct App {
     pub exchanges: Vec<JsonRpcExchange>,
     pub selected_exchange: usize,
     pub filter_text: String,
-    pub table_state: TableState,
+    pub history_scroll: Option<usize>,
     pub details_scroll: usize,
     pub request_details_scroll: usize,
     pub response_details_scroll: usize,
+    pub request_details_cursor_line: usize,
+    pub response_details_cursor_line: usize,
     pub details_tab: usize,
     pub request_details_tab: usize,
     pub response_details_tab: usize,
@@ -697,9 +738,17 @@ pub struct App {
     pub request_tab: usize,                    // 0 = Headers, 1 = Body
     pub response_tab: usize,                   // 0 = Headers, 1 = Body
     pub line_selection: Option<LineSelection>,
+    pub visual_selection_active: bool,
+    pub annotations: Vec<LineAnnotation>,
+    pub active_annotation_id: Option<String>,
     pub editor: Option<TextEditor>,
     pub notice: Option<String>,
     pub control_port: u16,
+    pub overlay: Overlay,
+    pub panel_fullscreen: bool,
+    pub session: Option<SessionSummary>,
+    pub sessions: Vec<SessionSummary>,
+    pub selected_session: usize,
     revision: u64,
 }
 
@@ -738,6 +787,14 @@ fn display_id(id: Option<&serde_json::Value>) -> String {
         Some(value) => value.to_string(),
         None => "null".to_string(),
     }
+}
+
+pub fn request_matches_filter(
+    method: Option<&str>,
+    id: Option<&serde_json::Value>,
+    filter: &str,
+) -> bool {
+    filter.is_empty() || method.unwrap_or("").contains(filter) || display_id(id).contains(filter)
 }
 
 fn exchange_duration(exchange: &JsonRpcExchange) -> String {
@@ -837,17 +894,16 @@ impl Default for App {
 #[allow(dead_code)]
 impl App {
     pub fn new() -> Self {
-        let mut table_state = TableState::default();
-        table_state.select(Some(0));
-
         Self {
             exchanges: Vec::new(),
             selected_exchange: 0,
             filter_text: String::new(),
-            table_state,
+            history_scroll: None,
             details_scroll: 0,
             request_details_scroll: 0,
             response_details_scroll: 0,
+            request_details_cursor_line: 1,
+            response_details_cursor_line: 1,
             details_tab: 0,
             request_details_tab: 0,
             response_details_tab: 0,
@@ -869,9 +925,17 @@ impl App {
             request_tab: 1,  // Body selected by default
             response_tab: 1, // Body selected by default
             line_selection: None,
+            visual_selection_active: false,
+            annotations: Vec::new(),
+            active_annotation_id: None,
             editor: None,
             notice: None,
             control_port: 8081,
+            overlay: Overlay::None,
+            panel_fullscreen: false,
+            session: None,
+            sessions: Vec::new(),
+            selected_session: 0,
             revision: 0,
         }
     }
@@ -883,21 +947,94 @@ impl App {
     }
 
     pub fn check_for_new_messages(&mut self) -> bool {
-        let Some(receiver) = &mut self.message_receiver else {
-            return false;
-        };
-
-        let mut new_messages = Vec::new();
-        while let Ok(message) = receiver.try_recv() {
-            new_messages.push(message);
-        }
-
+        let new_messages = self.take_new_messages();
         let received_messages = !new_messages.is_empty();
         for message in new_messages {
             self.add_message(message);
         }
 
         received_messages
+    }
+
+    pub fn take_new_messages(&mut self) -> Vec<JsonRpcMessage> {
+        let Some(receiver) = &mut self.message_receiver else {
+            return Vec::new();
+        };
+
+        let mut messages = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            messages.push(message);
+        }
+
+        messages
+    }
+
+    pub fn activate_session(
+        &mut self,
+        session: SessionSummary,
+        exchanges: Vec<JsonRpcExchange>,
+        annotations: Vec<LineAnnotation>,
+    ) {
+        self.exchanges = exchanges;
+        self.selected_exchange = self.exchanges.len().saturating_sub(1);
+        self.history_scroll = None;
+        self.session = Some(session);
+        self.overlay = Overlay::None;
+        self.line_selection = None;
+        self.visual_selection_active = false;
+        self.annotations = annotations;
+        self.active_annotation_id = None;
+        self.reset_details_scroll();
+        self.request_details_scroll = 0;
+        self.response_details_scroll = 0;
+        self.reset_detail_cursors();
+        self.mark_changed();
+    }
+
+    pub fn show_prefix(&mut self) {
+        self.overlay = Overlay::Prefix;
+        self.mark_changed();
+    }
+
+    pub fn show_help(&mut self) {
+        self.overlay = Overlay::Help;
+        self.mark_changed();
+    }
+
+    pub fn show_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        self.selected_session = self
+            .session
+            .as_ref()
+            .and_then(|active| sessions.iter().position(|session| session.id == active.id))
+            .unwrap_or(0);
+        self.sessions = sessions;
+        self.overlay = Overlay::Sessions;
+        self.mark_changed();
+    }
+
+    pub fn close_overlay(&mut self) {
+        if self.overlay == Overlay::None {
+            return;
+        }
+        self.overlay = Overlay::None;
+        self.mark_changed();
+    }
+
+    pub fn select_next_session(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.selected_session = (self.selected_session + 1).min(self.sessions.len() - 1);
+        self.mark_changed();
+    }
+
+    pub fn select_previous_session(&mut self) {
+        let selected = self.selected_session.saturating_sub(1);
+        if selected == self.selected_session {
+            return;
+        }
+        self.selected_session = selected;
+        self.mark_changed();
     }
 
     pub fn add_message(&mut self, mut message: JsonRpcMessage) {
@@ -951,6 +1088,9 @@ impl App {
                 }
             }
         }
+        if let Some(session) = &mut self.session {
+            session.exchange_count = self.exchanges.len();
+        }
         self.mark_changed();
     }
 
@@ -963,15 +1103,44 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, exchange)| {
-                self.filter_text.is_empty()
-                    || exchange
-                        .method
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains(&self.filter_text)
+                request_matches_filter(
+                    exchange.method.as_deref(),
+                    exchange.id.as_ref(),
+                    &self.filter_text,
+                )
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    pub fn history_scroll_offset(&self, visible_rows: usize) -> usize {
+        let indices = self.filtered_exchange_indices();
+        let selected = indices
+            .iter()
+            .position(|index| *index == self.selected_exchange)
+            .unwrap_or(0);
+        let visible_rows = visible_rows.max(1);
+        let followed = selected.saturating_sub(visible_rows.saturating_sub(1));
+        let max_scroll = indices.len().saturating_sub(visible_rows);
+        self.history_scroll.unwrap_or(followed).min(max_scroll)
+    }
+
+    pub fn scroll_history(&mut self, lines: i64, visible_rows: usize) {
+        let previous = self.history_scroll_offset(visible_rows);
+        let distance = usize::try_from(lines.unsigned_abs()).unwrap_or(usize::MAX);
+        let max_scroll = self
+            .filtered_exchange_indices()
+            .len()
+            .saturating_sub(visible_rows.max(1));
+        let current = if lines >= 0 {
+            previous.saturating_add(distance).min(max_scroll)
+        } else {
+            previous.saturating_sub(distance)
+        };
+        self.history_scroll = Some(current);
+        if current != previous {
+            self.mark_changed();
+        }
     }
 
     pub fn select_exchange(&mut self, index: usize) {
@@ -980,10 +1149,13 @@ impl App {
         }
 
         self.selected_exchange = index;
-        self.table_state.select(Some(index));
+        self.history_scroll = None;
         self.request_details_scroll = 0;
         self.response_details_scroll = 0;
+        self.reset_detail_cursors();
         self.line_selection = None;
+        self.visual_selection_active = false;
+        self.active_annotation_id = None;
         self.mark_changed();
     }
 
@@ -994,7 +1166,25 @@ impl App {
         end_line: usize,
         text: Vec<String>,
     ) {
+        self.visual_selection_active = false;
+        self.active_annotation_id = None;
         self.select_lines_from_anchor(panel, start_line, start_line, end_line, text);
+    }
+
+    pub fn start_visual_selection(&mut self) {
+        if self.visual_selection_active {
+            return;
+        }
+        self.visual_selection_active = true;
+        self.mark_changed();
+    }
+
+    pub fn finish_visual_selection(&mut self) {
+        if !self.visual_selection_active {
+            return;
+        }
+        self.visual_selection_active = false;
+        self.mark_changed();
     }
 
     pub fn select_lines_from_anchor(
@@ -1010,6 +1200,17 @@ impl App {
         }
 
         self.focus = panel;
+        self.active_annotation_id = None;
+        let cursor_line = if anchor_line == start_line {
+            end_line
+        } else {
+            start_line
+        };
+        match panel {
+            Focus::RequestSection => self.request_details_cursor_line = cursor_line,
+            Focus::ResponseSection => self.response_details_cursor_line = cursor_line,
+            Focus::MessageList | Focus::StatusHeader => {}
+        }
         self.line_selection = Some(LineSelection {
             panel,
             anchor_line,
@@ -1055,11 +1256,165 @@ impl App {
     }
 
     pub fn clear_line_selection(&mut self) {
-        if self.line_selection.is_none() {
+        if self.line_selection.is_none() && !self.visual_selection_active {
             return;
         }
         self.line_selection = None;
+        self.visual_selection_active = false;
         self.mark_changed();
+    }
+
+    pub fn add_annotation(&mut self, annotation: LineAnnotation) {
+        self.annotations.push(annotation);
+        self.mark_changed();
+    }
+
+    pub fn focus_annotation(&mut self, id: &str) {
+        let Some(annotation) = self
+            .annotations
+            .iter()
+            .find(|annotation| annotation.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.reveal_lines(
+            annotation.panel,
+            annotation.start_line,
+            annotation.end_line,
+            annotation.text,
+        );
+        self.active_annotation_id = Some(annotation.id);
+        self.mark_changed();
+    }
+
+    pub fn remove_annotation(&mut self, id: &str) -> bool {
+        let before = self.annotations.len();
+        self.annotations.retain(|annotation| annotation.id != id);
+        if self.annotations.len() == before {
+            return false;
+        }
+        if self.active_annotation_id.as_deref() == Some(id) {
+            self.active_annotation_id = None;
+        }
+        self.mark_changed();
+        true
+    }
+
+    pub fn detail_tab(&self, panel: Focus) -> Option<DetailTab> {
+        match panel {
+            Focus::RequestSection => Some(if self.request_tab == 0 {
+                DetailTab::Headers
+            } else {
+                DetailTab::Body
+            }),
+            Focus::ResponseSection => Some(if self.response_tab == 0 {
+                DetailTab::Headers
+            } else {
+                DetailTab::Body
+            }),
+            Focus::MessageList | Focus::StatusHeader => None,
+        }
+    }
+
+    pub fn visible_annotations(
+        &self,
+        panel: Focus,
+    ) -> impl DoubleEndedIterator<Item = &LineAnnotation> {
+        let tab = self.detail_tab(panel);
+        self.annotations.iter().filter(move |annotation| {
+            annotation.exchange_index == self.selected_exchange
+                && annotation.panel == panel
+                && Some(annotation.tab) == tab
+        })
+    }
+
+    pub fn selection_overlaps_annotation(&self) -> bool {
+        let Some(selection) = &self.line_selection else {
+            return false;
+        };
+        self.visible_annotations(selection.panel).any(|annotation| {
+            selection.start_line <= annotation.end_line
+                && annotation.start_line <= selection.end_line
+        })
+    }
+
+    pub fn annotation_at_cursor(&self) -> Option<&LineAnnotation> {
+        let cursor = self.detail_cursor_line(self.focus)?;
+        self.visible_annotations(self.focus)
+            .rev()
+            .find(|annotation| (annotation.start_line..=annotation.end_line).contains(&cursor))
+    }
+
+    pub fn annotation_to_delete(&self) -> Option<&LineAnnotation> {
+        self.active_annotation_id
+            .as_deref()
+            .and_then(|id| {
+                self.visible_annotations(self.focus)
+                    .find(|annotation| annotation.id == id)
+            })
+            .or_else(|| self.annotation_at_cursor())
+    }
+
+    pub fn detail_cursor_line(&self, panel: Focus) -> Option<usize> {
+        match panel {
+            Focus::RequestSection => Some(self.request_details_cursor_line),
+            Focus::ResponseSection => Some(self.response_details_cursor_line),
+            Focus::MessageList | Focus::StatusHeader => None,
+        }
+    }
+
+    pub fn move_detail_cursor(
+        &mut self,
+        panel: Focus,
+        lines: i64,
+        total_lines: usize,
+        visible_lines: usize,
+    ) {
+        let total_lines = total_lines.max(1);
+        let visible_lines = visible_lines.max(1);
+        let distance = usize::try_from(lines.unsigned_abs()).unwrap_or(usize::MAX);
+        let previous_focus = self.focus;
+        self.focus = panel;
+
+        let (cursor, scroll) = match panel {
+            Focus::RequestSection => (
+                &mut self.request_details_cursor_line,
+                &mut self.request_details_scroll,
+            ),
+            Focus::ResponseSection => (
+                &mut self.response_details_cursor_line,
+                &mut self.response_details_scroll,
+            ),
+            Focus::MessageList | Focus::StatusHeader => return,
+        };
+        let previous_cursor = *cursor;
+        let previous_scroll = *scroll;
+        *cursor = (*cursor).clamp(1, total_lines);
+        *cursor = if lines >= 0 {
+            cursor.saturating_add(distance).min(total_lines)
+        } else {
+            cursor.saturating_sub(distance).max(1)
+        };
+
+        let cursor_index = cursor.saturating_sub(1);
+        let max_scroll = total_lines.saturating_sub(visible_lines);
+        *scroll = (*scroll).min(max_scroll);
+        if cursor_index < *scroll {
+            *scroll = cursor_index;
+        } else if cursor_index >= scroll.saturating_add(visible_lines) {
+            *scroll = cursor_index.saturating_add(1).saturating_sub(visible_lines);
+        }
+
+        if previous_focus != self.focus || previous_cursor != *cursor || previous_scroll != *scroll
+        {
+            self.mark_changed();
+        }
+    }
+
+    fn reset_detail_cursors(&mut self) {
+        self.request_details_cursor_line = 1;
+        self.response_details_cursor_line = 1;
     }
 
     pub fn set_focus(&mut self, focus: Focus) {
@@ -1067,6 +1422,14 @@ impl App {
             return;
         }
         self.focus = focus;
+        self.mark_changed();
+    }
+
+    pub fn set_panel_fullscreen(&mut self, fullscreen: bool) {
+        if self.panel_fullscreen == fullscreen {
+            return;
+        }
+        self.panel_fullscreen = fullscreen;
         self.mark_changed();
     }
 
@@ -1084,6 +1447,9 @@ impl App {
         }
 
         self.exchanges.extend(exchanges);
+        if let Some(session) = &mut self.session {
+            session.exchange_count = self.exchanges.len();
+        }
         self.select_exchange(self.exchanges.len() - 1);
     }
 
@@ -1113,6 +1479,14 @@ impl App {
     }
 
     pub fn focused_markdown(&self) -> Option<String> {
+        if let Some(selection) = self
+            .line_selection
+            .as_ref()
+            .filter(|selection| self.visual_selection_active || selection.panel == self.focus)
+        {
+            return Some(format!("```text\n{}\n```", selection.text.join("\n")));
+        }
+
         match self.focus {
             Focus::MessageList => Some(self.requests_markdown()),
             Focus::RequestSection => self.request_markdown(),
@@ -1190,14 +1564,17 @@ impl App {
     pub fn select_next(&mut self) {
         if !self.exchanges.is_empty() {
             self.selected_exchange = (self.selected_exchange + 1) % self.exchanges.len();
-            self.table_state.select(Some(self.selected_exchange));
+            self.history_scroll = None;
             self.reset_details_scroll();
             self.request_details_scroll = 0;
             self.response_details_scroll = 0;
+            self.reset_detail_cursors();
             self.details_tab = 0;
             self.request_details_tab = 0;
             self.response_details_tab = 0;
             self.line_selection = None;
+            self.visual_selection_active = false;
+            self.active_annotation_id = None;
             self.mark_changed();
         }
     }
@@ -1209,14 +1586,17 @@ impl App {
             } else {
                 self.selected_exchange - 1
             };
-            self.table_state.select(Some(self.selected_exchange));
+            self.history_scroll = None;
             self.reset_details_scroll();
             self.request_details_scroll = 0;
             self.response_details_scroll = 0;
+            self.reset_detail_cursors();
             self.details_tab = 0;
             self.request_details_tab = 0;
             self.response_details_tab = 0;
             self.line_selection = None;
+            self.visual_selection_active = false;
+            self.active_annotation_id = None;
             self.mark_changed();
         }
     }
@@ -1307,9 +1687,6 @@ impl App {
             Focus::ResponseSection => Focus::StatusHeader,
             Focus::StatusHeader => Focus::MessageList,
         };
-        self.reset_details_scroll();
-        self.request_details_scroll = 0;
-        self.response_details_scroll = 0;
         self.mark_changed();
     }
 
@@ -1320,9 +1697,6 @@ impl App {
             Focus::ResponseSection => Focus::RequestSection,
             Focus::StatusHeader => Focus::ResponseSection,
         };
-        self.reset_details_scroll();
-        self.request_details_scroll = 0;
-        self.response_details_scroll = 0;
         self.mark_changed();
     }
 
@@ -1345,28 +1719,40 @@ impl App {
     pub fn next_request_tab(&mut self) {
         self.request_tab = 1 - self.request_tab; // Toggle between 0 and 1
         self.request_details_scroll = 0;
+        self.request_details_cursor_line = 1;
         self.line_selection = None;
+        self.visual_selection_active = false;
+        self.active_annotation_id = None;
         self.mark_changed();
     }
 
     pub fn previous_request_tab(&mut self) {
         self.request_tab = 1 - self.request_tab; // Toggle between 0 and 1
         self.request_details_scroll = 0;
+        self.request_details_cursor_line = 1;
         self.line_selection = None;
+        self.visual_selection_active = false;
+        self.active_annotation_id = None;
         self.mark_changed();
     }
 
     pub fn next_response_tab(&mut self) {
         self.response_tab = 1 - self.response_tab; // Toggle between 0 and 1
         self.response_details_scroll = 0;
+        self.response_details_cursor_line = 1;
         self.line_selection = None;
+        self.visual_selection_active = false;
+        self.active_annotation_id = None;
         self.mark_changed();
     }
 
     pub fn previous_response_tab(&mut self) {
         self.response_tab = 1 - self.response_tab; // Toggle between 0 and 1
         self.response_details_scroll = 0;
+        self.response_details_cursor_line = 1;
         self.line_selection = None;
+        self.visual_selection_active = false;
+        self.active_annotation_id = None;
         self.mark_changed();
     }
 
@@ -1383,6 +1769,7 @@ impl App {
 
     pub fn apply_filter(&mut self) {
         self.filter_text = self.input_buffer.clone();
+        self.history_scroll = None;
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.mark_changed();
@@ -1400,6 +1787,39 @@ impl App {
         self.input_buffer.clear();
     }
 
+    pub fn start_naming_session(&mut self) {
+        self.input_mode = InputMode::NamingSession;
+        self.input_buffer.clear();
+    }
+
+    pub fn start_annotating_selection(&mut self) {
+        if !self.visual_selection_active || self.line_selection.is_none() {
+            return;
+        }
+        self.input_mode = InputMode::AnnotatingSelection;
+        self.input_buffer.clear();
+    }
+
+    pub fn start_renaming_session(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        self.input_mode = InputMode::RenamingSession;
+        self.input_buffer = session.name.clone();
+    }
+
+    pub fn rename_session(&mut self, id: &str, name: String) {
+        if let Some(session) = &mut self.session {
+            if session.id == id {
+                session.name = name.clone();
+            }
+        }
+        if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
+            session.name = name;
+        }
+        self.mark_changed();
+    }
+
     pub fn confirm_target_edit(&mut self) {
         if !self.input_buffer.trim().is_empty() {
             self.proxy_config.target_url = self.input_buffer.trim().to_string();
@@ -1410,17 +1830,13 @@ impl App {
     }
 
     pub fn handle_input_char(&mut self, c: char) {
-        if self.input_mode == InputMode::EditingTarget
-            || self.input_mode == InputMode::FilteringRequests
-        {
+        if self.input_mode != InputMode::Normal {
             self.input_buffer.push(c);
         }
     }
 
     pub fn handle_backspace(&mut self) {
-        if self.input_mode == InputMode::EditingTarget
-            || self.input_mode == InputMode::FilteringRequests
-        {
+        if self.input_mode != InputMode::Normal {
             self.input_buffer.pop();
         }
     }
@@ -1668,10 +2084,13 @@ impl App {
     // Pause/Intercept functionality
     pub fn toggle_pause_mode(&mut self) {
         self.line_selection = None;
+        self.visual_selection_active = false;
+        self.active_annotation_id = None;
         self.app_mode = match self.app_mode {
             AppMode::Normal => AppMode::Paused,
-            AppMode::Paused => AppMode::Normal,
-            AppMode::Intercepting => AppMode::Normal,
+            AppMode::Paused if self.pending_requests.is_empty() => AppMode::Normal,
+            AppMode::Paused => AppMode::Intercepting,
+            AppMode::Intercepting => AppMode::Paused,
         };
         self.mark_changed();
     }
@@ -1923,6 +2342,10 @@ impl App {
     }
 
     pub fn prepare_new_request(&self, request_json: String) -> Result<OutboundRequest, String> {
+        if !self.is_running {
+            return Err("Proxy is stopped. Press Ctrl-B x to start it.".to_string());
+        }
+
         let parsed: serde_json::Value =
             serde_json::from_str(&request_json).map_err(|e| format!("Invalid JSON: {}", e))?;
 
@@ -1937,7 +2360,9 @@ impl App {
 
         // Check if target URL is empty
         if self.proxy_config.target_url.trim().is_empty() {
-            return Err("Target URL is not set. Press 't' to set a target URL first.".to_string());
+            return Err(
+                "Target URL is not set. Press Ctrl-B t to set a target URL first.".to_string(),
+            );
         }
 
         let url = if matches!(self.app_mode, AppMode::Paused | AppMode::Intercepting) {

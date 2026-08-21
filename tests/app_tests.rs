@@ -122,6 +122,22 @@ fn test_toggle_proxy() {
 }
 
 #[test]
+fn panel_fullscreen_is_an_idempotent_view_state() {
+    let mut app = App::new();
+    let revision = app.revision();
+
+    app.set_panel_fullscreen(true);
+    assert!(app.panel_fullscreen);
+    assert_eq!(app.revision(), revision + 1);
+
+    app.set_panel_fullscreen(true);
+    assert_eq!(app.revision(), revision + 1);
+
+    app.set_panel_fullscreen(false);
+    assert!(!app.panel_fullscreen);
+}
+
+#[test]
 fn test_request_response_pairing() {
     let mut app = App::new();
 
@@ -386,6 +402,33 @@ fn test_filtering_functionality() {
 }
 
 #[test]
+fn filters_requests_by_their_visible_id() {
+    let mut app = App::new();
+    for (id, method) in [
+        (serde_json::json!("audit-ab12"), "first_method"),
+        (serde_json::json!(73), "second_method"),
+    ] {
+        app.add_message(JsonRpcMessage {
+            id: Some(id),
+            method: Some(method.to_string()),
+            params: Some(serde_json::json!([])),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: MessageDirection::Request,
+            transport: TransportType::Http,
+            headers: None,
+        });
+    }
+
+    app.filter_text = "ab12".to_string();
+    assert_eq!(app.filtered_exchange_indices(), vec![0]);
+
+    app.filter_text = "73".to_string();
+    assert_eq!(app.filtered_exchange_indices(), vec![1]);
+}
+
+#[test]
 fn focused_request_list_copies_as_markdown_table() {
     let mut app = App::new();
     app.add_message(JsonRpcMessage {
@@ -442,6 +485,52 @@ fn focused_details_copy_the_selected_tab_as_markdown() {
 }
 
 #[test]
+fn focused_detail_selection_copies_only_the_selected_lines() {
+    let mut app = App::new();
+    app.focus = Focus::RequestSection;
+    app.select_lines(
+        Focus::RequestSection,
+        2,
+        3,
+        vec!["one".to_string(), "two".to_string()],
+    );
+
+    assert_eq!(app.focused_markdown().unwrap(), "```text\none\ntwo\n```");
+    assert_eq!(app.request_details_cursor_line, 3);
+}
+
+#[test]
+fn visual_selection_copy_takes_priority_after_hover_changes_focus() {
+    let mut app = App::new();
+    app.focus = Focus::RequestSection;
+    app.select_lines(
+        Focus::RequestSection,
+        2,
+        3,
+        vec!["one".to_string(), "two".to_string()],
+    );
+    app.start_visual_selection();
+    app.focus = Focus::MessageList;
+
+    assert_eq!(app.focused_markdown().unwrap(), "```text\none\ntwo\n```");
+}
+
+#[test]
+fn detail_cursor_and_scroll_survive_focus_changes() {
+    let mut app = App::new();
+    app.focus = Focus::RequestSection;
+    app.request_details_cursor_line = 7;
+    app.request_details_scroll = 4;
+
+    app.switch_focus();
+    app.switch_focus_reverse();
+
+    assert_eq!(app.focus, Focus::RequestSection);
+    assert_eq!(app.request_details_cursor_line, 7);
+    assert_eq!(app.request_details_scroll, 4);
+}
+
+#[test]
 fn inline_editor_edits_multiline_unicode_text() {
     let mut editor = TextEditor::new(EditorTarget::NewRequest, "aé\ncd".to_string());
 
@@ -495,4 +584,170 @@ fn new_requests_are_validated_before_background_send() {
     assert_eq!(request.url, "http://localhost:8090");
 
     assert!(app.prepare_new_request("{}".to_string()).is_err());
+}
+
+#[test]
+fn stopped_proxy_refuses_to_send_through_its_port() {
+    let mut app = App::new();
+    app.is_running = false;
+
+    let error = app
+        .prepare_new_request(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#.to_string())
+        .unwrap_err();
+
+    assert_eq!(error, "Proxy is stopped. Press Ctrl-B x to start it.");
+}
+
+#[test]
+fn active_session_tracks_new_exchanges() {
+    let mut app = App::new();
+    app.activate_session(
+        SessionSummary {
+            id: "session".to_string(),
+            name: "Session".to_string(),
+            target: "http://node".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            exchange_count: 0,
+        },
+        Vec::new(),
+        Vec::new(),
+    );
+
+    app.add_message(JsonRpcMessage {
+        id: Some(serde_json::json!(1)),
+        method: Some("eth_chainId".to_string()),
+        params: Some(serde_json::json!([])),
+        result: None,
+        error: None,
+        timestamp: std::time::SystemTime::now(),
+        direction: MessageDirection::Request,
+        transport: TransportType::Http,
+        headers: None,
+    });
+
+    assert_eq!(app.session.unwrap().exchange_count, 1);
+}
+
+#[test]
+fn session_name_prompts_use_the_shared_input_buffer() {
+    let mut app = App::new();
+    app.activate_session(
+        SessionSummary {
+            id: "session".to_string(),
+            name: "Original".to_string(),
+            target: "http://node".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            exchange_count: 0,
+        },
+        Vec::new(),
+        Vec::new(),
+    );
+
+    app.start_naming_session();
+    app.handle_input_char('N');
+    assert_eq!(app.input_mode, InputMode::NamingSession);
+    assert_eq!(app.input_buffer, "N");
+
+    app.start_renaming_session();
+    assert_eq!(app.input_mode, InputMode::RenamingSession);
+    assert_eq!(app.input_buffer, "Original");
+
+    app.rename_session("session", "Refunds".to_string());
+    assert_eq!(app.session.unwrap().name, "Refunds");
+}
+
+#[test]
+fn annotation_prompt_requires_an_active_visual_selection() {
+    let mut app = App::new();
+    app.select_lines(
+        Focus::RequestSection,
+        2,
+        3,
+        vec!["two".to_string(), "three".to_string()],
+    );
+
+    app.start_annotating_selection();
+    assert_eq!(app.input_mode, InputMode::Normal);
+
+    app.start_visual_selection();
+    app.start_annotating_selection();
+    app.handle_input_char('N');
+
+    assert_eq!(app.input_mode, InputMode::AnnotatingSelection);
+    assert_eq!(app.input_buffer, "N");
+}
+
+#[test]
+fn adding_an_annotation_preserves_the_viewport() {
+    let mut app = App::new();
+    app.selected_exchange = 7;
+    app.focus = Focus::MessageList;
+    app.request_tab = 0;
+    app.response_tab = 1;
+    app.request_details_scroll = 3;
+    app.response_details_scroll = 9;
+    app.line_selection = Some(LineSelection {
+        panel: Focus::RequestSection,
+        anchor_line: 2,
+        start_line: 2,
+        end_line: 4,
+        text: vec!["selected".to_string()],
+    });
+    app.active_annotation_id = Some("existing".to_string());
+
+    let selection = app.line_selection.clone();
+    app.add_annotation(LineAnnotation {
+        id: "new".to_string(),
+        exchange_index: 12,
+        panel: Focus::ResponseSection,
+        tab: DetailTab::Body,
+        start_line: 20,
+        end_line: 22,
+        message: "Background finding".to_string(),
+        text: vec!["evidence".to_string()],
+    });
+
+    assert_eq!(app.annotations.len(), 1);
+    assert_eq!(app.selected_exchange, 7);
+    assert_eq!(app.focus, Focus::MessageList);
+    assert_eq!((app.request_tab, app.response_tab), (0, 1));
+    assert_eq!(
+        (app.request_details_scroll, app.response_details_scroll),
+        (3, 9)
+    );
+    assert_eq!(app.line_selection, selection);
+    assert_eq!(app.active_annotation_id.as_deref(), Some("existing"));
+}
+
+#[test]
+fn unpausing_with_pending_requests_keeps_them_visible() {
+    let mut app = App::new();
+    let (decision_sender, _decision_receiver) = tokio::sync::oneshot::channel();
+    app.app_mode = AppMode::Paused;
+    app.pending_requests.push(PendingRequest {
+        id: "pending".to_string(),
+        original_request: JsonRpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: Some("eth_chainId".to_string()),
+            params: Some(serde_json::json!([])),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: MessageDirection::Request,
+            transport: TransportType::Http,
+            headers: None,
+        },
+        modified_request: None,
+        modified_headers: None,
+        decision_sender,
+    });
+
+    app.toggle_pause_mode();
+    assert_eq!(app.app_mode, AppMode::Intercepting);
+    assert_eq!(app.pending_requests.len(), 1);
+
+    app.toggle_pause_mode();
+    assert_eq!(app.app_mode, AppMode::Paused);
 }

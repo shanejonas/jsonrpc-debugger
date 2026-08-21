@@ -15,6 +15,16 @@ async fn test_proxy_server_creation() {
 }
 
 #[tokio::test]
+async fn proxy_bind_rejects_an_occupied_port() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    let proxy = ProxyServer::new(port, "http://localhost:8090".to_string(), sender);
+
+    assert!(proxy.bind().is_err());
+}
+
+#[tokio::test]
 async fn test_proxy_handles_different_paths() {
     use warp::Filter;
 
