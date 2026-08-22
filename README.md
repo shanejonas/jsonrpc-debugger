@@ -2,12 +2,12 @@
 
 Debug JSON-RPC yourself or hand the debugger to an agent.
 
-`jsonrpc-debugger` is a local JSON-RPC proxy with two interfaces over the same live session:
+`jsonrpc-debugger` is a local JSON-RPC proxy and transparent stdio wrapper with two interfaces over the same live session:
 
 - A terminal UI for people.
 - A localhost JSON-RPC control plane for agents and scripts.
 
-Both can inspect history, send requests, intercept traffic, focus panels, scroll, and point at exact request or response lines.
+Both inspect the same history. Driver mode can also send requests and intercept traffic.
 
 ## Install
 
@@ -37,10 +37,54 @@ Send traffic to the proxy:
 ```bash
 curl http://127.0.0.1:8080 \
   -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"example_ping","params":[]}'
 ```
 
 The control port defaults to the proxy port plus one. Override it with `--control-port`.
+
+### Wrap stdio servers
+
+Use `wrap` when a real MCP, ACP, LSP, or DAP client should talk through the debugger. The debugger preserves the server's native stdio framing instead of exposing an HTTP proxy.
+
+MCP and ACP use newline-delimited JSON:
+
+```bash
+jsonrpc-debugger --control-port 8096 \
+  wrap -- npx -y @modelcontextprotocol/server-everything
+```
+
+LSP and DAP use `Content-Length` framing:
+
+```bash
+jsonrpc-debugger --control-port 8096 \
+  wrap --framing content-length -- gopls
+```
+
+Point the real client at that command. The client owns the wrapper's stdin and stdout. The debugger forwards child stderr to its own stderr and records requests, responses, batches, notifications, and server requests.
+
+Open the TUI from another terminal:
+
+```bash
+jsonrpc-debugger attach http://127.0.0.1:8096
+```
+
+The attached TUI is read-only. It follows live history and supports navigation, filtering, fullscreen panels, and Markdown copy without competing with the protocol client for response IDs.
+
+### Drive stdio servers over HTTP
+
+Use `stdio` when a person, curl, or an agent should act as the JSON-RPC client. Newline-delimited framing works with MCP and ACP servers:
+
+```bash
+jsonrpc-debugger --port 8080 stdio -- npx my-mcp-server
+```
+
+LSP and DAP servers use `Content-Length` framing:
+
+```bash
+jsonrpc-debugger --port 8080 stdio --framing content-length -- rust-analyzer
+```
+
+This mode keeps the local HTTP proxy on port `8080`. Requests from the TUI, control plane, or another HTTP client travel through the child process. Server notifications appear in history as notifications instead of pending requests.
 
 ## Use it yourself
 
@@ -101,7 +145,7 @@ curl http://127.0.0.1:8081 \
   -d '{"jsonrpc":"2.0","id":2,"method":"debugger.getState"}'
 ```
 
-An agent can:
+In HTTP and stdio driver modes, an agent can:
 
 - Read state, history, pending requests, and numbered panel content.
 - List old sessions and page through their persistent history without changing the TUI.
@@ -112,6 +156,8 @@ An agent can:
 - Change the target or filter and control interception.
 - Create, select, or rename sessions.
 - Export portable history or replay it without forwarding requests.
+
+Transparent `wrap` mode keeps one client on one matching data plane. Agents can inspect its state and durable history, but cannot inject requests or pause the external client.
 
 Line selections are shared but temporary. Annotations stick to their exchange until a person presses `Ctrl-B d` or an agent removes one by ID. Highlights can move without erasing the notes around them.
 

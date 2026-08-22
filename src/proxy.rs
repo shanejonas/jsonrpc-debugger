@@ -1,6 +1,8 @@
 use crate::app::{
-    AppMode, JsonRpcMessage, MessageDirection, PendingRequest, ProxyDecision, TransportType,
+    json_rpc_messages, json_rpc_messages_by_shape, AppMode, Framing, JsonRpcMessage,
+    MessageDirection, PendingRequest, ProxyConfig, ProxyDecision, TransportType,
 };
+use crate::stdio::StdioTransport;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
@@ -23,10 +25,30 @@ pub struct ProxyState {
 
 pub struct ProxyServer {
     listen_port: u16,
-    target_url: String,
+    target: ProxyTarget,
     message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
-    client: Client,
     proxy_state: Option<ProxyState>,
+}
+
+#[derive(Clone)]
+enum ProxyTarget {
+    Http {
+        url: String,
+        client: Client,
+    },
+    Stdio {
+        transport: StdioTransport,
+        framing: Framing,
+    },
+}
+
+impl ProxyTarget {
+    fn transport(&self, body: &Value) -> TransportType {
+        match self {
+            Self::Http { .. } => http_transport(body),
+            Self::Stdio { framing, .. } => TransportType::Stdio(*framing),
+        }
+    }
 }
 
 impl ProxyServer {
@@ -46,11 +68,38 @@ impl ProxyServer {
 
         Self {
             listen_port,
-            target_url,
+            target: ProxyTarget::Http {
+                url: target_url,
+                client,
+            },
             message_sender,
-            client,
             proxy_state: None,
         }
+    }
+
+    pub fn from_config(
+        config: &ProxyConfig,
+        message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
+    ) -> Result<Self> {
+        let Some(stdio) = &config.stdio else {
+            return Ok(Self::new(
+                config.listen_port,
+                config.target_url.clone(),
+                message_sender,
+            ));
+        };
+        let transport =
+            StdioTransport::spawn(&stdio.command, stdio.framing, message_sender.clone())
+                .map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            listen_port: config.listen_port,
+            target: ProxyTarget::Stdio {
+                transport,
+                framing: stdio.framing,
+            },
+            message_sender,
+            proxy_state: None,
+        })
     }
 
     pub fn with_state(mut self, proxy_state: ProxyState) -> Self {
@@ -64,8 +113,7 @@ impl ProxyServer {
     }
 
     pub fn bind(&self) -> Result<impl Future<Output = ()> + 'static> {
-        let target_url = self.target_url.clone();
-        let client = self.client.clone();
+        let target = self.target.clone();
         let message_sender = self.message_sender.clone();
         let proxy_state = self.proxy_state.clone();
 
@@ -75,8 +123,7 @@ impl ProxyServer {
             .and(warp::body::json())
             .and_then(
                 move |path: warp::path::FullPath, headers: warp::http::HeaderMap, body: Value| {
-                    let target_url = target_url.clone();
-                    let client = client.clone();
+                    let target = target.clone();
                     let message_sender = message_sender.clone();
                     let proxy_state = proxy_state.clone();
 
@@ -85,8 +132,7 @@ impl ProxyServer {
                             path,
                             headers,
                             body,
-                            target_url,
-                            client,
+                            target,
                             message_sender,
                             proxy_state,
                         )
@@ -114,8 +160,7 @@ async fn handle_proxy_request(
     path: warp::path::FullPath,
     headers: warp::http::HeaderMap,
     body: Value,
-    target_url: String,
-    client: Client,
+    target: ProxyTarget,
     message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
     proxy_state: Option<ProxyState>,
 ) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
@@ -127,28 +172,42 @@ async fn handle_proxy_request(
         }
     }
 
-    // Log the incoming request
-    let request_message = JsonRpcMessage {
-        id: body.get("id").cloned(),
-        method: body
-            .get("method")
-            .and_then(|m| m.as_str())
-            .map(String::from),
-        params: body.get("params").cloned(),
+    // Log each JSON-RPC request in the HTTP body.
+    let transport = target.transport(&body);
+    let request_messages = if matches!(transport, TransportType::Stdio(_)) {
+        json_rpc_messages_by_shape(&body, transport, Some(&header_map))
+    } else {
+        json_rpc_messages(
+            &body,
+            MessageDirection::Request,
+            transport,
+            Some(&header_map),
+        )
+    };
+    let request_message = request_messages.first().cloned().unwrap_or(JsonRpcMessage {
+        id: None,
+        method: None,
+        params: None,
         result: None,
         error: None,
         timestamp: std::time::SystemTime::now(),
-        direction: MessageDirection::Request,
-        transport: TransportType::Http,
+        direction: if matches!(transport, TransportType::Stdio(_)) && body.get("method").is_none() {
+            MessageDirection::Response
+        } else {
+            MessageDirection::Request
+        },
+        transport,
         headers: Some(header_map.clone()),
-    };
-
-    let _ = message_sender.send(request_message.clone());
+    });
+    for message in request_messages {
+        let _ = message_sender.send(message);
+    }
 
     // Check if we're in pause mode and should intercept the request
     if let Some(ref state) = proxy_state {
         let should_intercept = if let Ok(app_mode) = state.app_mode.lock() {
             matches!(*app_mode, AppMode::Paused)
+                && matches!(request_message.direction, MessageDirection::Request)
         } else {
             false
         };
@@ -201,8 +260,8 @@ async fn handle_proxy_request(
                     forward_request(
                         final_headers,
                         request_body,
-                        format!("{}{}", target_url, path.as_str()),
-                        client,
+                        path.as_str(),
+                        target,
                         message_sender,
                     )
                     .await
@@ -231,7 +290,7 @@ async fn handle_proxy_request(
                         error: response_json.get("error").cloned(),
                         timestamp: std::time::SystemTime::now(),
                         direction: MessageDirection::Response,
-                        transport: TransportType::Http,
+                        transport,
                         headers: Some(HashMap::from([
                             ("content-type".to_string(), "application/json".to_string()),
                             ("x-proxy-completed".to_string(), "true".to_string()),
@@ -265,23 +324,41 @@ async fn handle_proxy_request(
     }
 
     // Normal forwarding (not intercepted)
-    forward_request(
-        headers,
-        body,
-        format!("{}{}", target_url, path.as_str()),
-        client,
-        message_sender,
-    )
-    .await
+    forward_request(headers, body, path.as_str(), target, message_sender).await
 }
 
 async fn forward_request(
+    headers: warp::http::HeaderMap,
+    body: Value,
+    path: &str,
+    target: ProxyTarget,
+    message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
+) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    match target {
+        ProxyTarget::Http { url, client } => {
+            forward_http_request(
+                headers,
+                body,
+                format!("{url}{path}"),
+                client,
+                message_sender,
+            )
+            .await
+        }
+        ProxyTarget::Stdio { transport, framing } => {
+            forward_stdio_request(body, transport, framing, message_sender).await
+        }
+    }
+}
+
+async fn forward_http_request(
     headers: warp::http::HeaderMap,
     body: Value,
     target_url: String,
     client: Client,
     message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
 ) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    let transport = http_transport(&body);
     // Forward the request to the target
     let mut request_builder = client.post(&target_url).json(&body);
 
@@ -312,19 +389,14 @@ async fn forward_request(
                     match serde_json::from_str::<Value>(&response_text) {
                         Ok(response_body) => {
                             // Valid JSON response
-                            let response_message = JsonRpcMessage {
-                                id: response_body.get("id").cloned(),
-                                method: None,
-                                params: None,
-                                result: response_body.get("result").cloned(),
-                                error: response_body.get("error").cloned(),
-                                timestamp: std::time::SystemTime::now(),
-                                direction: MessageDirection::Response,
-                                transport: TransportType::Http,
-                                headers: Some(response_header_map.clone()),
-                            };
-
-                            let _ = message_sender.send(response_message);
+                            for message in json_rpc_messages(
+                                &response_body,
+                                MessageDirection::Response,
+                                transport,
+                                Some(&response_header_map),
+                            ) {
+                                let _ = message_sender.send(message);
+                            }
 
                             // Return the original response as-is
                             Ok(Box::new(warp::reply::with_status(
@@ -396,7 +468,7 @@ async fn forward_request(
                                 })),
                                 timestamp: std::time::SystemTime::now(),
                                 direction: MessageDirection::Response,
-                                transport: TransportType::Http,
+                                transport,
                                 headers: Some(response_header_map.clone()),
                             };
 
@@ -435,7 +507,7 @@ async fn forward_request(
                         })),
                         timestamp: std::time::SystemTime::now(),
                         direction: MessageDirection::Response,
-                        transport: TransportType::Http,
+                        transport,
                         headers: Some(response_header_map),
                     };
 
@@ -468,7 +540,7 @@ async fn forward_request(
                 })),
                 timestamp: std::time::SystemTime::now(),
                 direction: MessageDirection::Response,
-                transport: TransportType::Http,
+                transport,
                 headers: None,
             };
 
@@ -489,9 +561,116 @@ async fn forward_request(
     }
 }
 
+async fn forward_stdio_request(
+    body: Value,
+    target: StdioTransport,
+    framing: Framing,
+    message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
+) -> Result<Box<dyn warp::Reply>, warp::Rejection> {
+    match target.send(body.clone()).await {
+        Ok(response) => Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&response),
+            warp::http::StatusCode::OK,
+        ))),
+        Err(message) => {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body.get("id").cloned().unwrap_or(Value::Null),
+                "error": {
+                    "code": -32603,
+                    "message": message,
+                }
+            });
+            for message in json_rpc_messages(
+                &response,
+                MessageDirection::Response,
+                TransportType::Stdio(framing),
+                None,
+            ) {
+                let _ = message_sender.send(message);
+            }
+            Ok(Box::new(warp::reply::with_status(
+                warp::reply::json(&response),
+                warp::http::StatusCode::BAD_GATEWAY,
+            )))
+        }
+    }
+}
+
 fn should_forward_header(header_name: &str) -> bool {
     !matches!(
         header_name.to_lowercase().as_str(),
         "host" | "content-length" | "transfer-encoding" | "connection"
     )
+}
+
+fn http_transport(body: &Value) -> TransportType {
+    if body.is_array() {
+        TransportType::HttpBatch
+    } else {
+        TransportType::Http
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn batch_bodies_become_individual_messages() {
+        let request = json!([
+            {"jsonrpc": "2.0", "method": "example_first", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "example_second", "params": [], "id": 2}
+        ]);
+        let requests = json_rpc_messages(
+            &request,
+            MessageDirection::Request,
+            TransportType::HttpBatch,
+            None,
+        );
+
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|message| matches!(message.transport, TransportType::HttpBatch)));
+        assert_eq!(requests[0].method.as_deref(), Some("example_first"));
+        assert_eq!(requests[1].id, Some(json!(2)));
+
+        let response = json!([
+            {"jsonrpc": "2.0", "id": 2, "result": "second"},
+            {"jsonrpc": "2.0", "id": 1, "result": "first"}
+        ]);
+        let responses = json_rpc_messages(
+            &response,
+            MessageDirection::Response,
+            TransportType::HttpBatch,
+            None,
+        );
+
+        assert_eq!(responses.len(), 2);
+        assert!(responses
+            .iter()
+            .all(|message| matches!(message.transport, TransportType::HttpBatch)));
+        assert_eq!(responses[0].id, Some(json!(2)));
+        assert_eq!(responses[1].result, Some(json!("first")));
+
+        let rejected = json_rpc_messages(
+            &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700}}),
+            MessageDirection::Response,
+            TransportType::HttpBatch,
+            None,
+        );
+        assert!(matches!(rejected[0].transport, TransportType::HttpBatch));
+
+        let mut app = crate::app::App::new();
+        for message in requests.into_iter().chain(responses) {
+            app.add_message(message);
+        }
+        assert_eq!(app.exchanges.len(), 2);
+        assert!(app
+            .exchanges
+            .iter()
+            .all(|exchange| exchange.response.is_some()));
+    }
 }

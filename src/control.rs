@@ -132,6 +132,12 @@ pub struct SessionExchange {
 #[serde(rename_all = "lowercase")]
 pub enum SessionTransport {
     Http,
+    #[serde(rename = "http-batch")]
+    HttpBatch,
+    #[serde(rename = "stdio-json-lines")]
+    StdioJsonLines,
+    #[serde(rename = "stdio-content-length")]
+    StdioContentLength,
     Websocket,
 }
 
@@ -547,9 +553,11 @@ pub fn state(app: &App) -> Value {
         "revision": app.revision(),
         "running": app.is_running,
         "mode": mode_name(&app.app_mode),
-        "proxyPort": app.proxy_config.listen_port,
+        "proxyPort": (!app.proxy_config.transparent).then_some(app.proxy_config.listen_port),
+        "dataPlane": if app.proxy_config.transparent { "stdio" } else { "http" },
         "controlPort": app.control_port,
         "target": app.proxy_config.target_url,
+        "transport": app.proxy_config.transport.name(),
         "filter": app.filter_text,
         "focus": focus_name(app.focus),
         "fullscreen": app.panel_fullscreen,
@@ -644,6 +652,13 @@ impl From<&JsonRpcExchange> for SessionExchange {
         Self {
             transport: match exchange.transport {
                 TransportType::Http => SessionTransport::Http,
+                TransportType::HttpBatch => SessionTransport::HttpBatch,
+                TransportType::Stdio(crate::app::Framing::JsonLines) => {
+                    SessionTransport::StdioJsonLines
+                }
+                TransportType::Stdio(crate::app::Framing::ContentLength) => {
+                    SessionTransport::StdioContentLength
+                }
                 TransportType::WebSocket => SessionTransport::Websocket,
             },
             request: exchange.request.as_ref().map(SessionMessage::from),
@@ -672,15 +687,22 @@ impl TryFrom<SessionExchange> for JsonRpcExchange {
 
         let transport = match exchange.transport {
             SessionTransport::Http => TransportType::Http,
+            SessionTransport::HttpBatch => TransportType::HttpBatch,
+            SessionTransport::StdioJsonLines => {
+                TransportType::Stdio(crate::app::Framing::JsonLines)
+            }
+            SessionTransport::StdioContentLength => {
+                TransportType::Stdio(crate::app::Framing::ContentLength)
+            }
             SessionTransport::Websocket => TransportType::WebSocket,
         };
         let request = exchange
             .request
-            .map(|message| session_message(message, MessageDirection::Request, transport.clone()))
+            .map(|message| session_message(message, MessageDirection::Request, transport))
             .transpose()?;
         let response = exchange
             .response
-            .map(|message| session_message(message, MessageDirection::Response, transport.clone()))
+            .map(|message| session_message(message, MessageDirection::Response, transport))
             .transpose()?;
         let id = request
             .as_ref()
@@ -779,7 +801,9 @@ fn exchange_value(index: usize, exchange: &JsonRpcExchange) -> Value {
         "id": exchange.id,
         "method": exchange.method,
         "transport": transport_name(&exchange.transport),
-        "status": if exchange.response.as_ref().is_some_and(|response| response.error.is_some()) {
+        "status": if exchange.is_notification() {
+            "notification"
+        } else if exchange.response.as_ref().is_some_and(|response| response.error.is_some()) {
             "error"
         } else if exchange.response.is_some() {
             "success"
@@ -875,10 +899,7 @@ pub fn annotation(annotation: &LineAnnotation) -> Value {
 }
 
 fn transport_name(transport: &TransportType) -> &'static str {
-    match transport {
-        TransportType::Http => "http",
-        TransportType::WebSocket => "websocket",
-    }
+    transport.name()
 }
 
 #[cfg(test)]
@@ -959,6 +980,16 @@ mod tests {
             .unwrap()
             .iter()
             .any(|method| method["name"] == "debugger.setFullscreen"));
+        let send_request = document["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|method| method["name"] == "debugger.sendRequest")
+            .unwrap();
+        assert_eq!(
+            send_request["params"][0]["schema"]["oneOf"][1]["type"],
+            "array"
+        );
     }
 
     #[test]
@@ -1212,6 +1243,30 @@ mod tests {
             ..session
         })
         .is_err());
+    }
+
+    #[test]
+    fn stdio_transport_round_trips_through_sessions() {
+        let mut app = App::new();
+        app.add_message(JsonRpcMessage {
+            id: None,
+            method: Some("example/changed".to_string()),
+            params: None,
+            result: None,
+            error: None,
+            timestamp: UNIX_EPOCH + Duration::from_millis(10),
+            direction: MessageDirection::Request,
+            transport: TransportType::Stdio(crate::app::Framing::ContentLength),
+            headers: None,
+        });
+
+        let exchanges = replay_session(export_session(&app)).unwrap();
+
+        assert!(exchanges[0].is_notification());
+        assert!(matches!(
+            exchanges[0].transport,
+            TransportType::Stdio(crate::app::Framing::ContentLength)
+        ));
     }
 
     #[tokio::test]

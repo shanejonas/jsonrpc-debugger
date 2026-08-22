@@ -11,7 +11,7 @@ use ratatui::{
 
 use crate::app::{
     request_matches_filter, App, AppMode, EditorMode, Focus, InputMode, JsonRpcExchange,
-    LineAnnotation, Overlay, TransportType,
+    LineAnnotation, Overlay,
 };
 
 const ANNOTATION_AMBER: Color = Color::Rgb(245, 166, 35);
@@ -239,10 +239,7 @@ fn request_header_action(area: Rect, app: &App, column: u16, row: u16) -> Option
         return None;
     }
 
-    let transport_width = match app.proxy_config.transport {
-        TransportType::Http => 6,
-        TransportType::WebSocket => 11,
-    };
+    let transport_width = app.proxy_config.transport.label().len() as u16 + 2;
     let target = if app.input_mode == InputMode::EditingTarget {
         if app.input_buffer.is_empty() {
             "Enter target URL"
@@ -804,42 +801,60 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     match app.overlay {
-        Overlay::Help => draw_keybind_help(f),
+        Overlay::Help => draw_keybind_help(f, app),
         Overlay::Sessions => draw_sessions(f, app),
         Overlay::None | Overlay::Prefix => {}
     }
 }
 
-fn draw_keybind_help(f: &mut Frame) {
+fn draw_keybind_help(f: &mut Frame, app: &App) {
     let popup = centered_popup(f.size(), 90, 65);
-    let lines = vec![
-        Line::from(Span::styled(
-            "Global commands",
-            Style::default().fg(Color::Cyan),
-        )),
-        Line::from("^B s  sessions       ^B n  new session"),
-        Line::from("^B R  rename session"),
-        Line::from("^B a  annotate visual selection"),
-        Line::from("^B c  create request ^B p  pause interception"),
-        Line::from("^B t  target         ^B x  start/stop proxy"),
-        Line::from("^B z  fullscreen panel"),
-        Line::from("^B y  copy focused panel as Markdown"),
-        Line::from("^B d  delete focused annotation"),
-        Line::from("^B q  quit           ^B ?  this help"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Focused pending request",
-            Style::default().fg(Color::Cyan),
-        )),
-        Line::from("a allow   b block   e body   h headers"),
-        Line::from("c complete   r resume all"),
-        Line::from(""),
-        Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
-        Line::from("↑/↓ or j/k navigate   Tab focus   h/l tabs   / filter"),
-        Line::from("d/u page   g/G top/bottom"),
-        Line::from("Requests: Enter response   Details: Enter copy Markdown"),
-        Line::from("Details: v visual select   j/k extend   Esc clear"),
-    ];
+    let lines = if app.proxy_config.transparent {
+        vec![
+            Line::from(Span::styled(
+                "Attached viewer",
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from("^B z  fullscreen panel"),
+            Line::from("^B y  copy focused panel as Markdown"),
+            Line::from("^B q  quit           ^B ?  this help"),
+            Line::from(""),
+            Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
+            Line::from("↑/↓ or j/k navigate   Tab focus   h/l tabs   / filter"),
+            Line::from("d/u page   g/G top/bottom"),
+            Line::from("Requests: Enter response   Details: Enter copy Markdown"),
+            Line::from("The external client owns the stdio data plane."),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "Global commands",
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from("^B s  sessions       ^B n  new session"),
+            Line::from("^B R  rename session"),
+            Line::from("^B a  annotate visual selection"),
+            Line::from("^B c  create request ^B p  pause interception"),
+            Line::from("^B t  target         ^B x  start/stop proxy"),
+            Line::from("^B z  fullscreen panel"),
+            Line::from("^B y  copy focused panel as Markdown"),
+            Line::from("^B d  delete focused annotation"),
+            Line::from("^B q  quit           ^B ?  this help"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Focused pending request",
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from("a allow   b block   e body   h headers"),
+            Line::from("c complete   r resume all"),
+            Line::from(""),
+            Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
+            Line::from("↑/↓ or j/k navigate   Tab focus   h/l tabs   / filter"),
+            Line::from("d/u page   g/G top/bottom"),
+            Line::from("Requests: Enter response   Details: Enter copy Markdown"),
+            Line::from("Details: v visual select   j/k extend   Esc clear"),
+        ]
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Keybinds")
@@ -1016,10 +1031,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_request_header(f: &mut Frame, area: Rect, app: &App) {
-    let transport_label = match app.proxy_config.transport {
-        TransportType::Http => "HTTP",
-        TransportType::WebSocket => "WebSocket",
-    };
+    let transport_label = app.proxy_config.transport.label();
 
     let transport_style = Style::default()
         .fg(Color::Black)
@@ -1161,13 +1173,25 @@ fn draw_status_header(f: &mut Frame, area: Rect, app: &App) {
         .fg(Color::Gray)
         .add_modifier(Modifier::BOLD);
 
-    let info_line = Line::from(vec![
-        Span::styled("Port:", label_style),
-        Span::raw(format!(" {}", app.proxy_config.listen_port)),
-        Span::raw(format!("  RPC: {}  ", app.control_port)),
-        Span::styled("Mode:", label_style),
-        Span::styled(format!(" {}", mode_text), Style::default().fg(mode_color)),
-    ]);
+    let data_plane = if app.proxy_config.transparent {
+        vec![Span::styled("Data:", label_style), Span::raw(" STDIO")]
+    } else {
+        vec![
+            Span::styled("Port:", label_style),
+            Span::raw(format!(" {}", app.proxy_config.listen_port)),
+        ]
+    };
+    let info_line = Line::from(
+        [
+            data_plane,
+            vec![
+                Span::raw(format!("  RPC: {}  ", app.control_port)),
+                Span::styled("Mode:", label_style),
+                Span::styled(format!(" {}", mode_text), Style::default().fg(mode_color)),
+            ],
+        ]
+        .concat(),
+    );
     lines.push(info_line);
 
     if app.input_mode == InputMode::EditingTarget {
@@ -1240,6 +1264,8 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                 "No requests match filter {:?}. Press / then Enter to clear it.",
                 app.filter_text
             )
+        } else if app.proxy_config.transparent {
+            "Attached. Waiting for stdio messages...".to_string()
         } else if app.is_running {
             format!(
                 "Proxy is running on port {}. Waiting for requests...",
@@ -1300,10 +1326,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         .skip(offset)
         .take(visible_rows)
         .map(|(_, exchange)| {
-            let transport_symbol = match exchange.transport {
-                TransportType::Http => "HTTP",
-                TransportType::WebSocket => "WS",
-            };
+            let transport_symbol = exchange.transport.label();
 
             let method = exchange.method.as_deref().unwrap_or("unknown");
             let id = exchange
@@ -1316,7 +1339,9 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                 })
                 .unwrap_or_else(|| "null".to_string());
 
-            let (status_symbol, status_color) = if exchange.response.is_none() {
+            let (status_symbol, status_color) = if exchange.is_notification() {
+                ("• Notify", Color::Cyan)
+            } else if exchange.response.is_none() {
                 ("⏳ Pending", Color::Yellow)
             } else if let Some(response) = &exchange.response {
                 if response.error.is_some() {
@@ -1371,7 +1396,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(12), // Status
-            Constraint::Length(9),  // Transport
+            Constraint::Length(11), // Transport
             Constraint::Min(15),    // Method (flexible)
             Constraint::Length(12), // ID
             Constraint::Length(10), // Duration
@@ -1642,7 +1667,7 @@ fn request_detail_lines_for(
         // Basic exchange info
         lines.push(Line::from(vec![
             Span::styled("Transport: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("{:?}", exchange.transport)),
+            Span::raw(exchange.transport.label()),
         ]));
 
         if let Some(method) = &exchange.method {
@@ -2088,6 +2113,23 @@ impl KeybindInfo {
 
 fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
     if app.overlay == Overlay::Prefix {
+        if app.proxy_config.transparent {
+            return vec![
+                KeybindInfo::new("?", "keybinds", 1),
+                KeybindInfo::new("y", "copy markdown", 1),
+                KeybindInfo::new(
+                    "z",
+                    if app.panel_fullscreen {
+                        "restore panels"
+                    } else {
+                        "fullscreen panel"
+                    },
+                    1,
+                ),
+                KeybindInfo::new("q", "quit", 1),
+                KeybindInfo::new("Esc", "cancel", 1),
+            ];
+        }
         let mut keybinds = vec![
             KeybindInfo::new("?", "keybinds", 1),
             KeybindInfo::new("s", "sessions", 1),
@@ -2627,7 +2669,7 @@ fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{DetailTab, JsonRpcMessage, MessageDirection, SessionSummary};
+    use crate::app::{DetailTab, JsonRpcMessage, MessageDirection, SessionSummary, TransportType};
     use ratatui::{backend::TestBackend, Terminal};
 
     fn app_with_request() -> App {
@@ -2655,6 +2697,73 @@ mod tests {
             headers: None,
         });
         app
+    }
+
+    #[test]
+    fn batch_members_are_labeled_http_batch() {
+        let mut app = App::new();
+        app.add_message(JsonRpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: Some("example_first".to_string()),
+            params: Some(serde_json::json!([])),
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: MessageDirection::Request,
+            transport: TransportType::HttpBatch,
+            headers: None,
+        });
+
+        let details = request_detail_lines(&app)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(details.contains("Transport: HTTP-BATCH"));
+
+        let area = Rect::new(0, 0, 100, 5);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| draw_message_list(frame, area, &app))
+            .unwrap();
+        let rendered = terminal.backend().buffer().content().iter().fold(
+            String::new(),
+            |mut rendered, cell| {
+                rendered.push_str(cell.symbol());
+                rendered
+            },
+        );
+        assert!(rendered.contains("HTTP-BATCH"));
+    }
+
+    #[test]
+    fn stdio_framing_is_visible_in_the_transport_column() {
+        let mut app = App::new();
+        app.add_message(JsonRpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: Some("example_first".to_string()),
+            params: None,
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: MessageDirection::Request,
+            transport: TransportType::Stdio(crate::app::Framing::JsonLines),
+            headers: None,
+        });
+
+        let area = Rect::new(0, 0, 100, 5);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| draw_message_list(frame, area, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("STDIO/JSONL"));
     }
 
     fn normal_panels(area: Rect, app: &App) -> (Rect, Rect, Rect) {

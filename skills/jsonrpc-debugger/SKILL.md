@@ -1,17 +1,24 @@
 ---
 name: jsonrpc-debugger
-description: Control a running jsonrpc-debugger TUI through its localhost JSON-RPC control plane. Use when an agent needs to inspect debugger state or durable history, send or intercept requests, drive visible focus and selections, annotate request or response lines, or demonstrate a JSON-RPC flow.
+description: Control a running jsonrpc-debugger TUI or transparent stdio wrapper through its localhost JSON-RPC control plane. Use to inspect live state or durable history, send or intercept requests in driver mode, navigate visible panels, annotate exact lines, or verify HTTP, MCP, LSP, and other framed JSON-RPC flows.
 ---
 
 # JSON-RPC Debugger
 
-Drive the live debugger the user sees. Treat the TUI as a shared screen: preserve unrelated state and leave it usable.
+Drive the live debugger or inspect a transparent wrapper. Treat an attached TUI as a shared screen: preserve unrelated state and leave it usable.
 
 ## Connect
 
-1. Find the existing debugger process and its proxy port. The control port defaults to the proxy port plus one unless `--control-port` overrides it.
+1. Find the existing debugger process and control port. HTTP driver mode defaults to the proxy port plus one. Transparent wrappers usually set `--control-port` explicitly.
 2. Probe the control endpoint with `rpc.discover`. Do not confuse it with the proxy port.
 3. Read `debugger.getState` before changing anything. Record its session, target, filter, focus, selection, annotations, mode, pending count, and revision.
+
+Read `getState.dataPlane` before acting:
+
+- `http` means the debugger drives the target. `proxyPort` contains its HTTP ingress.
+- `stdio` means a transparent wrapper. `proxyPort` is null and the external client owns stdin/stdout.
+
+`getState.transport` identifies the target wire format. Stdio uses `stdio-json-lines` or `stdio-content-length`. Its command comes from `getState.target` and cannot change through the control plane.
 
 Drive the existing live process when its control endpoint responds. Do not start another debugger unless the user asks.
 
@@ -60,7 +67,9 @@ To point at evidence:
 
 `debugger.annotateLines` does not select, focus, scroll, switch tabs, or highlight. Pass `exchangeIndex` and `tab` for background annotations. Messages must be one line and at most 160 characters. Remove only annotations you created, using their returned ID with `debugger.removeAnnotation`.
 
-`debugger.sendRequest` sends a complete target JSON-RPC request through the proxy. Keep human-facing request IDs unique, semantic, and at most 12 characters.
+Use `debugger.sendRequest` only when `getState.dataPlane` is `http`. It sends a complete target JSON-RPC request through the driver proxy. Keep human-facing request IDs unique, semantic, and at most 12 characters.
+
+Never inject requests into a transparent stdio wrapper. The external MCP/LSP client owns response routing. Use `debugger.getHistory`, `debugger.waitForChange`, or `jsonrpc-debugger attach` to observe it.
 
 ## Run Dense Audits
 
@@ -74,6 +83,8 @@ To point at evidence:
 Do not visually select findings during the background audit. Persistent annotations and temporary highlights are separate tools.
 
 ## Intercept Requests
+
+Interception requires the HTTP data plane. Do not call `debugger.setPaused` when `getState.dataPlane` is `stdio`.
 
 Interception requires concurrent calls:
 

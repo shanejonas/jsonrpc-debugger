@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, ffi::OsString};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -25,17 +25,131 @@ pub struct JsonRpcExchange {
     pub transport: TransportType,
 }
 
-#[derive(Debug, Clone)]
+impl JsonRpcExchange {
+    pub fn is_notification(&self) -> bool {
+        self.request
+            .as_ref()
+            .is_some_and(|request| request.id.is_none() && request.method.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageDirection {
     Request,
     Response,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    JsonLines,
+    ContentLength,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
     Http,
+    HttpBatch,
+    Stdio(Framing),
     #[allow(dead_code)] // Used in tests and UI display
     WebSocket,
+}
+
+impl TransportType {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::HttpBatch => "HTTP-BATCH",
+            Self::Stdio(Framing::JsonLines) => "STDIO/JSONL",
+            Self::Stdio(Framing::ContentLength) => "STDIO/LSP",
+            Self::WebSocket => "WebSocket",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::HttpBatch => "http-batch",
+            Self::Stdio(Framing::JsonLines) => "stdio-json-lines",
+            Self::Stdio(Framing::ContentLength) => "stdio-content-length",
+            Self::WebSocket => "websocket",
+        }
+    }
+}
+
+pub fn json_rpc_messages(
+    body: &serde_json::Value,
+    direction: MessageDirection,
+    transport: TransportType,
+    headers: Option<&HashMap<String, String>>,
+) -> Vec<JsonRpcMessage> {
+    body.as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(body))
+        .iter()
+        .map(|body| json_rpc_message(body, direction, transport, headers))
+        .collect()
+}
+
+pub fn incoming_json_rpc_messages(
+    body: &serde_json::Value,
+    transport: TransportType,
+) -> Vec<JsonRpcMessage> {
+    json_rpc_messages_by_shape(body, transport, None)
+}
+
+pub fn json_rpc_messages_by_shape(
+    body: &serde_json::Value,
+    transport: TransportType,
+    headers: Option<&HashMap<String, String>>,
+) -> Vec<JsonRpcMessage> {
+    body.as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(body))
+        .iter()
+        .map(|body| {
+            let direction = if body.get("method").is_some() {
+                MessageDirection::Request
+            } else {
+                MessageDirection::Response
+            };
+            json_rpc_message(body, direction, transport, headers)
+        })
+        .collect()
+}
+
+fn json_rpc_message(
+    body: &serde_json::Value,
+    direction: MessageDirection,
+    transport: TransportType,
+    headers: Option<&HashMap<String, String>>,
+) -> JsonRpcMessage {
+    let (method, params, result, error) = match direction {
+        MessageDirection::Request => (
+            body.get("method")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            body.get("params").cloned(),
+            None,
+            None,
+        ),
+        MessageDirection::Response => (
+            None,
+            None,
+            body.get("result").cloned(),
+            body.get("error").cloned(),
+        ),
+    };
+    JsonRpcMessage {
+        id: body.get("id").cloned(),
+        method,
+        params,
+        result,
+        error,
+        timestamp: std::time::SystemTime::now(),
+        direction,
+        transport,
+        headers: headers.cloned(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,7 +184,7 @@ pub enum Overlay {
     Sessions,
 }
 
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
     pub id: String,
@@ -758,15 +872,26 @@ pub struct OutboundRequest {
     pub body: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ProxyConfig {
     pub listen_port: u16,
     pub target_url: String,
     pub transport: TransportType,
+    pub stdio: Option<StdioConfig>,
+    pub transparent: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StdioConfig {
+    pub command: Vec<OsString>,
+    pub framing: Framing,
 }
 
 fn exchange_status(exchange: &JsonRpcExchange) -> &'static str {
+    if exchange.is_notification() {
+        return "Notification";
+    }
     match &exchange.response {
         None => "Pending",
         Some(response) if response.error.is_some() => "Error",
@@ -775,10 +900,7 @@ fn exchange_status(exchange: &JsonRpcExchange) -> &'static str {
 }
 
 fn transport_name(transport: &TransportType) -> &'static str {
-    match transport {
-        TransportType::Http => "HTTP",
-        TransportType::WebSocket => "WebSocket",
-    }
+    transport.label()
 }
 
 fn display_id(id: Option<&serde_json::Value>) -> String {
@@ -912,6 +1034,8 @@ impl App {
                 listen_port: 8080,
                 target_url: "".to_string(),
                 transport: TransportType::Http,
+                stdio: None,
+                transparent: false,
             },
             is_running: true,
             message_receiver: None,
@@ -1062,17 +1186,16 @@ impl App {
                     request: Some(message.clone()),
                     response: None,
                     timestamp: message.timestamp,
-                    transport: message.transport.clone(),
+                    transport: message.transport,
                 };
                 self.exchanges.push(exchange);
             }
             MessageDirection::Response => {
                 // Find matching request by ID and add response
-                if let Some(exchange) = self
-                    .exchanges
-                    .iter_mut()
-                    .rev()
-                    .find(|e| e.id == message.id && e.response.is_none())
+                if let Some(exchange) =
+                    self.exchanges.iter_mut().rev().find(|e| {
+                        !e.is_notification() && e.id == message.id && e.response.is_none()
+                    })
                 {
                     exchange.response = Some(message);
                 } else {
@@ -1083,7 +1206,7 @@ impl App {
                         request: None,
                         response: Some(message.clone()),
                         timestamp: message.timestamp,
-                        transport: message.transport.clone(),
+                        transport: message.transport,
                     };
                     self.exchanges.push(exchange);
                 }
@@ -1556,9 +1679,14 @@ impl App {
             AppMode::Paused => "Paused".to_string(),
             AppMode::Intercepting => format!("Intercepting ({})", self.pending_requests.len()),
         };
+        let data_plane = if self.proxy_config.transparent {
+            "Stdio".to_string()
+        } else {
+            format!("HTTP port {}", self.proxy_config.listen_port)
+        };
         format!(
-            "# Status\n\n- State: {state}\n- Proxy port: {}\n- Control port: {}\n- Mode: {mode}",
-            self.proxy_config.listen_port, self.control_port
+            "# Status\n\n- State: {state}\n- Data plane: {data_plane}\n- Control port: {}\n- Mode: {mode}",
+            self.control_port
         )
     }
 
@@ -1779,6 +1907,11 @@ impl App {
     // Get content lines for proper scrolling calculations
     // Target editing methods
     pub fn start_editing_target(&mut self) {
+        if self.proxy_config.stdio.is_some() {
+            self.notice = Some("The stdio command is configured at startup".to_string());
+            self.mark_changed();
+            return;
+        }
         self.input_mode = InputMode::EditingTarget;
         self.input_buffer = self.proxy_config.target_url.clone();
     }
@@ -2346,17 +2479,24 @@ impl App {
         if !self.is_running {
             return Err("Proxy is stopped. Press Ctrl-B x to start it.".to_string());
         }
+        if self.proxy_config.transparent {
+            return Err("Transparent wrappers receive requests from stdin".to_string());
+        }
 
         let parsed: serde_json::Value =
             serde_json::from_str(&request_json).map_err(|e| format!("Invalid JSON: {}", e))?;
 
-        // Validate it's a proper JSON-RPC request
-        if parsed.get("jsonrpc") != Some(&serde_json::Value::String("2.0".to_string())) {
-            return Err("Missing or invalid 'jsonrpc' field".to_string());
-        }
-
-        if parsed.get("method").is_none() {
-            return Err("Missing 'method' field".to_string());
+        match &parsed {
+            serde_json::Value::Array(requests) => {
+                if requests.is_empty() {
+                    return Err("Batch request cannot be empty".to_string());
+                }
+                for (index, request) in requests.iter().enumerate() {
+                    validate_json_rpc_message(request, self.proxy_config.stdio.is_some())
+                        .map_err(|error| format!("Batch item {}: {error}", index + 1))?;
+                }
+            }
+            request => validate_json_rpc_message(request, self.proxy_config.stdio.is_some())?,
         }
 
         // Check if target URL is empty
@@ -2377,6 +2517,25 @@ impl App {
             body: request_json,
         })
     }
+}
+
+fn validate_json_rpc_message(
+    request: &serde_json::Value,
+    allow_response: bool,
+) -> Result<(), String> {
+    if request.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Err("Missing or invalid 'jsonrpc' field".to_string());
+    }
+    if request.get("method").is_some() {
+        return Ok(());
+    }
+    if allow_response
+        && request.get("id").is_some()
+        && (request.get("result").is_some() || request.get("error").is_some())
+    {
+        return Ok(());
+    }
+    Err("Missing 'method' field".to_string())
 }
 
 pub async fn send_new_request(request: OutboundRequest) -> Result<serde_json::Value, String> {

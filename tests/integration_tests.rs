@@ -14,6 +14,8 @@ fn skill_flag_prints_the_bundled_agent_skill() {
     let stdout = String::from_utf8(output.stdout).expect("skill should be UTF-8");
     assert!(stdout.starts_with("---\nname: jsonrpc-debugger\n"));
     assert!(stdout.contains("debugger.getState"));
+    assert!(stdout.contains("getState.dataPlane"));
+    assert!(stdout.contains("transparent stdio wrapper"));
     assert!(output.stderr.is_empty());
 }
 

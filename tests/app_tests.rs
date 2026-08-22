@@ -44,6 +44,24 @@ fn test_add_message() {
 }
 
 #[test]
+fn idless_requests_are_notifications() {
+    let mut app = App::new();
+    app.add_message(JsonRpcMessage {
+        id: None,
+        method: Some("example_changed".to_string()),
+        params: Some(serde_json::json!({})),
+        result: None,
+        error: None,
+        timestamp: std::time::SystemTime::now(),
+        direction: MessageDirection::Request,
+        transport: TransportType::Http,
+        headers: None,
+    });
+
+    assert!(app.exchanges[0].is_notification());
+}
+
+#[test]
 fn test_navigation() {
     let mut app = App::new();
 
@@ -263,6 +281,8 @@ fn test_proxy_config() {
         listen_port: 9090,
         target_url: "https://example.com".to_string(),
         transport: TransportType::Http,
+        stdio: None,
+        transparent: false,
     };
 
     assert_eq!(config.listen_port, 9090);
@@ -584,6 +604,48 @@ fn new_requests_are_validated_before_background_send() {
     assert_eq!(request.url, "http://localhost:8090");
 
     assert!(app.prepare_new_request("{}".to_string()).is_err());
+}
+
+#[test]
+fn batch_new_requests_are_validated_before_background_send() {
+    let mut app = App::new();
+    app.proxy_config.target_url = "http://localhost:8090".to_string();
+    let body = r#"[
+        {"jsonrpc":"2.0","method":"example_first","params":[],"id":1},
+        {"jsonrpc":"2.0","method":"example_second","params":[],"id":2}
+    ]"#
+    .to_string();
+
+    let request = app.prepare_new_request(body.clone()).unwrap();
+
+    assert_eq!(request.url, "http://localhost:8080");
+    assert_eq!(request.body, body);
+    assert_eq!(
+        app.prepare_new_request("[]".to_string()).unwrap_err(),
+        "Batch request cannot be empty"
+    );
+    assert_eq!(
+        app.prepare_new_request(
+            r#"[{"jsonrpc":"2.0","method":"example_first"},{"jsonrpc":"2.0"}]"#.to_string()
+        )
+        .unwrap_err(),
+        "Batch item 2: Missing 'method' field"
+    );
+}
+
+#[test]
+fn stdio_accepts_responses_to_server_requests() {
+    let mut app = App::new();
+    app.proxy_config.target_url = "example-server".to_string();
+    app.proxy_config.transport = TransportType::Stdio(Framing::JsonLines);
+    app.proxy_config.stdio = Some(StdioConfig {
+        command: vec!["example-server".into()],
+        framing: Framing::JsonLines,
+    });
+
+    assert!(app
+        .prepare_new_request(r#"{"jsonrpc":"2.0","id":9,"result":{}}"#.to_string())
+        .is_ok());
 }
 
 #[test]

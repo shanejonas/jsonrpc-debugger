@@ -1,6 +1,6 @@
 [package]
 name = "jsonrpc-debugger"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["Shane Jonas <shane@shanejonas.com>"]
 description = "A terminal-based JSON-RPC debugger with interception capabilities"
@@ -32,3 +32,6 @@ warp = "0.3"
 uuid = { version = "1.17.0", features = ["v4"] }
 flate2 = "1.0"
 rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.40", features = ["hooks"] }

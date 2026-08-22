@@ -1,6 +1,7 @@
 use jsonrpc_debugger::app::*;
 use jsonrpc_debugger::proxy::ProxyServer;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use tokio::sync::mpsc;
 
 #[tokio::test]
@@ -22,6 +23,65 @@ async fn proxy_bind_rejects_an_occupied_port() {
     let proxy = ProxyServer::new(port, "http://localhost:8090".to_string(), sender);
 
     assert!(proxy.bind().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_target_round_trips_through_the_http_frontend() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let (message_sender, mut message_receiver) = mpsc::unbounded_channel();
+    let script = concat!(
+        "while IFS= read -r line; do ",
+        "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"example/changed\"}'; ",
+        "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":\"ok\"}'; ",
+        "done"
+    );
+    let config = ProxyConfig {
+        listen_port: port,
+        target_url: "sh test server".to_string(),
+        transport: TransportType::Stdio(Framing::JsonLines),
+        stdio: Some(StdioConfig {
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(script),
+            ],
+            framing: Framing::JsonLines,
+        }),
+        transparent: false,
+    };
+    let proxy = ProxyServer::from_config(&config, message_sender).unwrap();
+    let server = tokio::spawn(proxy.bind().unwrap());
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}"))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "example/run"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(response["result"], "ok");
+
+    let request = message_receiver.recv().await.unwrap();
+    let notification = message_receiver.recv().await.unwrap();
+    let response = message_receiver.recv().await.unwrap();
+    assert_eq!(request.method.as_deref(), Some("example/run"));
+    assert_eq!(notification.method.as_deref(), Some("example/changed"));
+    assert_eq!(response.result, Some(serde_json::json!("ok")));
+    assert!(matches!(
+        response.transport,
+        TransportType::Stdio(Framing::JsonLines)
+    ));
+
+    server.abort();
 }
 
 #[tokio::test]

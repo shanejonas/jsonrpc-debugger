@@ -283,28 +283,36 @@ impl HistoryStore {
         Ok(rows)
     }
 
-    pub fn record_message(
+    pub fn record_messages(
         &mut self,
         active_session_id: &str,
-        message: &JsonRpcMessage,
-    ) -> Result<String> {
-        let transaction = self.connection.transaction()?;
-        let session_id = match message.direction {
-            MessageDirection::Request => active_session_id.to_string(),
-            MessageDirection::Response => pending_session(&transaction, message)?
-                .unwrap_or_else(|| active_session_id.to_string()),
-        };
-
-        match message.direction {
-            MessageDirection::Request => insert_message(&transaction, &session_id, message)?,
-            MessageDirection::Response => update_response(&transaction, &session_id, message)?,
+        messages: &[JsonRpcMessage],
+    ) -> Result<Vec<String>> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
         }
-        transaction.execute(
-            "UPDATE sessions SET updated_at_ms = ?2 WHERE id = ?1",
-            params![session_id, database_timestamp_ms(message.timestamp)],
-        )?;
+
+        let transaction = self.connection.transaction()?;
+        let mut session_ids = Vec::with_capacity(messages.len());
+        for message in messages {
+            let session_id = match message.direction {
+                MessageDirection::Request => active_session_id.to_string(),
+                MessageDirection::Response => pending_session(&transaction, message)?
+                    .unwrap_or_else(|| active_session_id.to_string()),
+            };
+
+            match message.direction {
+                MessageDirection::Request => insert_message(&transaction, &session_id, message)?,
+                MessageDirection::Response => update_response(&transaction, &session_id, message)?,
+            }
+            transaction.execute(
+                "UPDATE sessions SET updated_at_ms = ?2 WHERE id = ?1",
+                params![session_id, database_timestamp_ms(message.timestamp)],
+            )?;
+            session_ids.push(session_id);
+        }
         transaction.commit()?;
-        Ok(session_id)
+        Ok(session_ids)
     }
 
     pub fn append_exchanges(
@@ -458,7 +466,7 @@ fn insert_message(
         request: Some(message.clone()),
         response: None,
         timestamp: message.timestamp,
-        transport: message.transport.clone(),
+        transport: message.transport,
     };
     let sequence = next_sequence(transaction, session_id)?;
     insert_exchange(transaction, session_id, sequence, &exchange)
@@ -488,7 +496,7 @@ fn update_response(
             request: None,
             response: Some(message.clone()),
             timestamp: message.timestamp,
-            transport: message.transport.clone(),
+            transport: message.transport,
         };
         let sequence = next_sequence(transaction, session_id)?;
         return insert_exchange(transaction, session_id, sequence, &exchange);
@@ -533,7 +541,7 @@ fn insert_exchange(
                 .transpose()?
                 .unwrap_or_else(|| "null".to_string()),
             exchange.method,
-            i64::from(exchange.response.is_some()),
+            i64::from(exchange.response.is_some() || exchange.is_notification()),
             serde_json::to_string(&value)?,
         ],
     )?;
@@ -608,6 +616,10 @@ mod tests {
     use super::*;
     use crate::app::TransportType;
     use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn request(id: u64) -> JsonRpcMessage {
         JsonRpcMessage {
@@ -650,13 +662,58 @@ mod tests {
         }
     }
 
+    fn count_commits(store: &HistoryStore) -> Arc<AtomicUsize> {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&commits);
+        store
+            .connection
+            .commit_hook(Some(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                false
+            }))
+            .unwrap();
+        commits
+    }
+
+    #[test]
+    fn recording_request_and_response_separately_commits_twice() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store.create_session(Some("chain"), "http://node").unwrap();
+        let commits = count_commits(&store);
+
+        store.record_messages(&session.id, &[request(1)]).unwrap();
+        store.record_messages(&session.id, &[response(1)]).unwrap();
+
+        assert_eq!(commits.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn recording_request_and_response_together_commits_once() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store.create_session(Some("chain"), "http://node").unwrap();
+        let commits = count_commits(&store);
+
+        let recorded_sessions = store
+            .record_messages(
+                &session.id,
+                &[request(1), request(2), response(2), response(1)],
+            )
+            .unwrap();
+
+        assert_eq!(recorded_sessions, vec![session.id.clone(); 4]);
+        assert_eq!(commits.load(Ordering::Relaxed), 1);
+        let exchanges = store.load_session(&session.id).unwrap().1;
+        assert_eq!(exchanges.len(), 2);
+        assert!(exchanges.iter().all(|exchange| exchange.response.is_some()));
+    }
+
     #[test]
     fn records_and_pages_session_history() {
         let mut store = HistoryStore::in_memory().unwrap();
         let session = store.create_session(Some("chain"), "http://node").unwrap();
         for id in 1..=3 {
-            store.record_message(&session.id, &request(id)).unwrap();
-            store.record_message(&session.id, &response(id)).unwrap();
+            store.record_messages(&session.id, &[request(id)]).unwrap();
+            store.record_messages(&session.id, &[response(id)]).unwrap();
         }
 
         let recent = store.history(&session.id, 2, None).unwrap();
@@ -678,15 +735,32 @@ mod tests {
         let mut store = HistoryStore::in_memory().unwrap();
         let first = store.create_session(Some("first"), "").unwrap();
         let second = store.create_session(Some("second"), "").unwrap();
-        store.record_message(&first.id, &request(1)).unwrap();
+        store.record_messages(&first.id, &[request(1)]).unwrap();
 
-        let recorded_session = store.record_message(&second.id, &response(1)).unwrap();
+        let recorded_sessions = store
+            .record_messages(&second.id, &[request(2), response(1)])
+            .unwrap();
 
-        assert_eq!(recorded_session, first.id);
+        assert_eq!(recorded_sessions, vec![second.id.clone(), first.id.clone()]);
         assert!(store.load_session(&first.id).unwrap().1[0]
             .response
             .is_some());
-        assert!(store.load_session(&second.id).unwrap().1.is_empty());
+        assert!(store.load_session(&second.id).unwrap().1[0]
+            .response
+            .is_none());
+    }
+
+    #[test]
+    fn notifications_are_complete_exchanges() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store.create_session(Some("notifications"), "").unwrap();
+        let mut notification = request(1);
+        notification.id = None;
+        store.record_messages(&session.id, &[notification]).unwrap();
+
+        let exchanges = store.load_session(&session.id).unwrap().1;
+        assert_eq!(exchanges.len(), 1);
+        assert!(exchanges[0].is_notification());
     }
 
     #[test]
@@ -696,7 +770,9 @@ mod tests {
         let session_id = {
             let mut store = HistoryStore::open(&path).unwrap();
             let session = store.create_session(Some("saved"), "http://node").unwrap();
-            store.record_message(&session.id, &request(1)).unwrap();
+            store
+                .record_messages(&session.id, &[request(1), response(1)])
+                .unwrap();
             store
                 .add_annotation(&session.id, &annotation("saved-note", 0))
                 .unwrap();
@@ -704,7 +780,9 @@ mod tests {
         };
 
         let store = HistoryStore::open(&path).unwrap();
-        assert_eq!(store.load_session(&session_id).unwrap().1.len(), 1);
+        let exchanges = store.load_session(&session_id).unwrap().1;
+        assert_eq!(exchanges.len(), 1);
+        assert!(exchanges[0].response.is_some());
         assert_eq!(
             store.load_session(&session_id).unwrap().2[0].id,
             "saved-note"

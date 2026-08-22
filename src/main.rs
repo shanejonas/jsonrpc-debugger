@@ -1,6 +1,6 @@
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -10,6 +10,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::ffi::OsString;
 use std::io;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -18,9 +19,11 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 mod app;
+mod attach;
 mod control;
 mod history;
 mod proxy;
+mod stdio;
 mod ui;
 
 use app::{
@@ -36,9 +39,9 @@ const AGENT_SKILL: &str = include_str!("../skills/jsonrpc-debugger/SKILL.md");
 
 #[derive(Parser)]
 #[command(name = "jsonrpc-debugger", version)]
-#[command(about = "A JSON-RPC debugger TUI for intercepting and inspecting requests")]
+#[command(about = "A JSON-RPC debugger for intercepting and inspecting requests")]
 struct Cli {
-    /// Port to listen on for incoming requests
+    /// HTTP proxy port in driver mode
     #[arg(short, long, default_value = "8080")]
     port: u16,
 
@@ -46,13 +49,63 @@ struct Cli {
     #[arg(short, long)]
     target: Option<String>,
 
-    /// Port for the local JSON-RPC control plane (defaults to proxy port + 1)
+    /// Local JSON-RPC control port (defaults to the proxy port plus one)
     #[arg(long)]
     control_port: Option<u16>,
 
     /// Print agent instructions and exit
     #[arg(long)]
     skill: bool,
+
+    #[command(subcommand)]
+    mode: Option<TargetMode>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TargetMode {
+    /// Drive a spawned JSON-RPC server through a local HTTP proxy
+    Stdio {
+        /// Message framing used on stdin and stdout
+        #[arg(long, value_enum, default_value = "json-lines")]
+        framing: CliFraming,
+
+        /// Server command and arguments
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+
+    /// Transparently wrap a JSON-RPC server over matching standard streams
+    Wrap {
+        /// Message framing used on stdin and stdout
+        #[arg(long, value_enum, default_value = "json-lines")]
+        framing: CliFraming,
+
+        /// Server command and arguments
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+
+    /// Attach a read-only TUI to a transparent wrapper
+    Attach {
+        /// Wrapper control-plane URL
+        #[arg(default_value = "http://127.0.0.1:8081")]
+        control_url: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliFraming {
+    JsonLines,
+    ContentLength,
+}
+
+impl From<CliFraming> for app::Framing {
+    fn from(framing: CliFraming) -> Self {
+        match framing {
+            CliFraming::JsonLines => Self::JsonLines,
+            CliFraming::ContentLength => Self::ContentLength,
+        }
+    }
 }
 
 fn copy_to_clipboard(
@@ -553,7 +606,11 @@ async fn handle_control_command(
         }
         ControlAction::SetTarget { url } => {
             let url = url.trim();
-            if url.is_empty() {
+            if app.proxy_config.stdio.is_some() {
+                Err(ControlError::invalid_params(
+                    "stdio commands are configured at startup",
+                ))
+            } else if url.is_empty() {
                 Err(ControlError::invalid_params("url cannot be empty"))
             } else {
                 let changed = app.proxy_config.target_url != url;
@@ -586,6 +643,12 @@ async fn handle_control_command(
             Ok(control::state(app))
         }
         ControlAction::SetPaused { paused } => {
+            if app.proxy_config.transparent {
+                let _ = reply.send(Err(ControlError::invalid_params(
+                    "transparent wrappers cannot pause the external client yet",
+                )));
+                return;
+            }
             if paused {
                 app.clear_line_selection();
             }
@@ -853,6 +916,11 @@ fn select_session(app: &mut App, history: &HistoryStore, id: &str) -> Result<boo
     let (session, exchanges, annotations) = history
         .load_session(id)
         .map_err(|error| ControlError::runtime(error.to_string()))?;
+    if app.proxy_config.stdio.is_some() && session.target != app.proxy_config.target_url {
+        return Err(ControlError::invalid_params(
+            "Cannot switch a stdio process to a session from another target",
+        ));
+    }
     let target_changed = app.proxy_config.target_url != session.target;
     app.proxy_config.target_url = session.target.clone();
     app.activate_session(session, exchanges, annotations);
@@ -942,11 +1010,58 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    match &cli.mode {
+        Some(TargetMode::Wrap { framing, command }) => {
+            if cli.target.is_some() {
+                anyhow::bail!("--target cannot be used with the wrap subcommand");
+            }
+            let control_port = cli
+                .control_port
+                .or_else(|| cli.port.checked_add(1))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--control-port is required when --port is 65535")
+                })?;
+            return run_transparent_wrap(control_port, (*framing).into(), command).await;
+        }
+        Some(TargetMode::Attach { control_url }) => {
+            if cli.target.is_some() {
+                anyhow::bail!("--target cannot be used with the attach subcommand");
+            }
+            return run_attached_tui(control_url).await;
+        }
+        Some(TargetMode::Stdio { .. }) | None => {}
+    }
+
     let control_port = cli
         .control_port
         .or_else(|| cli.port.checked_add(1))
         .ok_or_else(|| anyhow::anyhow!("--control-port is required when --port is 65535"))?;
-    let target = cli.target.unwrap_or_default();
+    let (target, transport, stdio) = match cli.mode {
+        Some(TargetMode::Stdio { framing, command }) => {
+            if cli.target.is_some() {
+                anyhow::bail!("--target cannot be used with the stdio subcommand");
+            }
+            let framing = app::Framing::from(framing);
+            (
+                stdio::display_command(&command),
+                app::TransportType::Stdio(framing),
+                Some(app::StdioConfig { command, framing }),
+            )
+        }
+        None => (
+            cli.target.unwrap_or_default(),
+            app::TransportType::Http,
+            None,
+        ),
+        Some(TargetMode::Wrap { .. } | TargetMode::Attach { .. }) => unreachable!(),
+    };
+    let proxy_config = app::ProxyConfig {
+        listen_port: cli.port,
+        target_url: target.clone(),
+        transport,
+        stdio,
+        transparent: false,
+    };
 
     // Create message channel for proxy communication
     let (message_sender, message_receiver) = mpsc::unbounded_channel();
@@ -966,7 +1081,7 @@ async fn main() -> Result<()> {
 
     // Bind both ports before entering the TUI. A second debugger must not send through
     // or expose the control plane of an older process that owns the same ports.
-    let initial_server = ProxyServer::new(cli.port, target.clone(), message_sender.clone())
+    let initial_server = ProxyServer::from_config(&proxy_config, message_sender.clone())?
         .with_state(proxy_state.clone());
     let initial_proxy_server = initial_server.bind()?;
     let control_server = control::bind(control_port, control_sender).map_err(anyhow::Error::msg)?;
@@ -991,9 +1106,8 @@ async fn main() -> Result<()> {
     let mut app = App::new_with_receiver(message_receiver);
 
     // Override default config with CLI arguments
-    app.proxy_config.listen_port = cli.port;
+    app.proxy_config = proxy_config;
     app.control_port = control_port;
-    app.proxy_config.target_url = target;
     app.activate_session(session, Vec::new(), Vec::new());
 
     let (request_result_sender, request_result_receiver) = mpsc::unbounded_channel();
@@ -1028,6 +1142,283 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_transparent_wrap(
+    control_port: u16,
+    framing: app::Framing,
+    command: &[OsString],
+) -> Result<()> {
+    let target = stdio::display_command(command);
+    let (message_sender, message_receiver) = mpsc::unbounded_channel();
+    let (_pending_sender, pending_receiver) = mpsc::unbounded_channel();
+    let (control_sender, control_receiver) = mpsc::unbounded_channel();
+    let shared_app_mode = Arc::new(Mutex::new(AppMode::Normal));
+    let (pending_sender, _pending_messages) = mpsc::unbounded_channel();
+    let proxy_state = ProxyState {
+        app_mode: shared_app_mode.clone(),
+        pending_sender,
+    };
+    let control_server = control::bind(control_port, control_sender).map_err(anyhow::Error::msg)?;
+    let control_server = tokio::spawn(async move {
+        control_server.await;
+        Ok(())
+    });
+
+    let mut history = HistoryStore::open_default()?;
+    let session = history.create_session(None, &target)?;
+    let mut app = App::new_with_receiver(message_receiver);
+    app.proxy_config = app::ProxyConfig {
+        listen_port: 0,
+        target_url: target,
+        transport: app::TransportType::Stdio(framing),
+        stdio: Some(app::StdioConfig {
+            command: command.to_vec(),
+            framing,
+        }),
+        transparent: true,
+    };
+    app.control_port = control_port;
+    app.activate_session(session, Vec::new(), Vec::new());
+
+    let (request_result_sender, request_result_receiver) = mpsc::unbounded_channel();
+    let mut runtime = Runtime {
+        history,
+        message_sender: message_sender.clone(),
+        shared_app_mode,
+        pending_receiver,
+        control_receiver,
+        proxy_state,
+        proxy_server: None,
+        control_server: Some(control_server),
+        request_result_sender,
+        request_result_receiver,
+        change_waiters: Vec::new(),
+    };
+    let relay_command = command.to_vec();
+    let mut relay =
+        tokio::spawn(async move { stdio::wrap(&relay_command, framing, message_sender).await });
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    loop {
+        record_new_messages(&mut app, &mut runtime.history);
+        while let Ok(command) = runtime.control_receiver.try_recv() {
+            let Some(command) = register_change_waiter(&app, command, &mut runtime.change_waiters)
+            else {
+                continue;
+            };
+            handle_control_command(
+                &mut app,
+                command,
+                ControlContext {
+                    terminal_area: ratatui::layout::Rect::new(0, 0, 120, 40),
+                    proxy_server: &mut runtime.proxy_server,
+                    message_sender: &runtime.message_sender,
+                    proxy_state: &runtime.proxy_state,
+                    request_result_sender: &runtime.request_result_sender,
+                    history: &mut runtime.history,
+                },
+            )
+            .await;
+        }
+        resolve_change_waiters(&app, &mut runtime.change_waiters);
+
+        if relay.is_finished() {
+            let result = (&mut relay)
+                .await
+                .map_err(|error| anyhow::anyhow!("wrapper task failed: {error}"))?;
+            record_new_messages(&mut app, &mut runtime.history);
+            if let Some(control_server) = runtime.control_server.take() {
+                control_server.abort();
+            }
+            return result.map_err(anyhow::Error::msg);
+        }
+        if runtime
+            .control_server
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            relay.abort();
+            anyhow::bail!("control plane stopped");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            result = &mut shutdown => {
+                result?;
+                relay.abort();
+                let _ = relay.await;
+                if let Some(control_server) = runtime.control_server.take() {
+                    control_server.abort();
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn run_attached_tui(control_url: &str) -> Result<()> {
+    let client = attach::ControlClient::new(control_url.to_string());
+    let state = client.state().await.map_err(anyhow::Error::msg)?;
+    let mut revision = state.revision;
+    let mut app = App::new();
+    client
+        .snapshot(state)
+        .await
+        .map_err(anyhow::Error::msg)?
+        .apply(&mut app)
+        .map_err(anyhow::Error::msg)?;
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let result = run_attached_app(&mut terminal, &client, &mut app, &mut revision).await;
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    result
+}
+
+async fn run_attached_app(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    client: &attach::ControlClient,
+    app: &mut App,
+    revision: &mut u64,
+) -> Result<()> {
+    let mut last_refresh = Instant::now();
+    loop {
+        if last_refresh.elapsed() >= std::time::Duration::from_millis(100) {
+            match client.state().await {
+                Ok(state) if state.revision != *revision => {
+                    let next_revision = state.revision;
+                    match client.snapshot(state).await {
+                        Ok(snapshot) => {
+                            if let Err(error) = snapshot.apply(app) {
+                                app.notice = Some(format!("Error: {error}"));
+                            } else {
+                                *revision = next_revision;
+                            }
+                        }
+                        Err(error) => app.notice = Some(format!("Error: {error}")),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => app.notice = Some(format!("Error: {error}")),
+            }
+            last_refresh = Instant::now();
+        }
+
+        terminal.draw(|frame| ui::draw(frame, app))?;
+        if !event::poll(std::time::Duration::from_millis(50))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if app.overlay == Overlay::Prefix {
+                app.close_overlay();
+            } else {
+                app.show_prefix();
+            }
+            continue;
+        }
+        if app.overlay == Overlay::Prefix {
+            match key.code {
+                KeyCode::Char('?') => app.show_help(),
+                KeyCode::Char('z') => app.set_panel_fullscreen(!app.panel_fullscreen),
+                KeyCode::Char('y') => copy_focused_panel(terminal, app)?,
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Esc => app.close_overlay(),
+                _ => {}
+            }
+            continue;
+        }
+        if app.overlay == Overlay::Help {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                app.close_overlay();
+            }
+            continue;
+        }
+        if app.input_mode == app::InputMode::FilteringRequests {
+            match key.code {
+                KeyCode::Enter => app.apply_filter(),
+                KeyCode::Esc => app.cancel_filtering(),
+                KeyCode::Backspace => app.handle_backspace(),
+                KeyCode::Char(character) => app.handle_input_char(character),
+                _ => {}
+            }
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Esc => app.clear_line_selection(),
+            KeyCode::Enter => {
+                if !enter_request_list(app) {
+                    copy_focused_panel(terminal, app)?;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if app.is_message_list_focused() {
+                    app.select_previous();
+                } else {
+                    move_focused_detail_cursor(app, -1, terminal.size()?);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if app.is_message_list_focused() {
+                    app.select_next();
+                } else {
+                    move_focused_detail_cursor(app, 1, terminal.size()?);
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if app.is_request_section_focused() {
+                    app.previous_request_tab();
+                } else if app.is_response_section_focused() {
+                    app.previous_response_tab();
+                } else if app.is_message_list_focused() {
+                    app.select_previous();
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if app.is_request_section_focused() {
+                    app.next_request_tab();
+                } else if app.is_response_section_focused() {
+                    app.next_response_tab();
+                } else if app.is_message_list_focused() {
+                    app.select_next();
+                }
+            }
+            KeyCode::Tab => app.switch_focus(),
+            KeyCode::BackTab => app.switch_focus_reverse(),
+            KeyCode::Char('u') => {
+                move_focused_detail_cursor(app, -10, terminal.size()?);
+            }
+            KeyCode::Char('d') => {
+                move_focused_detail_cursor(app, 10, terminal.size()?);
+            }
+            KeyCode::Char('g') => {
+                move_focused_detail_cursor(app, i64::MIN, terminal.size()?);
+            }
+            KeyCode::Char('G') => {
+                move_focused_detail_cursor(app, i64::MAX, terminal.size()?);
+            }
+            KeyCode::Char('/') => app.start_filtering_requests(),
+            KeyCode::Char('v') => toggle_visual_selection(app),
+            _ => {}
+        }
+    }
+}
+
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut app: App,
@@ -1037,23 +1428,7 @@ async fn run_app(
 
     loop {
         // Check for new messages from proxy
-        let messages = app.take_new_messages();
-        let received_messages = !messages.is_empty();
-        for message in messages {
-            let active_session_id = app
-                .session
-                .as_ref()
-                .map(|session| session.id.as_str())
-                .unwrap_or_default();
-            match runtime.history.record_message(active_session_id, &message) {
-                Ok(session_id) if session_id == active_session_id => app.add_message(message),
-                Ok(_) => {}
-                Err(error) => {
-                    app.notice = Some(format!("Error: save history: {error}"));
-                    app.add_message(message);
-                }
-            }
-        }
+        let received_messages = record_new_messages(&mut app, &mut runtime.history);
 
         // Sync app mode with shared state
         if let Ok(mut shared_mode) = runtime.shared_app_mode.try_lock() {
@@ -1695,6 +2070,35 @@ async fn run_app(
     }
 }
 
+fn record_new_messages(app: &mut App, history: &mut HistoryStore) -> bool {
+    let messages = app.take_new_messages();
+    if messages.is_empty() {
+        return false;
+    }
+
+    let active_session_id = app
+        .session
+        .as_ref()
+        .map(|session| session.id.clone())
+        .unwrap_or_default();
+    match history.record_messages(&active_session_id, &messages) {
+        Ok(session_ids) => {
+            for (message, session_id) in messages.into_iter().zip(session_ids) {
+                if session_id == active_session_id {
+                    app.add_message(message);
+                }
+            }
+        }
+        Err(error) => {
+            app.notice = Some(format!("Error: save history: {error}"));
+            for message in messages {
+                app.add_message(message);
+            }
+        }
+    }
+    true
+}
+
 async fn handle_overlay_key(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
@@ -2178,14 +2582,16 @@ async fn restart_proxy(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    let server = ProxyServer::new(
-        app.proxy_config.listen_port,
-        app.proxy_config.target_url.clone(),
-        message_sender.clone(),
-    )
-    .with_state(proxy_state.clone());
+    let config = app.proxy_config.clone();
+    let sender = message_sender.clone();
+    let state = proxy_state.clone();
     *proxy_server = Some(tokio::spawn(async move {
-        let _ = server.start().await;
+        match ProxyServer::from_config(&config, sender) {
+            Ok(server) => {
+                let _ = server.with_state(state).start().await;
+            }
+            Err(error) => eprintln!("Proxy server error: {error}"),
+        }
     }));
 }
 
@@ -2203,16 +2609,20 @@ async fn set_proxy_running(
     if should_run {
         app.toggle_proxy();
 
-        let listen_port = app.proxy_config.listen_port;
-        let target_url = app.proxy_config.target_url.clone();
+        let config = app.proxy_config.clone();
         let sender_clone = message_sender.clone();
         let state_clone = proxy_state.clone();
 
         *proxy_server = Some(tokio::spawn(async move {
-            let server =
-                ProxyServer::new(listen_port, target_url, sender_clone).with_state(state_clone);
-            if let Err(e) = server.start().await {
-                eprintln!("Proxy server error: {}", e);
+            match ProxyServer::from_config(&config, sender_clone) {
+                Ok(server) => {
+                    if let Err(error) = server.with_state(state_clone).start().await {
+                        eprintln!("Proxy server error: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Proxy server error: {error}");
+                }
             }
         }));
     } else {
@@ -2230,8 +2640,114 @@ async fn set_proxy_running(
 mod tests {
     use super::*;
 
+    #[test]
+    fn parses_stdio_command_and_framing() {
+        let cli = Cli::try_parse_from([
+            "jsonrpc-debugger",
+            "stdio",
+            "--framing",
+            "content-length",
+            "--",
+            "rust-analyzer",
+            "--stdio",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.mode,
+            Some(TargetMode::Stdio {
+                framing: CliFraming::ContentLength,
+                command,
+            }) if command == [OsString::from("rust-analyzer"), OsString::from("--stdio")]
+        ));
+    }
+
+    #[test]
+    fn parses_transparent_wrap_command() {
+        let cli = Cli::try_parse_from([
+            "jsonrpc-debugger",
+            "wrap",
+            "--framing",
+            "content-length",
+            "--",
+            "gopls",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.mode,
+            Some(TargetMode::Wrap {
+                framing: CliFraming::ContentLength,
+                command,
+            }) if command == [OsString::from("gopls")]
+        ));
+    }
+
+    #[test]
+    fn parses_attach_control_url() {
+        let cli =
+            Cli::try_parse_from(["jsonrpc-debugger", "attach", "http://127.0.0.1:8096"]).unwrap();
+
+        assert!(matches!(
+            cli.mode,
+            Some(TargetMode::Attach { control_url })
+                if control_url == "http://127.0.0.1:8096"
+        ));
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn rpc_message(id: u64, direction: app::MessageDirection) -> app::JsonRpcMessage {
+        let is_request = matches!(direction, app::MessageDirection::Request);
+        app::JsonRpcMessage {
+            id: Some(serde_json::json!(id)),
+            method: is_request.then(|| format!("method_{id}")),
+            params: is_request.then(|| serde_json::json!([])),
+            result: (!is_request).then(|| serde_json::json!(id)),
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction,
+            transport: app::TransportType::Http,
+            headers: None,
+        }
+    }
+
+    #[test]
+    fn records_every_message_from_one_queue_drain_as_one_batch() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut app = App::new_with_receiver(receiver);
+        let mut history = HistoryStore::in_memory().unwrap();
+        let session = history
+            .create_session(Some("batch"), "http://node")
+            .unwrap();
+        app.activate_session(session.clone(), Vec::new(), Vec::new());
+
+        for message in [
+            rpc_message(1, app::MessageDirection::Request),
+            rpc_message(2, app::MessageDirection::Request),
+            rpc_message(2, app::MessageDirection::Response),
+            rpc_message(1, app::MessageDirection::Response),
+        ] {
+            sender.send(message).unwrap();
+        }
+
+        assert!(record_new_messages(&mut app, &mut history));
+        assert!(!record_new_messages(&mut app, &mut history));
+        assert_eq!(app.exchanges.len(), 2);
+        assert!(app
+            .exchanges
+            .iter()
+            .all(|exchange| exchange.response.is_some()));
+        let persisted = history.load_session(&session.id).unwrap().1;
+        assert_eq!(persisted.len(), app.exchanges.len());
+        for (persisted, displayed) in persisted.iter().zip(&app.exchanges) {
+            assert_eq!(persisted.id, displayed.id);
+            assert_eq!(persisted.method, displayed.method);
+            assert!(persisted.request.is_some());
+            assert!(persisted.response.is_some());
+        }
     }
 
     #[test]

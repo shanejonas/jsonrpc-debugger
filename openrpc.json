@@ -101,9 +101,18 @@
     },
     {
       "name": "debugger.sendRequest",
-      "summary": "Send a JSON-RPC request through the debugger and return its response",
+      "summary": "Send a JSON-RPC request through an HTTP data plane and return its response",
       "params": [
-        { "name": "request", "required": true, "schema": { "type": "object" } }
+        {
+          "name": "request",
+          "required": true,
+          "schema": {
+            "oneOf": [
+              { "type": "object" },
+              { "type": "array", "minItems": 1, "items": { "type": "object" } }
+            ]
+          }
+        }
       ],
       "result": { "name": "result", "schema": {} }
     },
@@ -179,7 +188,7 @@
     },
     {
       "name": "debugger.setTarget",
-      "summary": "Set the proxy target URL",
+      "summary": "Set the HTTP proxy target URL",
       "params": [
         { "name": "url", "required": true, "schema": { "type": "string", "minLength": 1 } }
       ],
@@ -195,7 +204,7 @@
     },
     {
       "name": "debugger.setPaused",
-      "summary": "Enable or disable request interception",
+      "summary": "Enable or disable HTTP data-plane interception",
       "params": [
         { "name": "paused", "required": true, "schema": { "type": "boolean" } }
       ],
@@ -254,7 +263,16 @@
         "additionalProperties": false,
         "required": ["transport"],
         "properties": {
-          "transport": { "type": "string", "enum": ["http", "websocket"] },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "http",
+              "http-batch",
+              "stdio-json-lines",
+              "stdio-content-length",
+              "websocket"
+            ]
+          },
           "request": {
             "type": "object",
             "additionalProperties": false,
