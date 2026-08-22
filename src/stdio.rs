@@ -63,10 +63,7 @@ impl Framer {
 
     fn decode_content_length(&mut self) -> Result<Vec<Value>, String> {
         let mut messages = Vec::new();
-        loop {
-            let Some(header_end) = find_bytes(&self.buffer, b"\r\n\r\n") else {
-                break;
-            };
+        while let Some(header_end) = find_bytes(&self.buffer, b"\r\n\r\n") {
             let headers = std::str::from_utf8(&self.buffer[..header_end])
                 .map_err(|error| error.to_string())?;
             let content_length = headers
