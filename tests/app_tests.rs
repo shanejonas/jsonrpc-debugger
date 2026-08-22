@@ -659,6 +659,27 @@ fn session_name_prompts_use_the_shared_input_buffer() {
 }
 
 #[test]
+fn activating_a_session_clears_the_previous_filter() {
+    let mut app = App::new();
+    app.filter_text = "old-filter".to_string();
+
+    app.activate_session(
+        SessionSummary {
+            id: "session".to_string(),
+            name: "Session".to_string(),
+            target: "http://node".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            exchange_count: 0,
+        },
+        Vec::new(),
+        Vec::new(),
+    );
+
+    assert!(app.filter_text.is_empty());
+}
+
+#[test]
 fn annotation_prompt_requires_an_active_visual_selection() {
     let mut app = App::new();
     app.select_lines(

@@ -823,6 +823,7 @@ fn draw_keybind_help(f: &mut Frame) {
         Line::from("^B c  create request ^B p  pause interception"),
         Line::from("^B t  target         ^B x  start/stop proxy"),
         Line::from("^B z  fullscreen panel"),
+        Line::from("^B y  copy focused panel as Markdown"),
         Line::from("^B d  delete focused annotation"),
         Line::from("^B q  quit           ^B ?  this help"),
         Line::from(""),
@@ -835,7 +836,8 @@ fn draw_keybind_help(f: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
         Line::from("↑/↓ or j/k navigate   Tab focus   h/l tabs   / filter"),
-        Line::from("d/u page   g/G top/bottom   Enter copy Markdown"),
+        Line::from("d/u page   g/G top/bottom"),
+        Line::from("Requests: Enter response   Details: Enter copy Markdown"),
         Line::from("Details: v visual select   j/k extend   Esc clear"),
     ];
     let block = Block::default()
@@ -1233,7 +1235,12 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     if filtered.is_empty() {
-        let empty_message = if app.is_running {
+        let empty_message = if !app.filter_text.is_empty() && !app.exchanges.is_empty() {
+            format!(
+                "No requests match filter {:?}. Press / then Enter to clear it.",
+                app.filter_text
+            )
+        } else if app.is_running {
             format!(
                 "Proxy is running on port {}. Waiting for requests...",
                 app.proxy_config.listen_port
@@ -2090,6 +2097,7 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
             KeybindInfo::new("p", "pause", 1),
             KeybindInfo::new("t", "target", 1),
             KeybindInfo::new("x", "start/stop", 1),
+            KeybindInfo::new("y", "copy markdown", 1),
             KeybindInfo::new(
                 "z",
                 if app.panel_fullscreen {
@@ -2119,11 +2127,17 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
         return vec![KeybindInfo::new("Esc", "close", 1)];
     }
 
+    let enter_description =
+        if app.app_mode == AppMode::Normal && matches!(app.focus, Focus::MessageList) {
+            "response"
+        } else {
+            "copy markdown"
+        };
     let mut keybinds = vec![
         KeybindInfo::new("^B", "commands", 1),
         KeybindInfo::new("↑↓/j/k", "navigate", 1),
         KeybindInfo::new("Tab", "focus", 1),
-        KeybindInfo::new("Enter", "copy markdown", 1),
+        KeybindInfo::new("Enter", enter_description, 1),
         KeybindInfo::new("/", "filter", 2),
         KeybindInfo::new("h/l", "tabs", 2),
         KeybindInfo::new("d/u/g/G", "scroll", 2),
@@ -2687,6 +2701,27 @@ mod tests {
             mouse_action(area, &app, requests.x + 2, requests.y + 2),
             Some(MouseAction::SelectExchange(0))
         );
+    }
+
+    #[test]
+    fn filtered_empty_list_explains_that_requests_are_hidden() {
+        let mut app = app_with_request();
+        app.filter_text = "missing".to_string();
+        let area = Rect::new(0, 0, 80, 5);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| draw_message_list(frame, area, &app))
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("No requests match filter \"missing\""));
     }
 
     #[test]

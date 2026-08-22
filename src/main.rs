@@ -85,6 +85,28 @@ fn copy_focused_panel(
     copy_to_clipboard(terminal, &markdown)
 }
 
+fn enter_request_list(app: &mut App) -> bool {
+    if app.app_mode != AppMode::Normal
+        || !app.is_message_list_focused()
+        || app.visual_selection_active
+    {
+        return false;
+    }
+
+    let visible = app.filtered_exchange_indices();
+    let selected = visible
+        .iter()
+        .copied()
+        .find(|index| *index == app.selected_exchange)
+        .or_else(|| visible.first().copied());
+    if let Some(selected) = selected {
+        app.select_exchange(selected);
+        app.set_focus(app::Focus::ResponseSection);
+    }
+
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorAction {
     None,
@@ -1049,7 +1071,8 @@ async fn run_app(
         let mut received_request_result = false;
         while let Ok(result) = runtime.request_result_receiver.try_recv() {
             app.notice = Some(match result {
-                Ok(()) => "Request sent".to_string(),
+                Ok(()) if app.filter_text.is_empty() => "Request sent".to_string(),
+                Ok(()) => "Request sent; filter is active".to_string(),
                 Err(error) => format!("Error: {}", error),
             });
             received_request_result = true;
@@ -1355,7 +1378,7 @@ async fn run_app(
                         app.clear_line_selection();
                     }
                     KeyCode::Enter => {
-                        if app.app_mode == AppMode::Normal {
+                        if app.app_mode == AppMode::Normal && !enter_request_list(&mut app) {
                             copy_focused_panel(terminal, &app)?;
                         }
                     }
@@ -1701,6 +1724,10 @@ async fn handle_overlay_key(
                     },
                     None => app.notice = Some("No annotation under cursor".to_string()),
                 }
+            }
+            KeyCode::Char('y') => {
+                app.close_overlay();
+                copy_focused_panel(terminal, app)?;
             }
             KeyCode::Char('s') => match runtime.history.list_sessions(1000) {
                 Ok(sessions) => app.show_sessions(sessions),
@@ -2346,6 +2373,39 @@ mod tests {
 
         assert_eq!(app.selected_exchange, 1);
         assert_eq!(app.history_scroll, Some(3));
+    }
+
+    #[test]
+    fn enter_on_request_list_focuses_the_visible_response() {
+        let mut app = App::new();
+        for (id, method) in [(1, "first"), (2, "second")] {
+            app.add_message(app::JsonRpcMessage {
+                id: Some(serde_json::json!(id)),
+                method: Some(method.to_string()),
+                params: Some(serde_json::json!([])),
+                result: None,
+                error: None,
+                timestamp: std::time::SystemTime::now(),
+                direction: app::MessageDirection::Request,
+                transport: app::TransportType::Http,
+                headers: None,
+            });
+        }
+        app.selected_exchange = 0;
+        app.filter_text = "second".to_string();
+
+        assert!(enter_request_list(&mut app));
+        assert_eq!(app.selected_exchange, 1);
+        assert_eq!(app.focus, app::Focus::ResponseSection);
+    }
+
+    #[test]
+    fn visual_selection_still_copies_from_request_list_focus() {
+        let mut app = App::new();
+        app.visual_selection_active = true;
+
+        assert!(!enter_request_list(&mut app));
+        assert_eq!(app.focus, app::Focus::MessageList);
     }
 
     #[test]
