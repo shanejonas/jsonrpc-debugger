@@ -978,6 +978,7 @@ impl App {
         self.exchanges = exchanges;
         self.selected_exchange = self.exchanges.len().saturating_sub(1);
         self.history_scroll = None;
+        self.filter_text.clear();
         self.session = Some(session);
         self.overlay = Overlay::None;
         self.line_selection = None;

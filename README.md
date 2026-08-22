@@ -53,7 +53,9 @@ The TUI shows request history beside the selected request and response. It suppo
 | Change tabs or inputs | Click them |
 | Select a line | Click its line number |
 | Select a line range | Click, then Shift-click |
-| Copy the focused panel as Markdown | `Enter` |
+| Open the selected response | `Enter` from Requests |
+| Copy details or status as Markdown | `Enter` |
+| Copy any focused panel as Markdown | `Ctrl-B y` |
 | Open commands / keybinds | `Ctrl-B` / `Ctrl-B ?` |
 | Fullscreen the focused panel | `Ctrl-B z` |
 | Open saved sessions / start a new one | `Ctrl-B s` / `Ctrl-B n` |
@@ -67,7 +69,7 @@ The TUI shows request history beside the selected request and response. It suppo
 | Create a request | `Ctrl-B c` |
 | Quit | `Ctrl-B q` or `Ctrl-C` |
 
-The request list copies as a Markdown table. Request bodies, responses, headers, and status copy as Markdown.
+The request list copies as a Markdown table with `Ctrl-B y`. Request bodies, responses, headers, and status copy as Markdown with `Enter` or `Ctrl-B y`.
 
 The inline editor supports normal Vim motions and operators such as `w`, `b`, `e`, `cw`, `dw`, `dd`, `u`, and `p`. Save with `:w`; cancel with `:q!`.
 
