@@ -3,7 +3,9 @@ use crate::{
         DetailTab, Focus, JsonRpcExchange, JsonRpcMessage, LineAnnotation, MessageDirection,
         SessionSummary,
     },
-    control::{Session, SessionExchange, SessionMessage},
+    control::{
+        FindResults, FoundAnnotation, FoundExchange, Session, SessionExchange, SessionMessage,
+    },
 };
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -174,36 +176,7 @@ impl HistoryStore {
              WHERE session_id = ?1
              ORDER BY created_at_ms, id",
         )?;
-        let rows = statement.query_map([session_id], |row| {
-            let panel = match row.get::<_, String>(2)?.as_str() {
-                "request" => Focus::RequestSection,
-                "response" => Focus::ResponseSection,
-                value => return Err(invalid_annotation_column(2, value)),
-            };
-            let tab = match row.get::<_, String>(3)?.as_str() {
-                "headers" => DetailTab::Headers,
-                "body" => DetailTab::Body,
-                value => return Err(invalid_annotation_column(3, value)),
-            };
-            let text_json = row.get::<_, String>(7)?;
-            let text = serde_json::from_str(&text_json).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    7,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            Ok(LineAnnotation {
-                id: row.get(0)?,
-                exchange_index: row.get::<_, i64>(1)?.max(0) as usize,
-                panel,
-                tab,
-                start_line: row.get::<_, i64>(4)?.max(1) as usize,
-                end_line: row.get::<_, i64>(5)?.max(1) as usize,
-                message: row.get(6)?,
-                text,
-            })
-        })?;
+        let rows = statement.query_map([session_id], |row| line_annotation(row, 0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -230,6 +203,17 @@ impl HistoryStore {
         )?;
         self.touch_session(session_id)?;
         Ok(())
+    }
+
+    pub fn update_annotation(&self, session_id: &str, id: &str, message: &str) -> Result<bool> {
+        let updated = self.connection.execute(
+            "UPDATE annotations SET message = ?3 WHERE session_id = ?1 AND id = ?2",
+            params![session_id, id, message],
+        )?;
+        if updated > 0 {
+            self.touch_session(session_id)?;
+        }
+        Ok(updated > 0)
     }
 
     pub fn remove_annotation(&self, session_id: &str, id: &str) -> Result<bool> {
@@ -281,6 +265,117 @@ impl HistoryStore {
         };
         rows.reverse();
         Ok(rows)
+    }
+
+    pub fn find(&self, query: &str, limit: usize, session_id: Option<&str>) -> Result<FindResults> {
+        let sessions = self.find_sessions(query, limit, session_id)?;
+        let exchanges = self.find_exchanges(query, limit, session_id)?;
+        let annotations = self.find_annotations(query, limit, session_id)?;
+        Ok(FindResults {
+            query: query.to_string(),
+            sessions,
+            exchanges,
+            annotations,
+        })
+    }
+
+    fn find_sessions(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<SessionSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.name, s.target, s.created_at_ms, s.updated_at_ms,
+                    COUNT(e.id)
+             FROM sessions s
+             LEFT JOIN exchanges e ON e.session_id = s.id
+             WHERE (?2 IS NULL OR s.id = ?2)
+               AND (instr(lower(s.id), lower(?1)) > 0
+                 OR instr(lower(s.name), lower(?1)) > 0
+                 OR instr(lower(s.target), lower(?1)) > 0)
+             GROUP BY s.id
+             ORDER BY s.updated_at_ms DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![query, session_id, sqlite_limit(limit)],
+            session_summary,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn find_exchanges(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<FoundExchange>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.name, s.target, s.created_at_ms, s.updated_at_ms,
+                    (SELECT COUNT(*) FROM exchanges count
+                     WHERE count.session_id = s.id),
+                    e.sequence, e.exchange_json
+             FROM exchanges e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE (?2 IS NULL OR s.id = ?2)
+               AND instr(lower(e.exchange_json), lower(?1)) > 0
+             ORDER BY s.updated_at_ms DESC, e.sequence DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![query, session_id, sqlite_limit(limit)], |row| {
+            let session = session_summary(row)?;
+            let sequence = row.get::<_, i64>(6)?;
+            let json = row.get::<_, String>(7)?;
+            Ok((session, sequence, json))
+        })?;
+        rows.map(|row| {
+            let (session, sequence, json) = row?;
+            let exchange: SessionExchange = serde_json::from_str(&json)?;
+            let exchange = exchange
+                .try_into()
+                .map_err(|error: String| anyhow!(error))?;
+            Ok(FoundExchange {
+                session,
+                index: sequence.saturating_sub(1) as usize,
+                exchange,
+            })
+        })
+        .collect()
+    }
+
+    fn find_annotations(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<FoundAnnotation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.name, s.target, s.created_at_ms, s.updated_at_ms,
+                    (SELECT COUNT(*) FROM exchanges count
+                     WHERE count.session_id = s.id),
+                    a.id, a.exchange_index, a.panel, a.tab, a.start_line, a.end_line,
+                    a.message, a.text_json
+             FROM annotations a
+             JOIN sessions s ON s.id = a.session_id
+             WHERE (?2 IS NULL OR s.id = ?2)
+               AND (instr(lower(a.id), lower(?1)) > 0
+                 OR instr(lower(a.panel), lower(?1)) > 0
+                 OR instr(lower(a.tab), lower(?1)) > 0
+                 OR instr(lower(a.message), lower(?1)) > 0
+                 OR instr(lower(a.text_json), lower(?1)) > 0)
+             ORDER BY a.created_at_ms DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![query, session_id, sqlite_limit(limit)], |row| {
+            Ok(FoundAnnotation {
+                session: session_summary(row)?,
+                annotation: line_annotation(row, 6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn record_messages(
@@ -413,6 +508,37 @@ fn session_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> 
         created_at_ms: row.get::<_, i64>(3)?.max(0) as u64,
         updated_at_ms: row.get::<_, i64>(4)?.max(0) as u64,
         exchange_count: row.get::<_, i64>(5)?.max(0) as usize,
+    })
+}
+
+fn line_annotation(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<LineAnnotation> {
+    let panel = match row.get::<_, String>(offset + 2)?.as_str() {
+        "request" => Focus::RequestSection,
+        "response" => Focus::ResponseSection,
+        value => return Err(invalid_annotation_column(offset + 2, value)),
+    };
+    let tab = match row.get::<_, String>(offset + 3)?.as_str() {
+        "headers" => DetailTab::Headers,
+        "body" => DetailTab::Body,
+        value => return Err(invalid_annotation_column(offset + 3, value)),
+    };
+    let text_json = row.get::<_, String>(offset + 7)?;
+    let text = serde_json::from_str(&text_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 7,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    Ok(LineAnnotation {
+        id: row.get(offset)?,
+        exchange_index: row.get::<_, i64>(offset + 1)?.max(0) as usize,
+        panel,
+        tab,
+        start_line: row.get::<_, i64>(offset + 4)?.max(1) as usize,
+        end_line: row.get::<_, i64>(offset + 5)?.max(1) as usize,
+        message: row.get(offset + 6)?,
+        text,
     })
 }
 
@@ -616,9 +742,12 @@ mod tests {
     use super::*;
     use crate::app::TransportType;
     use serde_json::json;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
     };
 
     fn request(id: u64) -> JsonRpcMessage {
@@ -814,6 +943,25 @@ mod tests {
     }
 
     #[test]
+    fn updates_an_annotation_message_in_place() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store.create_session(Some("notes"), "").unwrap();
+        store
+            .add_annotation(&session.id, &annotation("note", 0))
+            .unwrap();
+
+        assert!(store
+            .update_annotation(&session.id, "note", "Edited note")
+            .unwrap());
+        let saved = store.annotations(&session.id).unwrap();
+        assert_eq!(saved[0].id, "note");
+        assert_eq!(saved[0].message, "Edited note");
+        assert!(!store
+            .update_annotation(&session.id, "missing", "No note")
+            .unwrap());
+    }
+
+    #[test]
     fn renames_a_session() {
         let mut store = HistoryStore::in_memory().unwrap();
         let session = store.create_session(Some("old"), "").unwrap();
@@ -821,6 +969,76 @@ mod tests {
         assert!(store.rename_session(&session.id, "Refunds").unwrap());
         assert_eq!(store.session(&session.id).unwrap().unwrap().name, "Refunds");
         assert!(store.rename_session(&session.id, "").is_err());
+    }
+
+    #[test]
+    fn finds_sessions_exchanges_and_annotations_without_changing_sessions() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let first = store
+            .create_session(Some("Refund investigation"), "http://builder.example")
+            .unwrap();
+        let second = store.create_session(Some("Other"), "http://node").unwrap();
+        let mut matching_request = request(1);
+        matching_request.method = Some("mev_getRefunds".to_string());
+        matching_request.params = Some(json!({"recipient": "0xDeadBeef", "share": "100%"}));
+        matching_request.headers = Some(HashMap::from([(
+            "x-trace".to_string(),
+            "Trace-Needle".to_string(),
+        )]));
+        store
+            .record_messages(&first.id, &[matching_request, response(1)])
+            .unwrap();
+        store.record_messages(&second.id, &[request(2)]).unwrap();
+        let mut note = annotation("refund-note", 0);
+        note.message = "Compare payout recipient".to_string();
+        note.text = vec!["0xDeadBeef receives the refund".to_string()];
+        store.add_annotation(&first.id, &note).unwrap();
+
+        let session_results = store.find("REFUND INVESTIGATION", 10, None).unwrap();
+        assert_eq!(
+            session_results.sessions,
+            vec![store.session(&first.id).unwrap().unwrap()]
+        );
+        assert!(session_results.exchanges.is_empty());
+        assert!(session_results.annotations.is_empty());
+
+        let exchange_results = store.find("trace-needle", 10, None).unwrap();
+        assert_eq!(exchange_results.exchanges.len(), 1);
+        assert_eq!(exchange_results.exchanges[0].session.id, first.id);
+        assert_eq!(exchange_results.exchanges[0].index, 0);
+        let exchange_results = crate::control::find_results(exchange_results);
+        assert!(exchange_results["exchanges"][0]["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reference| reference["text"] == "  x-trace: Trace-Needle"));
+
+        let literal_results = store.find("100%", 10, None).unwrap();
+        assert_eq!(literal_results.exchanges.len(), 1);
+
+        let annotation_results = store.find("PAYOUT RECIPIENT", 10, None).unwrap();
+        assert_eq!(annotation_results.annotations.len(), 1);
+        assert_eq!(
+            annotation_results.annotations[0].annotation.id,
+            "refund-note"
+        );
+        let annotation_results = crate::control::find_results(annotation_results);
+        assert_eq!(
+            annotation_results["annotations"][0]["reference"]["sessionId"],
+            first.id
+        );
+        assert_eq!(
+            annotation_results["annotations"][0]["reference"]["exchangeIndex"],
+            0
+        );
+
+        let scoped_results = store.find("eth_chainId", 10, Some(&first.id)).unwrap();
+        assert!(scoped_results.exchanges.is_empty());
+
+        let empty_results = store.find("refund", 0, None).unwrap();
+        assert!(empty_results.sessions.is_empty());
+        assert!(empty_results.exchanges.is_empty());
+        assert!(empty_results.annotations.is_empty());
     }
 
     #[test]

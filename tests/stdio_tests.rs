@@ -1,8 +1,9 @@
 use jsonrpc_debugger::{
     app::TransportType,
-    stdio::{relay, Framer, Framing, StreamTransport},
+    stdio::{relay, Framer, Framing, StreamTransport, DEFAULT_REQUEST_TIMEOUT},
 };
 use serde_json::json;
+use std::time::Duration;
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -58,6 +59,7 @@ async fn stream_transport_correlates_responses_and_records_notifications() {
         Framing::JsonLines,
         TransportType::Stdio(Framing::JsonLines),
         message_sender,
+        DEFAULT_REQUEST_TIMEOUT,
     );
 
     tokio::spawn(async move {
@@ -95,6 +97,53 @@ async fn stream_transport_correlates_responses_and_records_notifications() {
 }
 
 #[tokio::test]
+async fn stream_transport_times_out_unanswered_requests_and_releases_ids() {
+    let (client_stream, server_stream) = tokio::io::duplex(4096);
+    let (client_reader, client_writer) = split(client_stream);
+    let (mut server_reader, mut server_writer) = split(server_stream);
+    let (message_sender, _message_receiver) = mpsc::unbounded_channel();
+    let transport = StreamTransport::new(
+        client_reader,
+        client_writer,
+        Framing::JsonLines,
+        TransportType::Stdio(Framing::JsonLines),
+        message_sender,
+        Duration::from_millis(10),
+    );
+    let request = json!({"jsonrpc": "2.0", "id": 7, "method": "example/run"});
+
+    assert_eq!(
+        transport.send(request.clone()).await.unwrap_err(),
+        "stdio request timed out after 10ms"
+    );
+
+    let mut bytes = [0; 1024];
+    let count = server_reader.read(&mut bytes).await.unwrap();
+    assert_eq!(
+        Framer::new(Framing::JsonLines)
+            .decode(&bytes[..count])
+            .unwrap(),
+        vec![request.clone()]
+    );
+
+    let server = async move {
+        let count = server_reader.read(&mut bytes).await.unwrap();
+        let second_request = Framer::new(Framing::JsonLines)
+            .decode(&bytes[..count])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let response = Framer::new(Framing::JsonLines)
+            .encode(&json!({"jsonrpc": "2.0", "id": second_request["id"], "result": "ok"}))
+            .unwrap();
+        server_writer.write_all(&response).await.unwrap();
+    };
+    let (response, ()) = tokio::join!(transport.send(request), server);
+
+    assert_eq!(response.unwrap()["result"], "ok");
+}
+
+#[tokio::test]
 async fn stream_transport_writes_client_responses_without_waiting() {
     let (client_stream, server_stream) = tokio::io::duplex(4096);
     let (client_reader, client_writer) = split(client_stream);
@@ -106,6 +155,7 @@ async fn stream_transport_writes_client_responses_without_waiting() {
         Framing::JsonLines,
         TransportType::Stdio(Framing::JsonLines),
         message_sender,
+        DEFAULT_REQUEST_TIMEOUT,
     );
 
     let response = json!({"jsonrpc": "2.0", "id": 9, "result": {}});
@@ -133,6 +183,7 @@ async fn content_length_stream_supports_batch_responses() {
         Framing::ContentLength,
         TransportType::Stdio(Framing::ContentLength),
         message_sender,
+        DEFAULT_REQUEST_TIMEOUT,
     );
 
     tokio::spawn(async move {

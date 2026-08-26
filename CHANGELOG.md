@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `debugger.find` searches durable sessions, exchanges, and annotations. Its line references open and highlight exact matches.
+- New and edited annotations use an inline editor below their source lines. Detail lines show a hover `+` for quick annotations, and clicking an amber note edits it. `[` and `]` move between annotations in the focused panel. `Ctrl-B a` still annotates Vim selections.
+
 ## [0.3.1] - 2026-08-21
 
 ### Changed

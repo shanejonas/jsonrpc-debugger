@@ -67,6 +67,36 @@ mod unix {
         assert_eq!(history["status"], "success");
         assert_eq!(history["transport"], "stdio-json-lines");
 
+        let found = control_with_params(
+            &control_url,
+            "debugger.find",
+            json!({"query": "EXAMPLE/RUN"}),
+        )
+        .await;
+        assert_eq!(found["result"]["exchanges"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            found["result"]["exchanges"][0]["exchange"]["method"],
+            "example/run"
+        );
+        let reference = found["result"]["exchanges"][0]["references"][0].clone();
+        assert_eq!(reference["sessionId"], state["result"]["session"]["id"]);
+        assert_eq!(reference["exchangeIndex"], 0);
+        assert_eq!(reference["panel"], "request");
+        assert!(reference["text"].as_str().unwrap().contains("example/run"));
+        assert!(found["result"]["sessions"].as_array().unwrap().is_empty());
+        assert!(found["result"]["annotations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let revealed = control_with_params(&control_url, "debugger.revealLines", reference).await;
+        assert_eq!(revealed["result"]["selectedExchange"], 0);
+        assert_eq!(revealed["result"]["focus"], "request");
+        assert!(revealed["result"]["lineSelection"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("example/run"));
+
         let client = ControlClient::new(control_url.clone());
         let state = client.state().await.unwrap();
         let mut attached = App::new();
@@ -126,13 +156,17 @@ mod unix {
     }
 
     async fn control(url: &str, method: &str) -> Value {
+        control_with_params(url, method, json!({})).await
+    }
+
+    async fn control_with_params(url: &str, method: &str, params: Value) -> Value {
         reqwest::Client::new()
             .post(url)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": "test",
                 "method": method,
-                "params": {}
+                "params": params
             }))
             .send()
             .await

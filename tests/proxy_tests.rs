@@ -49,6 +49,7 @@ async fn stdio_target_round_trips_through_the_http_frontend() {
                 OsString::from(script),
             ],
             framing: Framing::JsonLines,
+            request_timeout: std::time::Duration::from_secs(120),
         }),
         transparent: false,
     };
@@ -80,6 +81,67 @@ async fn stdio_target_round_trips_through_the_http_frontend() {
         response.transport,
         TransportType::Stdio(Framing::JsonLines)
     ));
+
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_target_times_out_unanswered_requests() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let (message_sender, mut message_receiver) = mpsc::unbounded_channel();
+    let config = ProxyConfig {
+        listen_port: port,
+        target_url: "silent stdio server".to_string(),
+        transport: TransportType::Stdio(Framing::JsonLines),
+        stdio: Some(StdioConfig {
+            command: vec![
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from("while IFS= read -r line; do :; done"),
+            ],
+            framing: Framing::JsonLines,
+            request_timeout: std::time::Duration::from_millis(10),
+        }),
+        transparent: false,
+    };
+    let proxy = ProxyServer::from_config(&config, message_sender).unwrap();
+    let server = tokio::spawn(proxy.bind().unwrap());
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}"))
+        .json(&serde_json::json!([
+            {"jsonrpc": "2.0", "id": 7, "method": "example/first"},
+            {"jsonrpc": "2.0", "id": 8, "method": "example/second"}
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let response = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(response.as_array().unwrap().len(), 2);
+    assert_eq!(response[0]["id"], 7);
+    assert_eq!(response[1]["id"], 8);
+    assert_eq!(
+        response[0]["error"],
+        serde_json::json!({
+            "code": -32603,
+            "message": "stdio request timed out after 10ms"
+        })
+    );
+
+    let first_request = message_receiver.recv().await.unwrap();
+    let second_request = message_receiver.recv().await.unwrap();
+    let first_response = message_receiver.recv().await.unwrap();
+    let second_response = message_receiver.recv().await.unwrap();
+    assert_eq!(first_request.method.as_deref(), Some("example/first"));
+    assert_eq!(second_request.method.as_deref(), Some("example/second"));
+    assert_eq!(first_response.id, Some(serde_json::json!(7)));
+    assert_eq!(second_response.id, Some(serde_json::json!(8)));
+    assert!(first_response.error.is_some());
+    assert!(second_response.error.is_some());
 
     server.abort();
 }

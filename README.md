@@ -86,6 +86,8 @@ jsonrpc-debugger --port 8080 stdio --framing content-length -- rust-analyzer
 
 This mode keeps the local HTTP proxy on port `8080`. Requests from the TUI, control plane, or another HTTP client travel through the child process. Server notifications appear in history as notifications instead of pending requests.
 
+Stdio requests time out after 120 seconds by default. Change the upper bound with `--request-timeout <SECONDS>`.
+
 ## Use it yourself
 
 The TUI shows request history beside the selected request and response. It supports the keyboard, mouse, and an inline Vim-style JSON editor.
@@ -104,7 +106,10 @@ The TUI shows request history beside the selected request and response. It suppo
 | Fullscreen the focused panel | `Ctrl-B z` |
 | Open saved sessions / start a new one | `Ctrl-B s` / `Ctrl-B n` |
 | Rename the current session | `Ctrl-B R` |
+| Annotate one line | Hover it, then click `+` |
 | Annotate a Vim selection | `v`, select lines, then `Ctrl-B a` |
+| Edit an annotation | Click its amber note |
+| Previous / next annotation | `[` / `]` |
 | Delete the focused annotation | `Ctrl-B d` |
 | Pause new requests | `Ctrl-B p` |
 | Allow or block an intercepted request | `a` / `b` |
@@ -145,9 +150,19 @@ curl http://127.0.0.1:8081 \
   -d '{"jsonrpc":"2.0","id":2,"method":"debugger.getState"}'
 ```
 
+Search every saved session without changing the TUI:
+
+```bash
+curl http://127.0.0.1:8081 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"debugger.find","params":{"query":"eth_call"}}'
+```
+
 In HTTP and stdio driver modes, an agent can:
 
 - Read state, history, pending requests, and numbered panel content.
+- Search durable sessions, complete exchanges, and annotations without changing the TUI.
+- Pass a search result reference to `debugger.revealLines` to open and highlight it.
 - List old sessions and page through their persistent history without changing the TUI.
 - Wait for revisions without polling.
 - Send requests through the debugger.

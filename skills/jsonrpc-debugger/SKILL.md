@@ -44,6 +44,8 @@ Treat a JSON-RPC `error` envelope as failure even when HTTP returns 200. The run
 ## Inspect Before Acting
 
 - Use `debugger.getHistory` for recent traffic. Pass `sessionId` to inspect an older session without changing the TUI.
+- Use `debugger.find` for a case-insensitive literal search across durable session metadata, complete exchanges, and annotations. It searches every session by default; pass `sessionId` to scope it. `limit` applies to each result group.
+- Exchange hits include `references`; annotation hits include `reference`. Pass one directly as `debugger.revealLines` params to select its session, exchange, panel, and tab, then highlight the exact line.
 - Use `debugger.listSessions` when the relevant traffic may be from an earlier run.
 - Use `debugger.waitForChange` with the last revision instead of polling.
 - Use `debugger.getPending` before touching interception state.
@@ -65,9 +67,11 @@ To point at evidence:
 3. Add a durable note with `debugger.annotateLines`.
 4. Call `debugger.revealLines` only when you intend to focus, center, and highlight that evidence for the user.
 
-`debugger.annotateLines` does not select, focus, scroll, switch tabs, or highlight. Pass `exchangeIndex` and `tab` for background annotations. Messages must be one line and at most 160 characters. Remove only annotations you created, using their returned ID with `debugger.removeAnnotation`.
+`debugger.annotateLines` does not select, focus, scroll, switch tabs, or highlight. Pass `exchangeIndex` and `tab` for background annotations. `debugger.revealLines` accepts optional `sessionId`, `exchangeIndex`, and `tab` when you need to navigate before highlighting. Messages must be one line and at most 160 characters. Remove only annotations you created, using their returned ID with `debugger.removeAnnotation`.
 
 Use `debugger.sendRequest` only when `getState.dataPlane` is `http`. It sends a complete target JSON-RPC request through the driver proxy. Keep human-facing request IDs unique, semantic, and at most 12 characters.
+
+Stdio driver requests time out after 120 seconds by default. `stdio --request-timeout <SECONDS>` changes the limit. A `-32603` response containing `stdio request timed out` comes from the debugger, not the target.
 
 Never inject requests into a transparent stdio wrapper. The external MCP/LSP client owns response routing. Use `debugger.getHistory`, `debugger.waitForChange`, or `jsonrpc-debugger attach` to observe it.
 

@@ -2,6 +2,7 @@ use crate::app::{
     App, AppMode, DetailTab, Focus, JsonRpcExchange, JsonRpcMessage, LineAnnotation,
     MessageDirection, Overlay, SessionSummary, TransportType,
 };
+use crate::ui;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -30,6 +31,11 @@ pub enum ControlAction {
         limit: usize,
         session_id: Option<String>,
         before: Option<usize>,
+    },
+    Find {
+        query: String,
+        limit: usize,
+        session_id: Option<String>,
     },
     ListSessions {
         limit: usize,
@@ -64,6 +70,9 @@ pub enum ControlAction {
         focus: Focus,
         start_line: usize,
         end_line: usize,
+        session_id: Option<String>,
+        exchange_index: Option<usize>,
+        tab: Option<DetailTab>,
     },
     AnnotateLines {
         focus: Focus,
@@ -154,6 +163,27 @@ pub struct SessionMessage {
 pub struct ControlCommand {
     pub action: ControlAction,
     pub reply: oneshot::Sender<ControlResult>,
+}
+
+#[derive(Debug)]
+pub struct FindResults {
+    pub query: String,
+    pub sessions: Vec<SessionSummary>,
+    pub exchanges: Vec<FoundExchange>,
+    pub annotations: Vec<FoundAnnotation>,
+}
+
+#[derive(Debug)]
+pub struct FoundExchange {
+    pub session: SessionSummary,
+    pub index: usize,
+    pub exchange: JsonRpcExchange,
+}
+
+#[derive(Debug)]
+pub struct FoundAnnotation {
+    pub session: SessionSummary,
+    pub annotation: LineAnnotation,
 }
 
 pub type ControlResult = Result<Value, ControlError>;
@@ -285,6 +315,11 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
             session_id: optional_string(params, 1, "sessionId")?.map(str::to_string),
             before: optional_usize(params, 2, "before")?,
         }),
+        "debugger.find" => Ok(ControlAction::Find {
+            query: required_non_empty_string(params, 0, "query")?.to_string(),
+            limit: optional_usize(params, 1, "limit")?.unwrap_or(100).min(1000),
+            session_id: optional_string(params, 2, "sessionId")?.map(str::to_string),
+        }),
         "debugger.listSessions" => Ok(ControlAction::ListSessions {
             limit: optional_usize(params, 0, "limit")?.unwrap_or(100).min(1000),
         }),
@@ -318,10 +353,16 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
         }),
         "debugger.revealLines" => {
             let start_line = required_usize(params, 1, "startLine")?;
+            optional_string(params, 6, "text")?;
             Ok(ControlAction::RevealLines {
                 focus: parse_detail_focus(required_string(params, 0, "panel")?)?,
                 start_line,
                 end_line: optional_usize(params, 2, "endLine")?.unwrap_or(start_line),
+                session_id: optional_string(params, 3, "sessionId")?.map(str::to_string),
+                exchange_index: optional_usize(params, 4, "exchangeIndex")?,
+                tab: optional_string(params, 5, "tab")?
+                    .map(parse_detail_tab)
+                    .transpose()?,
             })
         }
         "debugger.annotateLines" => {
@@ -410,6 +451,20 @@ fn required_string<'a>(
     required(params, index, name)?
         .as_str()
         .ok_or_else(|| ControlError::invalid_params(format!("{name} must be a string")))
+}
+
+fn required_non_empty_string<'a>(
+    params: &'a Value,
+    index: usize,
+    name: &str,
+) -> Result<&'a str, ControlError> {
+    let value = required_string(params, index, name)?.trim();
+    if value.is_empty() {
+        return Err(ControlError::invalid_params(format!(
+            "{name} must not be empty"
+        )));
+    }
+    Ok(value)
 }
 
 fn optional_string<'a>(
@@ -611,6 +666,107 @@ pub fn stored_history(exchanges: Vec<(usize, JsonRpcExchange)>) -> Value {
             .map(|(index, exchange)| exchange_value(index, &exchange))
             .collect(),
     )
+}
+
+pub fn find_results(results: FindResults) -> Value {
+    let FindResults {
+        query,
+        sessions,
+        exchanges,
+        annotations,
+    } = results;
+    let query = query.to_lowercase();
+    let exchanges = exchanges
+        .into_iter()
+        .map(|found| {
+            let references =
+                exchange_references(&found.session.id, found.index, &found.exchange, &query);
+            json!({
+                "session": found.session,
+                "exchange": exchange_value(found.index, &found.exchange),
+                "references": references,
+            })
+        })
+        .collect::<Vec<_>>();
+    let annotations = annotations
+        .into_iter()
+        .map(|found| {
+            let reference = line_reference(
+                &found.session.id,
+                found.annotation.exchange_index,
+                found.annotation.panel,
+                found.annotation.tab,
+                found.annotation.start_line,
+                found.annotation.end_line,
+                found.annotation.text.join("\n"),
+            );
+            json!({
+                "session": found.session,
+                "annotation": annotation_value(&found.annotation),
+                "reference": reference,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "sessions": sessions,
+        "exchanges": exchanges,
+        "annotations": annotations,
+    })
+}
+
+fn exchange_references(
+    session_id: &str,
+    exchange_index: usize,
+    exchange: &JsonRpcExchange,
+    query: &str,
+) -> Vec<Value> {
+    [Focus::RequestSection, Focus::ResponseSection]
+        .into_iter()
+        .flat_map(|panel| {
+            [DetailTab::Headers, DetailTab::Body]
+                .into_iter()
+                .flat_map(move |tab| {
+                    ui::detail_lines_text_for(exchange, panel, tab)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(move |(index, text)| {
+                            text.to_lowercase().contains(query).then(|| {
+                                line_reference(
+                                    session_id,
+                                    exchange_index,
+                                    panel,
+                                    tab,
+                                    index + 1,
+                                    index + 1,
+                                    text,
+                                )
+                            })
+                        })
+                })
+        })
+        .collect()
+}
+
+fn line_reference(
+    session_id: &str,
+    exchange_index: usize,
+    panel: Focus,
+    tab: DetailTab,
+    start_line: usize,
+    end_line: usize,
+    text: String,
+) -> Value {
+    json!({
+        "sessionId": session_id,
+        "exchangeIndex": exchange_index,
+        "panel": focus_name(panel),
+        "tab": detail_tab_name(tab),
+        "startLine": start_line,
+        "endLine": end_line,
+        "text": text,
+    })
 }
 
 pub fn sessions(sessions: Vec<SessionSummary>) -> Value {
@@ -883,15 +1039,19 @@ fn annotation_value(annotation: &LineAnnotation) -> Value {
         "id": annotation.id,
         "exchangeIndex": annotation.exchange_index,
         "panel": focus_name(annotation.panel),
-        "tab": match annotation.tab {
-            DetailTab::Headers => "headers",
-            DetailTab::Body => "body",
-        },
+        "tab": detail_tab_name(annotation.tab),
         "startLine": annotation.start_line,
         "endLine": annotation.end_line,
         "message": annotation.message,
         "text": annotation.text.join("\n"),
     })
+}
+
+fn detail_tab_name(tab: DetailTab) -> &'static str {
+    match tab {
+        DetailTab::Headers => "headers",
+        DetailTab::Body => "body",
+    }
 }
 
 pub fn annotation(annotation: &LineAnnotation) -> Value {
@@ -954,7 +1114,7 @@ mod tests {
         assert_eq!(document["openrpc"], "1.3.2");
         assert_eq!(document["servers"][0]["url"], "http://127.0.0.1:8081");
         assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(document["methods"].as_array().unwrap().len(), 25);
+        assert_eq!(document["methods"].as_array().unwrap().len(), 26);
         assert!(document["methods"]
             .as_array()
             .unwrap()
@@ -980,6 +1140,11 @@ mod tests {
             .unwrap()
             .iter()
             .any(|method| method["name"] == "debugger.setFullscreen"));
+        assert!(document["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method["name"] == "debugger.find"));
         let send_request = document["methods"]
             .as_array()
             .unwrap()
@@ -1004,7 +1169,14 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "debugger.revealLines",
-            "params": {"panel": "request", "startLine": 7, "endLine": 9},
+            "params": {
+                "panel": "request",
+                "startLine": 7,
+                "endLine": 9,
+                "sessionId": "saved",
+                "exchangeIndex": 4,
+                "tab": "body",
+            },
         });
         let scroll = json!({
             "jsonrpc": "2.0",
@@ -1047,7 +1219,10 @@ mod tests {
                 focus: Focus::RequestSection,
                 start_line: 7,
                 end_line: 9,
-            })
+                session_id: Some(session_id),
+                exchange_index: Some(4),
+                tab: Some(DetailTab::Body),
+            }) if session_id == "saved"
         ));
         assert!(matches!(
             parse_request(&scroll),
@@ -1098,6 +1273,18 @@ mod tests {
             "method": "debugger.getHistory",
             "params": {"limit": 25, "sessionId": "saved", "before": 40},
         });
+        let find = json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "debugger.find",
+            "params": {"query": "  refund  ", "limit": 2000, "sessionId": "saved"},
+        });
+        let empty_find = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "debugger.find",
+            "params": {"query": "   "},
+        });
         let select = json!({
             "jsonrpc": "2.0",
             "id": 4,
@@ -1129,6 +1316,18 @@ mod tests {
                 session_id: Some(id),
                 before: Some(40),
             }) if id == "saved"
+        ));
+        assert!(matches!(
+            parse_request(&find),
+            Ok(ControlAction::Find {
+                query,
+                limit: 1000,
+                session_id: Some(id),
+            }) if query == "refund" && id == "saved"
+        ));
+        assert!(matches!(
+            parse_request(&empty_find),
+            Err(ControlError { code: -32602, .. })
         ));
         assert!(matches!(
             parse_request(&select),

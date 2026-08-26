@@ -8,13 +8,17 @@ use std::{
     ffi::OsString,
     process::Stdio,
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
     sync::{mpsc, oneshot},
     task::JoinHandle,
+    time::{sleep_until, Instant},
 };
+
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct Framer {
     framing: Framing,
@@ -286,6 +290,7 @@ enum Incoming {
 
 struct PendingCall {
     batch: bool,
+    deadline: Instant,
     remaining: usize,
     responses: Vec<Value>,
     reply: Option<oneshot::Sender<Result<Value, String>>>,
@@ -298,6 +303,7 @@ impl StreamTransport {
         framing: Framing,
         transport: TransportType,
         message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
+        request_timeout: Duration,
     ) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -311,6 +317,7 @@ impl StreamTransport {
             transport,
             message_sender,
             command_receiver,
+            request_timeout,
         ));
         Self {
             inner: Arc::new(StreamTransportInner {
@@ -339,6 +346,7 @@ async fn run_stream<R, W>(
     transport: TransportType,
     message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
     mut commands: mpsc::UnboundedReceiver<StreamCommand>,
+    request_timeout: Duration,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -351,6 +359,13 @@ async fn run_stream<R, W>(
     let mut calls = HashMap::<u64, PendingCall>::new();
 
     loop {
+        let deadline = calls.values().map(|call| call.deadline).min();
+        let wait_for_timeout = async move {
+            match deadline {
+                Some(deadline) => sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             command = commands.recv() => {
                 let Some(StreamCommand::Send { message, reply }) = command else {
@@ -390,6 +405,7 @@ async fn run_stream<R, W>(
                 }
                 calls.insert(call_id, PendingCall {
                     batch: message.is_array(),
+                    deadline: Instant::now() + request_timeout,
                     remaining: ids.len(),
                     responses: Vec::with_capacity(ids.len()),
                     reply: Some(reply),
@@ -410,11 +426,37 @@ async fn run_stream<R, W>(
                     fail_pending(&mut calls, "stdio stream closed".to_string());
                     break;
                 }
+            },
+            _ = wait_for_timeout => {
+                expire_pending(&mut call_by_rpc_id, &mut calls, request_timeout);
             }
         }
     }
 
     reader.abort();
+}
+
+fn expire_pending(
+    call_by_rpc_id: &mut HashMap<String, u64>,
+    calls: &mut HashMap<u64, PendingCall>,
+    request_timeout: Duration,
+) {
+    let now = Instant::now();
+    let expired = calls
+        .iter()
+        .filter_map(|(id, call)| (call.deadline <= now).then_some(*id))
+        .collect::<Vec<_>>();
+    for call_id in expired {
+        call_by_rpc_id.retain(|_, pending_call_id| *pending_call_id != call_id);
+        let Some(mut call) = calls.remove(&call_id) else {
+            continue;
+        };
+        if let Some(reply) = call.reply.take() {
+            let _ = reply.send(Err(format!(
+                "stdio request timed out after {request_timeout:?}"
+            )));
+        }
+    }
 }
 
 async fn read_stream<R>(mut reader: R, framing: Framing, incoming: mpsc::UnboundedSender<Incoming>)
@@ -544,6 +586,7 @@ impl StdioTransport {
         command: &[OsString],
         framing: Framing,
         message_sender: mpsc::UnboundedSender<JsonRpcMessage>,
+        request_timeout: Duration,
     ) -> Result<Self, String> {
         let (program, args) = command
             .split_first()
@@ -580,6 +623,7 @@ impl StdioTransport {
             framing,
             TransportType::Stdio(framing),
             message_sender,
+            request_timeout,
         );
 
         Ok(Self {

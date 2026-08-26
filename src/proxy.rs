@@ -88,9 +88,13 @@ impl ProxyServer {
                 message_sender,
             ));
         };
-        let transport =
-            StdioTransport::spawn(&stdio.command, stdio.framing, message_sender.clone())
-                .map_err(anyhow::Error::msg)?;
+        let transport = StdioTransport::spawn(
+            &stdio.command,
+            stdio.framing,
+            message_sender.clone(),
+            stdio.request_timeout,
+        )
+        .map_err(anyhow::Error::msg)?;
         Ok(Self {
             listen_port: config.listen_port,
             target: ProxyTarget::Stdio {
@@ -573,14 +577,7 @@ async fn forward_stdio_request(
             warp::http::StatusCode::OK,
         ))),
         Err(message) => {
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": body.get("id").cloned().unwrap_or(Value::Null),
-                "error": {
-                    "code": -32603,
-                    "message": message,
-                }
-            });
+            let response = stdio_error_response(&body, &message);
             for message in json_rpc_messages(
                 &response,
                 MessageDirection::Response,
@@ -594,6 +591,28 @@ async fn forward_stdio_request(
                 warp::http::StatusCode::BAD_GATEWAY,
             )))
         }
+    }
+}
+
+fn stdio_error_response(request: &Value, message: &str) -> Value {
+    let error = |id| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32603,
+                "message": message,
+            }
+        })
+    };
+    match request {
+        Value::Array(requests) => Value::Array(
+            requests
+                .iter()
+                .filter_map(|request| request.get("id").cloned().map(error))
+                .collect(),
+        ),
+        request => error(request.get("id").cloned().unwrap_or(Value::Null)),
     }
 }
 

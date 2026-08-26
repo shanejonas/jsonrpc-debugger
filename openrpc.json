@@ -53,6 +53,17 @@
       "result": { "name": "result", "schema": { "type": "array" } }
     },
     {
+      "name": "debugger.find",
+      "summary": "Search durable sessions, exchanges, and annotations for literal text",
+      "description": "Searches all sessions unless sessionId is provided. Matching is case-insensitive and limit applies independently to each result group.",
+      "params": [
+        { "name": "query", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "limit", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 1000 } },
+        { "name": "sessionId", "required": false, "schema": { "type": "string", "minLength": 1 } }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "#/components/schemas/FindResults" } }
+    },
+    {
       "name": "debugger.listSessions",
       "summary": "List persistent debugger sessions newest first",
       "params": [
@@ -142,11 +153,15 @@
     },
     {
       "name": "debugger.revealLines",
-      "summary": "Focus and reveal highlighted request or response lines",
+      "summary": "Select and reveal highlighted request or response lines",
       "params": [
         { "name": "panel", "required": true, "schema": { "type": "string", "enum": ["request", "response"] } },
         { "name": "startLine", "required": true, "schema": { "type": "integer", "minimum": 1 } },
-        { "name": "endLine", "required": false, "schema": { "type": "integer", "minimum": 1 } }
+        { "name": "endLine", "required": false, "schema": { "type": "integer", "minimum": 1 } },
+        { "name": "sessionId", "required": false, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "exchangeIndex", "required": false, "schema": { "type": "integer", "minimum": 0 } },
+        { "name": "tab", "required": false, "schema": { "type": "string", "enum": ["headers", "body"] } },
+        { "name": "text", "required": false, "schema": { "type": "string" } }
       ],
       "result": { "name": "result", "schema": { "type": "object" } }
     },
@@ -242,6 +257,60 @@
           "createdAtMs": { "type": "integer", "minimum": 0 },
           "updatedAtMs": { "type": "integer", "minimum": 0 },
           "exchangeCount": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "FindResults": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sessions", "exchanges", "annotations"],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SessionSummary" }
+          },
+          "exchanges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["session", "exchange", "references"],
+              "properties": {
+                "session": { "$ref": "#/components/schemas/SessionSummary" },
+                "exchange": { "type": "object" },
+                "references": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/LineReference" }
+                }
+              }
+            }
+          },
+          "annotations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["session", "annotation", "reference"],
+              "properties": {
+                "session": { "$ref": "#/components/schemas/SessionSummary" },
+                "annotation": { "type": "object" },
+                "reference": { "$ref": "#/components/schemas/LineReference" }
+              }
+            }
+          }
+        }
+      },
+      "LineReference": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sessionId", "exchangeIndex", "panel", "tab", "startLine", "endLine", "text"],
+        "properties": {
+          "sessionId": { "type": "string" },
+          "exchangeIndex": { "type": "integer", "minimum": 0 },
+          "panel": { "type": "string", "enum": ["request", "response"] },
+          "tab": { "type": "string", "enum": ["headers", "body"] },
+          "startLine": { "type": "integer", "minimum": 1 },
+          "endLine": { "type": "integer", "minimum": 1 },
+          "text": { "type": "string" }
         }
       },
       "Session": {

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::OsString};
+use std::{collections::HashMap, ffi::OsString, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -202,6 +202,12 @@ pub struct LineSelection {
     pub start_line: usize,
     pub end_line: usize,
     pub text: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailHover {
+    pub panel: Focus,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -853,6 +859,8 @@ pub struct App {
     pub response_tab: usize,                   // 0 = Headers, 1 = Body
     pub line_selection: Option<LineSelection>,
     pub visual_selection_active: bool,
+    pub annotation_hover: Option<DetailHover>,
+    pub annotation_edit_id: Option<String>,
     pub annotations: Vec<LineAnnotation>,
     pub active_annotation_id: Option<String>,
     pub editor: Option<TextEditor>,
@@ -886,6 +894,7 @@ pub struct ProxyConfig {
 pub struct StdioConfig {
     pub command: Vec<OsString>,
     pub framing: Framing,
+    pub request_timeout: Duration,
 }
 
 fn exchange_status(exchange: &JsonRpcExchange) -> &'static str {
@@ -1050,6 +1059,8 @@ impl App {
             response_tab: 1, // Body selected by default
             line_selection: None,
             visual_selection_active: false,
+            annotation_hover: None,
+            annotation_edit_id: None,
             annotations: Vec::new(),
             active_annotation_id: None,
             editor: None,
@@ -1107,6 +1118,8 @@ impl App {
         self.overlay = Overlay::None;
         self.line_selection = None;
         self.visual_selection_active = false;
+        self.annotation_hover = None;
+        self.annotation_edit_id = None;
         self.annotations = annotations;
         self.active_annotation_id = None;
         self.reset_details_scroll();
@@ -1279,6 +1292,8 @@ impl App {
         self.reset_detail_cursors();
         self.line_selection = None;
         self.visual_selection_active = false;
+        self.annotation_hover = None;
+        self.annotation_edit_id = None;
         self.active_annotation_id = None;
         self.mark_changed();
     }
@@ -1388,9 +1403,26 @@ impl App {
         self.mark_changed();
     }
 
+    pub fn set_annotation_hover(&mut self, hover: Option<DetailHover>) {
+        self.annotation_hover = hover;
+    }
+
     pub fn add_annotation(&mut self, annotation: LineAnnotation) {
         self.annotations.push(annotation);
         self.mark_changed();
+    }
+
+    pub fn update_annotation(&mut self, id: &str, message: String) -> bool {
+        let Some(annotation) = self
+            .annotations
+            .iter_mut()
+            .find(|annotation| annotation.id == id)
+        else {
+            return false;
+        };
+        annotation.message = message;
+        self.mark_changed();
+        true
     }
 
     pub fn focus_annotation(&mut self, id: &str) {
@@ -1402,6 +1434,9 @@ impl App {
         else {
             return;
         };
+        if annotation.exchange_index != self.selected_exchange {
+            self.select_exchange(annotation.exchange_index);
+        }
         self.reveal_lines(
             annotation.panel,
             annotation.start_line,
@@ -1412,6 +1447,74 @@ impl App {
         self.mark_changed();
     }
 
+    pub fn focus_previous_annotation(&mut self) -> bool {
+        self.focus_adjacent_annotation(false)
+    }
+
+    pub fn focus_next_annotation(&mut self) -> bool {
+        self.focus_adjacent_annotation(true)
+    }
+
+    fn focus_adjacent_annotation(&mut self, next: bool) -> bool {
+        let panel = self.focus;
+        let Some(cursor) = self.detail_cursor_line(panel) else {
+            return false;
+        };
+        let Some(tab) = self.detail_tab(panel) else {
+            return false;
+        };
+        let selected_exchange = self.selected_exchange;
+        let id = {
+            let mut annotations = self
+                .annotations
+                .iter()
+                .filter(|annotation| annotation.panel == panel && annotation.tab == tab)
+                .collect::<Vec<_>>();
+            annotations.sort_by_key(|annotation| {
+                (
+                    annotation.exchange_index,
+                    annotation.start_line,
+                    annotation.end_line,
+                )
+            });
+            let active = self.active_annotation_id.as_deref().and_then(|id| {
+                annotations.iter().position(|annotation| {
+                    annotation.id == id
+                        && annotation.exchange_index == selected_exchange
+                        && (annotation.start_line..=annotation.end_line).contains(&cursor)
+                })
+            });
+            let annotation = if let Some(index) = active {
+                if next {
+                    annotations.get(index + 1)
+                } else {
+                    index
+                        .checked_sub(1)
+                        .and_then(|index| annotations.get(index))
+                }
+            } else if next {
+                annotations.iter().find(|annotation| {
+                    annotation.exchange_index > selected_exchange
+                        || (annotation.exchange_index == selected_exchange
+                            && annotation.end_line >= cursor)
+                })
+            } else {
+                annotations.iter().rev().find(|annotation| {
+                    annotation.exchange_index < selected_exchange
+                        || (annotation.exchange_index == selected_exchange
+                            && annotation.start_line <= cursor)
+                })
+            };
+            annotation.map(|annotation| annotation.id.clone())
+        };
+        let Some(id) = id else {
+            return false;
+        };
+
+        self.focus_annotation(&id);
+        true
+    }
+
     pub fn remove_annotation(&mut self, id: &str) -> bool {
         let before = self.annotations.len();
         self.annotations.retain(|annotation| annotation.id != id);
@@ -1420,6 +1523,9 @@ impl App {
         }
         if self.active_annotation_id.as_deref() == Some(id) {
             self.active_annotation_id = None;
+        }
+        if self.annotation_edit_id.as_deref() == Some(id) {
+            self.annotation_edit_id = None;
         }
         self.mark_changed();
         true
@@ -1919,6 +2025,7 @@ impl App {
     pub fn cancel_editing(&mut self) {
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
+        self.annotation_edit_id = None;
     }
 
     pub fn start_naming_session(&mut self) {
@@ -1932,6 +2039,23 @@ impl App {
         }
         self.input_mode = InputMode::AnnotatingSelection;
         self.input_buffer.clear();
+        self.annotation_edit_id = None;
+    }
+
+    pub fn start_editing_annotation(&mut self, id: &str) -> bool {
+        let Some(message) = self
+            .annotations
+            .iter()
+            .find(|annotation| annotation.id == id)
+            .map(|annotation| annotation.message.clone())
+        else {
+            return false;
+        };
+        self.focus_annotation(id);
+        self.input_mode = InputMode::AnnotatingSelection;
+        self.input_buffer = message;
+        self.annotation_edit_id = Some(id.to_string());
+        true
     }
 
     pub fn start_renaming_session(&mut self) {

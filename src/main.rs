@@ -69,6 +69,10 @@ enum TargetMode {
         #[arg(long, value_enum, default_value = "json-lines")]
         framing: CliFraming,
 
+        /// Maximum seconds to wait for a server response
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
+        request_timeout: u64,
+
         /// Server command and arguments
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -437,6 +441,14 @@ async fn handle_control_command(
                     .map(control::stored_history)
                     .map_err(|error| ControlError::runtime(error.to_string()))
             }),
+        ControlAction::Find {
+            query,
+            limit,
+            session_id,
+        } => history
+            .find(&query, limit, session_id.as_deref())
+            .map(control::find_results)
+            .map_err(|error| ControlError::runtime(error.to_string())),
         ControlAction::ListSessions { limit } => history
             .list_sessions(limit)
             .map(control::sessions)
@@ -527,31 +539,44 @@ async fn handle_control_command(
             focus,
             start_line,
             end_line,
+            session_id,
+            exchange_index,
+            tab,
         } => {
             if app.app_mode != AppMode::Normal {
                 Err(ControlError::invalid_params(
                     "line references require normal mode",
                 ))
             } else {
-                let total_lines = ui::detail_line_count(app, focus).unwrap_or(0);
-                match ui::detail_line_text(app, focus, start_line, end_line) {
-                    Some(text) => {
-                        app.reveal_lines(focus, start_line, end_line, text);
-                        center_detail_range(
-                            app,
-                            terminal_area,
-                            focus,
-                            start_line,
-                            end_line,
-                            total_lines,
-                            None,
-                        );
-                        Ok(control::state(app))
+                let session_changed = session_id
+                    .as_deref()
+                    .is_some_and(|id| active_session_id(app) != Some(id));
+                let session_result = if session_changed {
+                    match select_session(app, history, session_id.as_deref().unwrap()) {
+                        Ok(target_changed) => {
+                            if target_changed && app.is_running {
+                                restart_proxy(app, proxy_server, message_sender, proxy_state).await;
+                            }
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
                     }
-                    None => Err(ControlError::invalid_params(format!(
-                        "line range must be within 1..={total_lines}"
-                    ))),
-                }
+                } else {
+                    Ok(())
+                };
+
+                session_result.and_then(|_| {
+                    reveal_lines_at(
+                        app,
+                        terminal_area,
+                        focus,
+                        exchange_index,
+                        tab,
+                        start_line,
+                        end_line,
+                    )
+                    .map(|_| control::state(app))
+                })
             }
         }
         ControlAction::AnnotateLines {
@@ -758,13 +783,7 @@ fn build_annotation(
             "line annotations require normal mode",
         ));
     }
-    let message = message.trim();
-    if message.is_empty() || message.chars().count() > 160 || message.chars().any(char::is_control)
-    {
-        return Err(ControlError::invalid_params(
-            "message must be one line containing 1 to 160 characters",
-        ));
-    }
+    let message = annotation_message(message)?;
 
     let exchange_index = exchange_index.unwrap_or(app.selected_exchange);
     let tab = tab
@@ -809,6 +828,50 @@ fn detail_lines_at(
         .ok_or_else(|| ControlError::invalid_params("panel must be request or response"))
 }
 
+fn reveal_lines_at(
+    app: &mut App,
+    terminal_area: ratatui::layout::Rect,
+    panel: app::Focus,
+    exchange_index: Option<usize>,
+    tab: Option<app::DetailTab>,
+    start_line: usize,
+    end_line: usize,
+) -> Result<(), ControlError> {
+    let exchange_index = exchange_index.unwrap_or(app.selected_exchange);
+    let tab = tab
+        .or_else(|| app.detail_tab(panel))
+        .ok_or_else(|| ControlError::invalid_params("panel must be request or response"))?;
+    let lines = detail_lines_at(app, panel, Some(exchange_index), Some(tab))?;
+    let total_lines = lines.len();
+    let text = (start_line > 0 && end_line >= start_line && end_line <= total_lines)
+        .then(|| lines[start_line - 1..end_line].to_vec())
+        .ok_or_else(|| {
+            ControlError::invalid_params(format!("line range must be within 1..={total_lines}"))
+        })?;
+
+    app.select_exchange(exchange_index);
+    match panel {
+        app::Focus::RequestSection => app.request_tab = usize::from(tab == app::DetailTab::Body),
+        app::Focus::ResponseSection => app.response_tab = usize::from(tab == app::DetailTab::Body),
+        app::Focus::MessageList | app::Focus::StatusHeader => {
+            return Err(ControlError::invalid_params(
+                "panel must be request or response",
+            ));
+        }
+    }
+    app.reveal_lines(panel, start_line, end_line, text);
+    center_detail_range(
+        app,
+        terminal_area,
+        panel,
+        start_line,
+        end_line,
+        total_lines,
+        None,
+    );
+    Ok(())
+}
+
 fn annotate_visual_selection(
     app: &mut App,
     history: &HistoryStore,
@@ -849,6 +912,48 @@ fn persist_annotation(
         .map_err(|error| ControlError::runtime(error.to_string()))?;
     app.add_annotation(annotation);
     Ok(())
+}
+
+fn update_annotation(
+    app: &mut App,
+    history: &HistoryStore,
+    annotation_id: &str,
+    message: &str,
+) -> Result<(), ControlError> {
+    let message = annotation_message(message)?;
+    if !app
+        .annotations
+        .iter()
+        .any(|annotation| annotation.id == annotation_id)
+    {
+        return Err(ControlError::invalid_params(format!(
+            "Annotation not found: {annotation_id}"
+        )));
+    }
+    let session_id = active_session_id(app)
+        .ok_or_else(|| ControlError::runtime("No active session"))?
+        .to_string();
+    let updated = history
+        .update_annotation(&session_id, annotation_id, message)
+        .map_err(|error| ControlError::runtime(error.to_string()))?;
+    if !updated {
+        return Err(ControlError::invalid_params(format!(
+            "Annotation not found: {annotation_id}"
+        )));
+    }
+    app.update_annotation(annotation_id, message.to_string());
+    Ok(())
+}
+
+fn annotation_message(message: &str) -> Result<&str, ControlError> {
+    let message = message.trim();
+    if message.is_empty() || message.chars().count() > 160 || message.chars().any(char::is_control)
+    {
+        return Err(ControlError::invalid_params(
+            "message must be one line containing 1 to 160 characters",
+        ));
+    }
+    Ok(message)
 }
 
 fn remove_annotation(
@@ -1037,7 +1142,11 @@ async fn main() -> Result<()> {
         .or_else(|| cli.port.checked_add(1))
         .ok_or_else(|| anyhow::anyhow!("--control-port is required when --port is 65535"))?;
     let (target, transport, stdio) = match cli.mode {
-        Some(TargetMode::Stdio { framing, command }) => {
+        Some(TargetMode::Stdio {
+            framing,
+            request_timeout,
+            command,
+        }) => {
             if cli.target.is_some() {
                 anyhow::bail!("--target cannot be used with the stdio subcommand");
             }
@@ -1045,7 +1154,11 @@ async fn main() -> Result<()> {
             (
                 stdio::display_command(&command),
                 app::TransportType::Stdio(framing),
-                Some(app::StdioConfig { command, framing }),
+                Some(app::StdioConfig {
+                    command,
+                    framing,
+                    request_timeout: std::time::Duration::from_secs(request_timeout),
+                }),
             )
         }
         None => (
@@ -1173,6 +1286,7 @@ async fn run_transparent_wrap(
         stdio: Some(app::StdioConfig {
             command: command.to_vec(),
             framing,
+            request_timeout: stdio::DEFAULT_REQUEST_TIMEOUT,
         }),
         transparent: true,
     };
@@ -1412,6 +1526,12 @@ async fn run_attached_app(
             KeyCode::Char('G') => {
                 move_focused_detail_cursor(app, i64::MAX, terminal.size()?);
             }
+            KeyCode::Char('[') => {
+                app.focus_previous_annotation();
+            }
+            KeyCode::Char(']') => {
+                app.focus_next_annotation();
+            }
             KeyCode::Char('/') => app.start_filtering_requests(),
             KeyCode::Char('v') => toggle_visual_selection(app),
             _ => {}
@@ -1616,15 +1736,26 @@ async fn run_app(
                         match key.code {
                             KeyCode::Enter => {
                                 let message = app.input_buffer.clone();
-                                match annotate_visual_selection(
-                                    &mut app,
-                                    &runtime.history,
-                                    terminal.size()?,
-                                    &message,
-                                ) {
+                                let annotation_id = app.annotation_edit_id.clone();
+                                let result = match annotation_id.as_deref() {
+                                    Some(id) => {
+                                        update_annotation(&mut app, &runtime.history, id, &message)
+                                    }
+                                    None => annotate_visual_selection(
+                                        &mut app,
+                                        &runtime.history,
+                                        terminal.size()?,
+                                        &message,
+                                    ),
+                                };
+                                match result {
                                     Ok(()) => {
                                         app.cancel_editing();
-                                        app.notice = Some("Annotation added".to_string());
+                                        app.notice = Some(if annotation_id.is_some() {
+                                            "Annotation updated".to_string()
+                                        } else {
+                                            "Annotation added".to_string()
+                                        });
                                     }
                                     Err(error) => {
                                         app.notice = Some(format!("Error: {}", error.message));
@@ -1906,6 +2037,12 @@ async fn run_app(
                             app.goto_top_intercept_details()
                         }
                     },
+                    KeyCode::Char('[') if app.app_mode == AppMode::Normal => {
+                        app.focus_previous_annotation();
+                    }
+                    KeyCode::Char(']') if app.app_mode == AppMode::Normal => {
+                        app.focus_next_annotation();
+                    }
                     KeyCode::Char('/') => {
                         app.start_filtering_requests();
                     }
@@ -2115,6 +2252,7 @@ async fn handle_overlay_key(
             KeyCode::Char('a') if app.visual_selection_active && app.line_selection.is_some() => {
                 app.close_overlay();
                 app.start_annotating_selection();
+                position_annotation_editor(app, terminal.size()?);
             }
             KeyCode::Char('d') => {
                 app.close_overlay();
@@ -2300,6 +2438,7 @@ async fn handle_mouse_event(
     let area = terminal.size()?;
 
     if app.overlay != Overlay::None {
+        app.set_annotation_hover(None);
         match mouse.kind {
             MouseEventKind::ScrollUp if app.overlay == Overlay::Sessions => {
                 app.select_previous_session();
@@ -2336,12 +2475,15 @@ async fn handle_mouse_event(
     let hovered_focus = ui::panel_focus(area, app, mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Moved => {
+            let hover = ui::annotation_hover(area, app, mouse.column, mouse.row);
+            app.set_annotation_hover(hover);
             if let Some(focus) = hovered_focus {
                 app.set_focus(focus);
             }
             return Ok(());
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            app.set_annotation_hover(None);
             if let Some(focus) = hovered_focus {
                 app.set_focus(focus);
                 let visible_lines = ui::panel_visible_lines(area, app, focus);
@@ -2361,6 +2503,7 @@ async fn handle_mouse_event(
     let Some(action) = ui::mouse_action(area, app, mouse.column, mouse.row) else {
         return Ok(());
     };
+    app.set_annotation_hover(None);
 
     match action {
         ui::MouseAction::EditTarget => app.start_editing_target(),
@@ -2403,6 +2546,9 @@ async fn handle_mouse_event(
             app.clear_line_selection();
             app.mark_changed();
         }
+        ui::MouseAction::AddAnnotation { panel, line } => {
+            start_line_annotation(app, panel, line, area);
+        }
         ui::MouseAction::SelectLine { panel, line } => {
             app.finish_visual_selection();
             let extend = mouse.modifiers.contains(KeyModifiers::SHIFT);
@@ -2412,12 +2558,47 @@ async fn handle_mouse_event(
             };
             app.select_lines_from_anchor(panel, anchor, start_line, end_line, text);
         }
-        ui::MouseAction::SelectAnnotation { id } => app.focus_annotation(&id),
+        ui::MouseAction::SelectAnnotation { id } => {
+            if app.start_editing_annotation(&id) {
+                position_annotation_editor(app, area);
+            }
+        }
         ui::MouseAction::SelectSession(_) | ui::MouseAction::CloseOverlay => {}
         ui::MouseAction::Focus(focus) => app.set_focus(focus),
     }
 
     Ok(())
+}
+
+fn start_line_annotation(
+    app: &mut App,
+    panel: app::Focus,
+    line: usize,
+    area: ratatui::layout::Rect,
+) {
+    let Some(text) = ui::detail_line_text(app, panel, line, line) else {
+        return;
+    };
+    app.select_lines(panel, line, line, text);
+    app.start_visual_selection();
+    app.start_annotating_selection();
+    position_annotation_editor(app, area);
+}
+
+fn position_annotation_editor(app: &mut App, area: ratatui::layout::Rect) {
+    let Some((panel, scroll)) = ui::annotation_editor_scroll(area, app) else {
+        return;
+    };
+    let current = match panel {
+        app::Focus::RequestSection => &mut app.request_details_scroll,
+        app::Focus::ResponseSection => &mut app.response_details_scroll,
+        app::Focus::MessageList | app::Focus::StatusHeader => return,
+    };
+    if *current == scroll {
+        return;
+    }
+    *current = scroll;
+    app.mark_changed();
 }
 
 fn scroll_panel(app: &mut App, focus: app::Focus, down: bool, visible_lines: usize) {
@@ -2641,12 +2822,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_stdio_command_and_framing() {
+    fn parses_stdio_command_framing_and_timeout() {
         let cli = Cli::try_parse_from([
             "jsonrpc-debugger",
             "stdio",
             "--framing",
             "content-length",
+            "--request-timeout",
+            "45",
             "--",
             "rust-analyzer",
             "--stdio",
@@ -2657,9 +2840,36 @@ mod tests {
             cli.mode,
             Some(TargetMode::Stdio {
                 framing: CliFraming::ContentLength,
+                request_timeout: 45,
                 command,
             }) if command == [OsString::from("rust-analyzer"), OsString::from("--stdio")]
         ));
+    }
+
+    #[test]
+    fn stdio_request_timeout_defaults_to_120_seconds() {
+        let cli = Cli::try_parse_from(["jsonrpc-debugger", "stdio", "--", "server"]).unwrap();
+
+        assert!(matches!(
+            cli.mode,
+            Some(TargetMode::Stdio {
+                request_timeout: 120,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stdio_request_timeout_rejects_zero() {
+        assert!(Cli::try_parse_from([
+            "jsonrpc-debugger",
+            "stdio",
+            "--request-timeout",
+            "0",
+            "--",
+            "server"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2712,6 +2922,23 @@ mod tests {
             transport: app::TransportType::Http,
             headers: None,
         }
+    }
+
+    #[test]
+    fn hover_annotation_starts_the_existing_single_line_prompt() {
+        let mut app = App::new();
+        app.add_message(rpc_message(1, app::MessageDirection::Request));
+
+        start_line_annotation(
+            &mut app,
+            app::Focus::RequestSection,
+            2,
+            ratatui::layout::Rect::new(0, 0, 120, 24),
+        );
+
+        assert_eq!(app.input_mode, app::InputMode::AnnotatingSelection);
+        assert!(app.visual_selection_active);
+        assert_eq!(app.line_selection.unwrap().start_line, 2);
     }
 
     #[test]
@@ -3020,8 +3247,17 @@ mod tests {
 
         assert_eq!(app.annotations[0].message, "Check this method");
         assert!(!app.visual_selection_active);
-        let session_id = app.session.as_ref().unwrap().id.as_str();
-        assert_eq!(history.annotations(session_id).unwrap(), app.annotations);
+        let session_id = app.session.as_ref().unwrap().id.clone();
+        assert_eq!(history.annotations(&session_id).unwrap(), app.annotations);
+
+        let annotation_id = app.annotations[0].id.clone();
+        update_annotation(&mut app, &history, &annotation_id, "Check the method name").unwrap();
+        assert_eq!(app.annotations[0].id, annotation_id);
+        assert_eq!(app.annotations[0].message, "Check the method name");
+        assert_eq!(
+            history.annotations(&session_id).unwrap()[0].message,
+            "Check the method name"
+        );
     }
 
     #[test]
@@ -3210,6 +3446,9 @@ mod tests {
                     focus: app::Focus::RequestSection,
                     start_line: 2,
                     end_line: 2,
+                    session_id: None,
+                    exchange_index: None,
+                    tab: None,
                 },
                 reply,
             },
@@ -3314,5 +3553,42 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+
+        let saved = history
+            .create_session(Some("Saved"), "http://localhost:8090")
+            .unwrap();
+        history
+            .record_messages(&saved.id, &[rpc_message(9, app::MessageDirection::Request)])
+            .unwrap();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        handle_control_command(
+            &mut app,
+            ControlCommand {
+                action: ControlAction::RevealLines {
+                    focus: app::Focus::RequestSection,
+                    start_line: 2,
+                    end_line: 2,
+                    session_id: Some(saved.id.clone()),
+                    exchange_index: Some(0),
+                    tab: Some(app::DetailTab::Headers),
+                },
+                reply,
+            },
+            ControlContext {
+                terminal_area,
+                proxy_server: &mut proxy_server,
+                message_sender: &message_sender,
+                proxy_state: &proxy_state,
+                request_result_sender: &notice_sender,
+                history: &mut history,
+            },
+        )
+        .await;
+
+        let state = result.await.unwrap().unwrap();
+        assert_eq!(state["session"]["id"], saved.id);
+        assert_eq!(state["selectedExchange"], 0);
+        assert_eq!(state["tabs"]["request"], "headers");
+        assert_eq!(state["lineSelection"]["text"], "Method: method_9");
     }
 }
