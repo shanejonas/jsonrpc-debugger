@@ -16,6 +16,18 @@ use crate::app::{
 
 const ANNOTATION_AMBER: Color = Color::Rgb(245, 166, 35);
 const ANNOTATION_EDITOR_HEIGHT: usize = 5;
+const THEME_BACKGROUND: Color = Color::Rgb(12, 16, 18);
+const THEME_SURFACE: Color = Color::Rgb(22, 28, 31);
+const THEME_BORDER: Color = Color::Rgb(58, 70, 74);
+const THEME_FOCUS: Color = Color::Rgb(102, 166, 120);
+const THEME_TEXT: Color = Color::Rgb(205, 211, 213);
+const THEME_MUTED: Color = Color::Rgb(118, 130, 134);
+const THEME_BLUE: Color = Color::Rgb(105, 153, 176);
+const THEME_METHOD: Color = Color::Rgb(221, 194, 125);
+const THEME_SELECTED: Color = Color::Rgb(54, 70, 64);
+const REQUEST_SIDEBAR_MIN_WIDTH: u16 = 50;
+const REQUEST_SIDEBAR_MAX_WIDTH: u16 = 72;
+const COMPACT_REQUEST_LIST_WIDTH: u16 = 80;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MouseAction {
@@ -53,10 +65,7 @@ pub fn panel_focus(area: Rect, app: &App, column: u16, row: u16) -> Option<Focus
         return Some(app.focus);
     }
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+    let main = main_columns(chunks[1], app.request_list_visible);
     if contains(main[0], column, row) {
         return Some(Focus::MessageList);
     }
@@ -64,10 +73,7 @@ pub fn panel_focus(area: Rect, app: &App, column: u16, row: u16) -> Option<Focus
         return contains(main[1], column, row).then_some(Focus::RequestSection);
     }
 
-    let details = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main[1]);
+    let details = detail_panels(main[1]);
     if contains(details[0], column, row) {
         return Some(Focus::RequestSection);
     }
@@ -89,7 +95,13 @@ pub fn panel_visible_lines(area: Rect, app: &App, focus: Focus) -> usize {
     }
     match (app.app_mode, focus) {
         (AppMode::Normal, Focus::RequestSection | Focus::ResponseSection) => {
-            (main_height / 2).saturating_sub(2)
+            let (_, request, response) = normal_panel_areas(chunks[1], app);
+            let height = if focus == Focus::RequestSection {
+                request.height
+            } else {
+                response.height
+            };
+            usize::from(height.saturating_sub(2))
         }
         (AppMode::Paused | AppMode::Intercepting, Focus::RequestSection) => {
             main_height.saturating_sub(2)
@@ -147,10 +159,7 @@ pub fn mouse_action(area: Rect, app: &App, column: u16, row: u16) -> Option<Mous
         return fullscreen_mouse_action(chunks[1], app, column, row);
     }
 
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+    let main_chunks = main_columns(chunks[1], app.request_list_visible);
 
     if contains(main_chunks[0], column, row) {
         return match app.app_mode {
@@ -168,10 +177,7 @@ pub fn mouse_action(area: Rect, app: &App, column: u16, row: u16) -> Option<Mous
         return Some(MouseAction::Focus(Focus::RequestSection));
     }
 
-    let details = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main_chunks[1]);
+    let details = detail_panels(main_chunks[1]);
 
     if contains(details[0], column, row) {
         return request_details_action(details[0], app, column, row);
@@ -236,10 +242,10 @@ fn screen_chunks(area: Rect, app: &App) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(2),
             Constraint::Min(10),
             Constraint::Length(footer_height(app, area.width)),
-            Constraint::Length(1),
+            Constraint::Length(u16::from(app.notice.is_some())),
         ])
         .split(area)
 }
@@ -251,8 +257,38 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+fn main_columns(area: Rect, request_list_visible: bool) -> std::rc::Rc<[Rect]> {
+    if !request_list_visible {
+        return Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(0), Constraint::Min(0)])
+            .split(area);
+    }
+
+    let desired = (area.width.saturating_mul(2) / 5)
+        .clamp(REQUEST_SIDEBAR_MIN_WIDTH, REQUEST_SIDEBAR_MAX_WIDTH);
+    let sidebar = desired.min(area.width.saturating_sub(30));
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(sidebar), Constraint::Min(30)])
+        .split(area)
+}
+
+fn detail_panels(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area)
+}
+
+fn normal_panel_areas(area: Rect, app: &App) -> (Rect, Rect, Rect) {
+    let main = main_columns(area, app.request_list_visible);
+    let details = detail_panels(main[1]);
+    (main[0], details[0], details[1])
+}
+
 fn request_header_action(area: Rect, app: &App, column: u16, row: u16) -> Option<MouseAction> {
-    if row != area.y.saturating_add(1) {
+    if row != area.y {
         return None;
     }
 
@@ -268,7 +304,7 @@ fn request_header_action(area: Rect, app: &App, column: u16, row: u16) -> Option
     } else {
         &app.proxy_config.target_url
     };
-    let target_start = area.x.saturating_add(1 + transport_width + 4);
+    let target_start = area.x.saturating_add(transport_width + 4);
     let target_end = target_start.saturating_add(target.chars().count() as u16 + 2);
     if column >= target_start && column < target_end {
         return Some(MouseAction::EditTarget);
@@ -289,8 +325,9 @@ fn request_header_action(area: Rect, app: &App, column: u16, row: u16) -> Option
 }
 
 fn status_header_action(area: Rect, column: u16, row: u16) -> Option<MouseAction> {
-    if row == area.y.saturating_add(1) {
-        let running_start = area.x.saturating_add(1);
+    let inset = u16::from(area.height > 2);
+    if row == area.y.saturating_add(inset) {
+        let running_start = area.x.saturating_add(inset);
         let stopped_start = running_start.saturating_add(9);
         if column >= running_start && column < stopped_start {
             return Some(MouseAction::SetProxyRunning(true));
@@ -306,7 +343,7 @@ fn status_header_action(area: Rect, column: u16, row: u16) -> Option<MouseAction
 fn message_list_action(area: Rect, app: &App, row: u16) -> Option<MouseAction> {
     let indices = app.filtered_exchange_indices();
     let first_row = area.y.saturating_add(2);
-    let visible_rows = area.height.saturating_sub(3) as usize;
+    let visible_rows = area.height.saturating_sub(2) as usize;
     if row < first_row || visible_rows == 0 || indices.is_empty() {
         return Some(MouseAction::Focus(Focus::MessageList));
     }
@@ -878,23 +915,23 @@ fn build_tab_line(
             let mut style = Style::default();
             if is_enabled {
                 style = style
-                    .fg(Color::Black)
-                    .bg(if is_active { Color::Cyan } else { Color::White })
+                    .fg(THEME_BACKGROUND)
+                    .bg(if is_active { THEME_FOCUS } else { THEME_TEXT })
                     .add_modifier(Modifier::BOLD);
             } else {
-                style = style.fg(Color::DarkGray).bg(Color::DarkGray);
+                style = style.fg(THEME_BORDER).bg(THEME_SURFACE);
             }
 
             spans.push(Span::styled(format!(" {} ", *label), style));
         } else if is_enabled {
             // Inactive tab - subtle background
             let style = Style::default()
-                .fg(if is_active { Color::White } else { Color::Gray })
-                .bg(Color::DarkGray);
+                .fg(if is_active { THEME_TEXT } else { THEME_MUTED })
+                .bg(THEME_SURFACE);
             spans.push(Span::styled(format!(" {} ", *label), style));
         } else {
             // Disabled tab
-            let style = Style::default().fg(Color::DarkGray);
+            let style = Style::default().fg(THEME_BORDER);
             spans.push(Span::styled(format!(" {} ", *label), style));
         }
 
@@ -908,17 +945,12 @@ fn build_tab_line(
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let footer_height = footer_height(app, f.size().width);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),             // Header
-            Constraint::Min(10),               // Main content
-            Constraint::Length(footer_height), // Dynamic footer height
-            Constraint::Length(1),             // Input dialog
-        ])
-        .split(f.size());
+    let area = f.size();
+    f.render_widget(
+        Block::default().style(Style::default().bg(THEME_BACKGROUND).fg(THEME_TEXT)),
+        area,
+    );
+    let chunks = screen_chunks(area, app);
 
     draw_header(f, chunks[0], app);
 
@@ -940,7 +972,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Color::Green
         };
         f.render_widget(
-            Paragraph::new(notice.as_str()).style(Style::default().fg(color)),
+            Paragraph::new(notice.as_str()).style(Style::default().fg(color).bg(THEME_SURFACE)),
             chunks[3],
         );
     }
@@ -970,15 +1002,17 @@ fn draw_keybind_help(f: &mut Frame, app: &App) {
         vec![
             Line::from(Span::styled(
                 "Attached viewer",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(THEME_BLUE),
             )),
             Line::from("^B z  fullscreen panel"),
             Line::from("^B y  copy focused panel as Markdown"),
+            Line::from("^B r  show/hide request list"),
             Line::from("^B q  quit           ^B ?  this help"),
             Line::from(""),
-            Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
+            Line::from(Span::styled("Navigation", Style::default().fg(THEME_BLUE))),
             Line::from("↑/↓ or j/k navigate   Tab focus   h/l tabs   / filter"),
             Line::from("d/u page   g/G top/bottom   [/] annotations"),
+            Line::from(",/. previous/next request"),
             Line::from("Requests: Enter response   Details: Enter copy Markdown"),
             Line::from("The external client owns the stdio data plane."),
         ]
@@ -986,7 +1020,7 @@ fn draw_keybind_help(f: &mut Frame, app: &App) {
         vec![
             Line::from(Span::styled(
                 "Global commands",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(THEME_BLUE),
             )),
             Line::from("^B s  sessions       ^B n  new session"),
             Line::from("^B R  rename session"),
@@ -995,19 +1029,21 @@ fn draw_keybind_help(f: &mut Frame, app: &App) {
             Line::from("^B t  target         ^B x  start/stop proxy"),
             Line::from("^B z  fullscreen panel"),
             Line::from("^B y  copy focused panel as Markdown"),
+            Line::from("^B r  show/hide request list"),
             Line::from("^B d  delete focused annotation"),
             Line::from("^B q  quit           ^B ?  this help"),
             Line::from(""),
             Line::from(Span::styled(
                 "Focused pending request",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(THEME_BLUE),
             )),
             Line::from("a allow   b block   e body   h headers"),
             Line::from("c complete   r resume all"),
             Line::from(""),
-            Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
+            Line::from(Span::styled("Navigation", Style::default().fg(THEME_BLUE))),
             Line::from("↑/↓ or j/k navigate   Tab focus   h/l tabs   / filter"),
             Line::from("d/u page   g/G top/bottom   [/] annotations"),
+            Line::from(",/. previous/next request"),
             Line::from("Requests: Enter response   Details: Enter copy Markdown"),
             Line::from("Details: v visual select   j/k extend   Esc clear"),
         ]
@@ -1015,8 +1051,8 @@ fn draw_keybind_help(f: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Keybinds")
-        .border_style(Style::default().fg(Color::Yellow));
-    f.render_widget(Clear, popup);
+        .border_style(Style::default().fg(THEME_FOCUS));
+    clear_popup(f, popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -1049,16 +1085,25 @@ fn draw_sessions(f: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Sessions — Enter/click open · Esc close"),
+                .title("Sessions — Enter/click open · Esc close")
+                .border_style(Style::default().fg(THEME_BORDER)),
         )
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black))
+        .highlight_style(Style::default().bg(THEME_SELECTED))
         .highlight_symbol("› ");
-    f.render_widget(Clear, popup);
+    clear_popup(f, popup);
     f.render_stateful_widget(list, popup, &mut state);
 }
 
 fn session_popup(area: Rect) -> Rect {
     centered_popup(area, 82, 70)
+}
+
+fn clear_popup(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(THEME_BACKGROUND).fg(THEME_TEXT)),
+        area,
+    );
 }
 
 fn centered_popup(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
@@ -1100,10 +1145,10 @@ fn draw_text_editor(f: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!("{} — {}", editor.target.title(), mode))
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(THEME_FOCUS));
     let inner = block.inner(popup);
 
-    f.render_widget(Clear, popup);
+    clear_popup(f, popup);
     f.render_widget(block, popup);
     if inner.height == 0 {
         return;
@@ -1123,14 +1168,14 @@ fn draw_text_editor(f: &mut Frame, app: &App) {
         .take(visible_lines)
         .map(|(index, line)| {
             let style = if index == editor.row {
-                Style::default().bg(Color::Rgb(35, 35, 35))
+                Style::default().bg(THEME_SELECTED)
             } else {
                 Style::default()
             };
             Line::from(vec![
                 Span::styled(
                     format!("{:>4} │ ", index + 1),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(THEME_BORDER),
                 ),
                 Span::styled(line.clone(), style),
             ])
@@ -1139,23 +1184,26 @@ fn draw_text_editor(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), chunks[0]);
 
     let status = if let Some(error) = &editor.error {
-        Span::styled(error.clone(), Style::default().fg(Color::Red))
+        Span::styled(error.clone(), Style::default().fg(Color::Rgb(202, 96, 103)))
     } else if editor.mode == EditorMode::Command {
         Span::styled(
             format!(":{}", editor.command),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Rgb(218, 170, 94)),
         )
     } else if let Some(operator) = editor.pending_operator {
         Span::styled(
             format!("{}…  motion or {} for line", operator.key(), operator.key()),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Rgb(218, 170, 94)),
         )
     } else if editor.pending_g {
-        Span::styled("g…  g for first line", Style::default().fg(Color::Yellow))
+        Span::styled(
+            "g…  g for first line",
+            Style::default().fg(Color::Rgb(218, 170, 94)),
+        )
     } else {
         Span::styled(
             "i/a/I/A/o/O · w/b/e · d/c/y+motion · dd/cc/yy · u · p/P · :wq",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(THEME_MUTED),
         )
     };
     f.render_widget(Paragraph::new(Line::from(status)), chunks[1]);
@@ -1172,9 +1220,13 @@ fn draw_text_editor(f: &mut Frame, app: &App) {
 }
 
 fn footer_height(app: &App, width: u16) -> u16 {
+    if app.overlay != Overlay::Prefix {
+        return 1;
+    }
+
     let keybinds = get_keybinds_for_mode(app);
     let lines = arrange_keybinds_responsive(keybinds, width as usize);
-    (lines.len() + 2).max(3) as u16
+    lines.len().max(1) as u16
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -1191,23 +1243,23 @@ fn draw_request_header(f: &mut Frame, area: Rect, app: &App) {
     let transport_label = app.proxy_config.transport.label();
 
     let transport_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Rgb(210, 160, 255))
+        .fg(THEME_BACKGROUND)
+        .bg(THEME_BLUE)
         .add_modifier(Modifier::BOLD);
 
     let dropdown_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Rgb(170, 120, 235))
+        .fg(THEME_BLUE)
+        .bg(THEME_SURFACE)
         .add_modifier(Modifier::BOLD);
 
     let target_bg = if app.input_mode == InputMode::EditingTarget {
-        Color::Rgb(80, 56, 140)
+        THEME_SELECTED
     } else {
-        Color::Rgb(48, 36, 96)
+        THEME_SURFACE
     };
 
     let target_style = Style::default()
-        .fg(Color::White)
+        .fg(THEME_TEXT)
         .bg(target_bg)
         .add_modifier(Modifier::BOLD);
 
@@ -1237,16 +1289,16 @@ fn draw_request_header(f: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::raw("  "));
 
     let filter_bg = if app.input_mode == InputMode::FilteringRequests {
-        Color::Rgb(80, 56, 140)
+        THEME_SELECTED
     } else {
-        Color::Rgb(48, 36, 96)
+        THEME_SURFACE
     };
 
     let filter_style = Style::default()
         .fg(if app.filter_text.is_empty() {
-            Color::Rgb(180, 170, 210)
+            THEME_MUTED
         } else {
-            Color::White
+            THEME_TEXT
         })
         .bg(filter_bg)
         .add_modifier(Modifier::BOLD);
@@ -1263,10 +1315,9 @@ fn draw_request_header(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled("█", filter_style));
     }
 
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        "Request",
-        Style::default().fg(Color::LightMagenta),
-    ));
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(THEME_BORDER));
 
     let paragraph = Paragraph::new(Line::from(spans))
         .block(block)
@@ -1278,23 +1329,23 @@ fn draw_request_header(f: &mut Frame, area: Rect, app: &App) {
 fn draw_status_header(f: &mut Frame, area: Rect, app: &App) {
     let status_focus = matches!(app.focus, Focus::StatusHeader);
 
-    let inactive_fg = Color::Rgb(180, 170, 210);
+    let inactive_fg = THEME_MUTED;
 
     let mut running_style = if app.is_running {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
+            .fg(THEME_BACKGROUND)
+            .bg(THEME_FOCUS)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(inactive_fg).bg(Color::Rgb(60, 60, 60))
+        Style::default().fg(inactive_fg).bg(THEME_SURFACE)
     };
 
     let mut stopped_style = if app.is_running {
-        Style::default().fg(inactive_fg).bg(Color::Rgb(60, 60, 60))
+        Style::default().fg(inactive_fg).bg(THEME_SURFACE)
     } else {
         Style::default()
-            .fg(Color::White)
-            .bg(Color::Rgb(120, 35, 52))
+            .fg(THEME_TEXT)
+            .bg(Color::Rgb(145, 61, 68))
             .add_modifier(Modifier::BOLD)
     };
 
@@ -1313,67 +1364,52 @@ fn draw_status_header(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let mode_color = match app.app_mode {
-        AppMode::Normal => Color::Gray,
-        AppMode::Paused => Color::Yellow,
-        AppMode::Intercepting => Color::Red,
+        AppMode::Normal => THEME_MUTED,
+        AppMode::Paused => Color::Rgb(218, 170, 94),
+        AppMode::Intercepting => Color::Rgb(202, 96, 103),
     };
 
-    let mut lines = Vec::new();
-
-    let tab_spans = vec![
-        Span::styled(" RUNNING ", running_style),
-        Span::styled(" STOPPED ", stopped_style),
-    ];
-    lines.push(Line::from(tab_spans));
-
     let label_style = Style::default()
-        .fg(Color::Gray)
+        .fg(THEME_MUTED)
         .add_modifier(Modifier::BOLD);
 
     let data_plane = if app.proxy_config.transparent {
-        vec![Span::styled("Data:", label_style), Span::raw(" STDIO")]
+        "STDIO".to_string()
     } else {
-        vec![
-            Span::styled("Port:", label_style),
-            Span::raw(format!(" {}", app.proxy_config.listen_port)),
-        ]
+        format!(":{}", app.proxy_config.listen_port)
     };
-    let info_line = Line::from(
-        [
-            data_plane,
-            vec![
-                Span::raw(format!("  RPC: {}  ", app.control_port)),
-                Span::styled("Mode:", label_style),
-                Span::styled(format!(" {}", mode_text), Style::default().fg(mode_color)),
-            ],
-        ]
-        .concat(),
-    );
-    lines.push(info_line);
+    let status_line = Line::from(vec![
+        Span::styled(" RUNNING ", running_style),
+        Span::styled(" STOPPED ", stopped_style),
+        Span::raw("  "),
+        Span::styled(data_plane, label_style),
+        Span::raw("  "),
+        Span::styled("RPC", label_style),
+        Span::raw(format!(":{}  ", app.control_port)),
+        Span::styled(
+            mode_text.to_uppercase(),
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ),
+    ]);
 
-    if app.input_mode == InputMode::EditingTarget {
-        lines.push(Line::from(Span::styled(
-            "Editing target (Enter to save, Esc to cancel)",
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-
-    let mut block = Block::default().borders(Borders::ALL).title(Span::styled(
-        "Status",
-        Style::default().fg(Color::LightMagenta),
-    ));
+    let borders = if area.height <= 2 {
+        Borders::BOTTOM
+    } else {
+        Borders::ALL
+    };
+    let mut block = Block::default().borders(borders);
 
     if status_focus {
         block = block.border_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(THEME_FOCUS)
                 .add_modifier(Modifier::BOLD),
         );
     } else {
-        block = block.border_style(Style::default().fg(Color::DarkGray));
+        block = block.border_style(Style::default().fg(THEME_BORDER));
     }
 
-    let paragraph = Paragraph::new(lines)
+    let paragraph = Paragraph::new(status_line)
         .block(block)
         .wrap(Wrap { trim: false });
 
@@ -1381,16 +1417,13 @@ fn draw_status_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_main_content(f: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50), // Message list
-            Constraint::Percentage(50), // Details area
-        ])
-        .split(area);
+    let (requests, request, response) = normal_panel_areas(area, app);
 
-    draw_message_list(f, chunks[0], app);
-    draw_details_split(f, chunks[1], app);
+    if app.request_list_visible {
+        draw_message_list(f, requests, app);
+    }
+    draw_request_details(f, request, app);
+    draw_response_details(f, response, app);
 }
 
 fn draw_fullscreen_panel(f: &mut Frame, area: Rect, app: &App) {
@@ -1408,6 +1441,53 @@ fn draw_fullscreen_panel(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn draw_sidebar_chrome(f: &mut Frame, area: Rect, title: String, focused: bool) -> Rect {
+    f.render_widget(
+        Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(THEME_BORDER)),
+        area,
+    );
+
+    let content_width = area.width.saturating_sub(1);
+    let title_style = Style::default()
+        .fg(if focused { THEME_FOCUS } else { THEME_MUTED })
+        .bg(THEME_SURFACE)
+        .add_modifier(Modifier::BOLD);
+    f.render_widget(
+        Paragraph::new(title).style(title_style),
+        Rect::new(area.x, area.y, content_width, 1),
+    );
+
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        content_width,
+        area.height.saturating_sub(1),
+    )
+}
+
+fn exchange_duration(exchange: &JsonRpcExchange) -> (String, Color) {
+    let (Some(request), Some(response)) = (&exchange.request, &exchange.response) else {
+        return ("-".to_string(), THEME_MUTED);
+    };
+    let Ok(duration) = response.timestamp.duration_since(request.timestamp) else {
+        return ("-".to_string(), THEME_MUTED);
+    };
+
+    let color = match duration.as_secs_f64() {
+        seconds if seconds < 1.0 => THEME_FOCUS,
+        seconds if seconds < 6.0 => Color::Rgb(218, 170, 94),
+        _ => Color::Rgb(202, 96, 103),
+    };
+    let text = if duration.as_millis() < 1000 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{:.2}s", duration.as_secs_f64())
+    };
+    (text, color)
+}
+
 fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
     let filtered: Vec<(usize, &JsonRpcExchange)> = app
         .filtered_exchange_indices()
@@ -1415,6 +1495,12 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         .map(|index| (index, &app.exchanges[index]))
         .collect();
 
+    let body = draw_sidebar_chrome(
+        f,
+        area,
+        format!("Requests \u{00b7} {}", filtered.len()),
+        matches!(app.focus, Focus::MessageList),
+    );
     if filtered.is_empty() {
         let empty_message = if !app.filter_text.is_empty() && !app.exchanges.is_empty() {
             format!(
@@ -1432,23 +1518,11 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
             "Press Ctrl-B x to start the proxy and begin capturing messages".to_string()
         };
 
-        let mut block = Block::default().borders(Borders::ALL).title("Requests");
-        if matches!(app.focus, Focus::MessageList) {
-            block = block.border_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            );
-        } else {
-            block = block.border_style(Style::default().fg(Color::DarkGray));
-        }
-
         let paragraph = Paragraph::new(empty_message.as_str())
-            .block(block)
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(THEME_MUTED))
             .wrap(Wrap { trim: true });
 
-        f.render_widget(paragraph, area);
+        f.render_widget(paragraph, body);
         return;
     }
 
@@ -1456,33 +1530,49 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .position(|(index, _)| *index == app.selected_exchange)
         .unwrap_or(0);
-    let visible_rows = area.height.saturating_sub(3) as usize;
+    let visible_rows = body.height.saturating_sub(1) as usize;
     let offset = app.history_scroll_offset(visible_rows);
+    let compact = body.width <= COMPACT_REQUEST_LIST_WIDTH;
 
-    let highlight_style = if matches!(app.focus, Focus::MessageList) {
-        Style::default()
-            .bg(Color::Cyan)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD)
+    let highlight_style = Style::default().bg(THEME_SELECTED).add_modifier(
+        if matches!(app.focus, Focus::MessageList) {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        },
+    );
+
+    let header = if compact {
+        Row::new(vec![
+            Cell::from("S"),
+            Cell::from("Transport"),
+            Cell::from("Method"),
+            Cell::from("ID"),
+            Cell::from("Time"),
+            Cell::from("N"),
+        ])
     } else {
-        Style::default().fg(Color::White)
-    };
-
-    let header = Row::new(vec![
-        Cell::from("Status"),
-        Cell::from("Transport"),
-        Cell::from("Method"),
-        Cell::from("ID"),
-        Cell::from("Duration"),
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD))
+        Row::new(vec![
+            Cell::from("Status"),
+            Cell::from("Transport"),
+            Cell::from("Method"),
+            Cell::from("ID"),
+            Cell::from("Duration"),
+            Cell::from("Notes"),
+        ])
+    }
+    .style(
+        Style::default()
+            .fg(THEME_MUTED)
+            .add_modifier(Modifier::BOLD),
+    )
     .height(1);
 
     let rows: Vec<Row> = filtered
         .iter()
         .skip(offset)
         .take(visible_rows)
-        .map(|(_, exchange)| {
+        .map(|(index, exchange)| {
             let transport_symbol = exchange.transport.label();
 
             let method = exchange.method.as_deref().unwrap_or("unknown");
@@ -1496,74 +1586,81 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
                 })
                 .unwrap_or_else(|| "null".to_string());
 
-            let (status_symbol, status_color) = if exchange.is_notification() {
-                ("• Notify", Color::Cyan)
+            let (status, status_mark, status_color) = if exchange.is_notification() {
+                ("Notify", "N", THEME_BLUE)
             } else if exchange.response.is_none() {
-                ("⏳ Pending", Color::Yellow)
+                ("Pending", "P", Color::Rgb(218, 170, 94))
             } else if let Some(response) = &exchange.response {
                 if response.error.is_some() {
-                    ("✗ Error", Color::Red)
+                    ("Error", "E", Color::Rgb(202, 96, 103))
                 } else {
-                    ("✓ Success", Color::Green)
+                    ("Success", "S", THEME_FOCUS)
                 }
             } else {
-                ("? Unknown", Color::Gray)
+                ("Unknown", "?", THEME_MUTED)
             };
 
-            let duration_text =
-                if let (Some(request), Some(response)) = (&exchange.request, &exchange.response) {
-                    match response.timestamp.duration_since(request.timestamp) {
-                        Ok(duration) => {
-                            let millis = duration.as_millis();
-                            if millis < 1000 {
-                                format!("{}ms", millis)
-                            } else {
-                                format!("{:.2}s", duration.as_secs_f64())
-                            }
-                        }
-                        Err(_) => "-".to_string(),
-                    }
-                } else {
-                    "-".to_string()
-                };
+            let (duration_text, duration_color) = exchange_duration(exchange);
 
-            Row::new(vec![
-                Cell::from(status_symbol).style(Style::default().fg(status_color)),
-                Cell::from(transport_symbol).style(Style::default().fg(Color::Blue)),
-                Cell::from(method).style(Style::default().fg(Color::Red)),
-                Cell::from(id).style(Style::default().fg(Color::Gray)),
-                Cell::from(duration_text).style(Style::default().fg(Color::Magenta)),
-            ])
-            .height(1)
+            let note_count = app
+                .annotations
+                .iter()
+                .filter(|annotation| annotation.exchange_index == *index)
+                .count();
+            let notes = if note_count > 0 {
+                format!("◆{note_count}")
+            } else {
+                String::new()
+            };
+
+            let cells = if compact {
+                vec![
+                    Cell::from(status_mark).style(Style::default().fg(status_color)),
+                    Cell::from(transport_symbol).style(Style::default().fg(THEME_BLUE)),
+                    Cell::from(method).style(Style::default().fg(THEME_METHOD)),
+                    Cell::from(id).style(Style::default().fg(THEME_MUTED)),
+                    Cell::from(duration_text).style(Style::default().fg(duration_color)),
+                    Cell::from(notes).style(Style::default().fg(ANNOTATION_AMBER)),
+                ]
+            } else {
+                vec![
+                    Cell::from(status).style(Style::default().fg(status_color)),
+                    Cell::from(transport_symbol).style(Style::default().fg(THEME_BLUE)),
+                    Cell::from(method).style(Style::default().fg(THEME_METHOD)),
+                    Cell::from(id).style(Style::default().fg(THEME_MUTED)),
+                    Cell::from(duration_text).style(Style::default().fg(duration_color)),
+                    Cell::from(notes).style(Style::default().fg(ANNOTATION_AMBER)),
+                ]
+            };
+
+            Row::new(cells).height(1)
         })
         .collect();
 
-    let mut table_block = Block::default().borders(Borders::ALL).title("Requests");
-    if matches!(app.focus, Focus::MessageList) {
-        table_block = table_block.border_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+    let widths = if compact {
+        vec![
+            Constraint::Length(2),
+            Constraint::Length(11),
+            Constraint::Min(8),
+            Constraint::Length(8),
+            Constraint::Length(7),
+            Constraint::Length(4),
+        ]
     } else {
-        table_block = table_block.border_style(Style::default().fg(Color::DarkGray));
-    }
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(12), // Status
-            Constraint::Length(11), // Transport
-            Constraint::Min(15),    // Method (flexible)
-            Constraint::Length(12), // ID
-            Constraint::Length(10), // Duration
-        ],
-    )
-    .header(header)
-    .block(table_block)
-    .highlight_style(highlight_style)
-    .highlight_symbol("  ")
-    .highlight_spacing(HighlightSpacing::Always);
+        vec![
+            Constraint::Length(8),
+            Constraint::Length(11),
+            Constraint::Min(12),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(5),
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .highlight_style(highlight_style)
+        .highlight_symbol("› ")
+        .highlight_spacing(HighlightSpacing::Always);
 
     let mut table_state = TableState::default();
     table_state.select(
@@ -1571,7 +1668,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
             .checked_sub(offset)
             .filter(|position| *position < visible_rows),
     );
-    f.render_stateful_widget(table, area, &mut table_state);
+    f.render_stateful_widget(table, body, &mut table_state);
 
     if filtered.len() > 1 {
         let mut scrollbar_state = ScrollbarState::new(filtered.len())
@@ -1582,16 +1679,10 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
             .begin_symbol(None)
             .end_symbol(None)
             .track_symbol(None)
-            .thumb_symbol("▐");
+            .thumb_symbol("▐")
+            .thumb_style(Style::default().fg(THEME_MUTED));
 
-        f.render_stateful_widget(
-            scrollbar,
-            area.inner(&Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut scrollbar_state,
-        );
+        f.render_stateful_widget(scrollbar, body, &mut scrollbar_state);
     }
 }
 
@@ -1935,6 +2026,55 @@ fn request_detail_lines_for(
     }
 }
 
+fn draw_detail_chrome(
+    f: &mut Frame,
+    area: Rect,
+    title: String,
+    annotation_count: usize,
+    progress: Option<u8>,
+    focused: bool,
+    divider: bool,
+) {
+    if divider {
+        f.render_widget(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(THEME_BORDER)),
+            area,
+        );
+    }
+
+    let title_style = Style::default()
+        .fg(if focused { THEME_FOCUS } else { THEME_MUTED })
+        .bg(THEME_SURFACE)
+        .add_modifier(if focused {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let mut spans = vec![Span::styled(title, title_style)];
+    if annotation_count > 0 {
+        spans.push(Span::styled(
+            format!(" · ◆{annotation_count}"),
+            Style::default()
+                .fg(ANNOTATION_AMBER)
+                .bg(THEME_SURFACE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(progress) = progress {
+        spans.push(Span::styled(
+            format!(" · {progress}%"),
+            Style::default().fg(THEME_MUTED).bg(THEME_SURFACE),
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(THEME_SURFACE)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+}
+
 fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     let inner_area = area.inner(&Margin {
         vertical: 1,
@@ -1970,34 +2110,30 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
         vec![]
     };
 
-    // Create title with scroll indicator
-    let base_title = detail_title("Request Details", app, Focus::RequestSection);
-
-    let scroll_info = if total_lines > visible_lines {
-        let progress = ((start_line as f32 / max_scroll as f32) * 100.0) as u8;
-        format!("{} ({}% - vim: j/k/d/u/G/g)", base_title, progress)
+    let tab = if app.request_tab == 0 {
+        "Headers"
     } else {
-        base_title
+        "Body"
     };
+    let title = detail_title(
+        &format!("Request · {tab} · {source_lines} lines"),
+        app,
+        Focus::RequestSection,
+    );
+    let progress = (total_lines > visible_lines)
+        .then(|| ((start_line as f32 / max_scroll as f32) * 100.0) as u8);
+    draw_detail_chrome(
+        f,
+        area,
+        title,
+        annotations.len(),
+        progress,
+        matches!(app.focus, Focus::RequestSection),
+        true,
+    );
 
-    let details_block = if matches!(app.focus, Focus::RequestSection) {
-        Block::default()
-            .borders(Borders::ALL)
-            .title(scroll_info)
-            .border_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-    } else {
-        Block::default().borders(Borders::ALL).title(scroll_info)
-    };
-
-    let details = Paragraph::new(visible_content)
-        .block(details_block)
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(details, area);
+    let details = Paragraph::new(visible_content).wrap(Wrap { trim: false });
+    f.render_widget(details, inner_area);
 
     if total_lines > visible_lines {
         let mut scrollbar_state = ScrollbarState::new(total_lines).position(start_line);
@@ -2027,19 +2163,6 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
         &request_detail_lines(app),
         &annotations,
     );
-}
-
-fn draw_details_split(f: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(50), // Request details
-            Constraint::Percentage(50), // Response details
-        ])
-        .split(area);
-
-    draw_request_details(f, chunks[0], app);
-    draw_response_details(f, chunks[1], app);
 }
 
 pub fn response_detail_lines(app: &App) -> Vec<Line<'static>> {
@@ -2163,34 +2286,30 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
         vec![]
     };
 
-    // Create title with scroll indicator
-    let base_title = detail_title("Response Details", app, Focus::ResponseSection);
-
-    let scroll_info = if total_lines > visible_lines {
-        let progress = ((start_line as f32 / max_scroll as f32) * 100.0) as u8;
-        format!("{} ({}% - vim: j/k/d/u/G/g)", base_title, progress)
+    let tab = if app.response_tab == 0 {
+        "Headers"
     } else {
-        base_title
+        "Body"
     };
+    let title = detail_title(
+        &format!("Response · {tab} · {source_lines} lines"),
+        app,
+        Focus::ResponseSection,
+    );
+    let progress = (total_lines > visible_lines)
+        .then(|| ((start_line as f32 / max_scroll as f32) * 100.0) as u8);
+    draw_detail_chrome(
+        f,
+        area,
+        title,
+        annotations.len(),
+        progress,
+        matches!(app.focus, Focus::ResponseSection),
+        false,
+    );
 
-    let details_block = if matches!(app.focus, Focus::ResponseSection) {
-        Block::default()
-            .borders(Borders::ALL)
-            .title(scroll_info)
-            .border_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-    } else {
-        Block::default().borders(Borders::ALL).title(scroll_info)
-    };
-
-    let details = Paragraph::new(visible_content)
-        .block(details_block)
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(details, area);
+    let details = Paragraph::new(visible_content).wrap(Wrap { trim: false });
+    f.render_widget(details, inner_area);
 
     if total_lines > visible_lines {
         let mut scrollbar_state = ScrollbarState::new(total_lines).position(start_line);
@@ -2334,10 +2453,13 @@ impl KeybindInfo {
             Span::styled(
                 self.key.clone(),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(THEME_FOCUS)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(" {} | ", self.description)),
+            Span::styled(
+                format!(" {} | ", self.description),
+                Style::default().fg(THEME_MUTED),
+            ),
         ]
     }
 }
@@ -2348,6 +2470,15 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
             return vec![
                 KeybindInfo::new("?", "keybinds", 1),
                 KeybindInfo::new("y", "copy markdown", 1),
+                KeybindInfo::new(
+                    "r",
+                    if app.request_list_visible {
+                        "hide requests"
+                    } else {
+                        "show requests"
+                    },
+                    1,
+                ),
                 KeybindInfo::new(
                     "z",
                     if app.panel_fullscreen {
@@ -2371,6 +2502,15 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
             KeybindInfo::new("t", "target", 1),
             KeybindInfo::new("x", "start/stop", 1),
             KeybindInfo::new("y", "copy markdown", 1),
+            KeybindInfo::new(
+                "r",
+                if app.request_list_visible {
+                    "hide requests"
+                } else {
+                    "show requests"
+                },
+                1,
+            ),
             KeybindInfo::new(
                 "z",
                 if app.panel_fullscreen {
@@ -2411,19 +2551,20 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
         KeybindInfo::new("↑↓/j/k", "navigate", 1),
         KeybindInfo::new("Tab", "focus", 1),
         KeybindInfo::new("Enter", enter_description, 1),
+        KeybindInfo::new(",/.", "requests", 1),
         KeybindInfo::new("/", "filter", 2),
         KeybindInfo::new("h/l", "tabs", 2),
         KeybindInfo::new("d/u/g/G", "scroll", 2),
     ];
 
-    if app.app_mode == AppMode::Normal
-        && matches!(app.focus, Focus::RequestSection | Focus::ResponseSection)
-    {
-        keybinds.extend([
-            KeybindInfo::new("[/]", "annotations", 1),
-            KeybindInfo::new("v", "visual select", 1),
-            KeybindInfo::new("Esc", "clear selection", 2),
-        ]);
+    if app.app_mode == AppMode::Normal {
+        keybinds.push(KeybindInfo::new("[/]", "annotations", 1));
+        if matches!(app.focus, Focus::RequestSection | Focus::ResponseSection) {
+            keybinds.extend([
+                KeybindInfo::new("v", "visual select", 1),
+                KeybindInfo::new("Esc", "clear selection", 2),
+            ]);
+        }
     }
 
     // Add context-specific keybinds (priority 4)
@@ -2454,8 +2595,7 @@ fn arrange_keybinds_responsive(
     let mut current_line_spans = Vec::new();
     let mut current_line_width = 0;
 
-    // Account for border padding (2 chars for left/right borders)
-    let usable_width = available_width.saturating_sub(4);
+    let usable_width = available_width;
 
     // Sort keybinds by priority
     let mut sorted_keybinds = keybinds;
@@ -2527,7 +2667,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let footer_text: Vec<Line> = line_spans.into_iter().map(Line::from).collect();
 
     let footer =
-        Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL).title("Controls"));
+        Paragraph::new(footer_text).style(Style::default().fg(THEME_MUTED).bg(THEME_SURFACE));
 
     f.render_widget(footer, area);
 }
@@ -2543,7 +2683,7 @@ fn draw_input_dialog(f: &mut Frame, app: &App, title: &str, label: &str) {
         height: 7,
     };
 
-    f.render_widget(Clear, popup_area);
+    clear_popup(f, popup_area);
 
     let input_text = vec![
         Line::from(""),
@@ -2598,7 +2738,7 @@ fn draw_annotation_dialog(f: &mut Frame, main_area: Rect, app: &App) {
         ]),
     ];
 
-    f.render_widget(Clear, popup);
+    clear_popup(f, popup);
     f.render_widget(
         Paragraph::new(content)
             .block(
@@ -2673,17 +2813,10 @@ fn detail_panel_area(main_area: Rect, app: &App, panel: Focus) -> Option<Rect> {
         return (app.focus == panel).then_some(main_area);
     }
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main_area);
-    let details = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main[1]);
+    let (_, request, response) = normal_panel_areas(main_area, app);
     match panel {
-        Focus::RequestSection => Some(details[0]),
-        Focus::ResponseSection => Some(details[1]),
+        Focus::RequestSection => Some(request),
+        Focus::ResponseSection => Some(response),
         Focus::MessageList | Focus::StatusHeader => None,
     }
 }
@@ -2711,19 +2844,21 @@ fn annotation_dialog_title(app: &App) -> String {
 }
 
 fn draw_intercept_content(f: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50), // Pending requests list
-            Constraint::Percentage(50), // Request details/editor
-        ])
-        .split(area);
+    let columns = main_columns(area, app.request_list_visible);
 
-    draw_pending_requests(f, chunks[0], app);
-    draw_intercept_request_details(f, chunks[1], app);
+    if app.request_list_visible {
+        draw_pending_requests(f, columns[0], app);
+    }
+    draw_intercept_request_details(f, columns[1], app);
 }
 
 fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
+    let body = draw_sidebar_chrome(
+        f,
+        area,
+        format!("Pending Requests · {}", app.pending_requests.len()),
+        matches!(app.focus, Focus::MessageList),
+    );
     if app.pending_requests.is_empty() {
         let mode_text = match app.app_mode {
             AppMode::Paused => "Pause mode active. New requests will be intercepted.",
@@ -2731,15 +2866,10 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
         };
 
         let paragraph = Paragraph::new(mode_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Pending Requests"),
-            )
-            .style(Style::default().fg(Color::Yellow))
+            .style(Style::default().fg(Color::Rgb(218, 170, 94)))
             .wrap(Wrap { trim: true });
 
-        f.render_widget(paragraph, area);
+        f.render_widget(paragraph, body);
         return;
     }
 
@@ -2769,8 +2899,7 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
 
             let style = if i == app.selected_pending {
                 Style::default()
-                    .bg(Color::Cyan)
-                    .fg(Color::Black)
+                    .bg(THEME_SELECTED)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -2779,9 +2908,9 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
             // Show different icon if request has been modified
             let (icon, icon_color) =
                 if pending.modified_request.is_some() || pending.modified_headers.is_some() {
-                    ("✏ ", Color::Blue) // Modified
+                    ("✏ ", THEME_BLUE) // Modified
                 } else {
-                    ("⏸ ", Color::Red) // Paused/Intercepted
+                    ("⏸ ", Color::Rgb(202, 96, 103)) // Paused/Intercepted
                 };
 
             let mut modification_labels = Vec::new();
@@ -2799,14 +2928,12 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
 
             ListItem::new(Line::from(vec![
                 Span::styled(icon, Style::default().fg(icon_color)),
-                Span::styled(format!("{} ", method), Style::default().fg(Color::Red)),
-                Span::styled(format!("(id: {})", id), Style::default().fg(Color::Gray)),
+                Span::styled(format!("{} ", method), Style::default().fg(THEME_METHOD)),
+                Span::styled(format!("(id: {})", id), Style::default().fg(THEME_MUTED)),
                 if !modification_text.is_empty() {
                     Span::styled(
                         modification_text,
-                        Style::default()
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(THEME_BLUE).add_modifier(Modifier::BOLD),
                     )
                 } else {
                     Span::raw("")
@@ -2816,29 +2943,13 @@ fn draw_pending_requests(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let pending_block = if matches!(app.focus, Focus::MessageList) {
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Pending Requests ({})", app.pending_requests.len()))
-            .border_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-    } else {
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Pending Requests ({})", app.pending_requests.len()))
-    };
-
-    let requests_list = List::new(requests).block(pending_block).highlight_style(
+    let requests_list = List::new(requests).highlight_style(
         Style::default()
-            .bg(Color::Cyan)
-            .fg(Color::Black)
+            .bg(THEME_SELECTED)
             .add_modifier(Modifier::BOLD),
     );
 
-    f.render_widget(requests_list, area);
+    f.render_widget(requests_list, body);
 }
 
 fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
@@ -2848,14 +2959,12 @@ fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
         if pending.modified_request.is_some() || pending.modified_headers.is_some() {
             lines.push(Line::from(Span::styled(
                 "MODIFIED REQUEST:",
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Blue),
+                Style::default().add_modifier(Modifier::BOLD).fg(THEME_BLUE),
             )));
         } else {
             lines.push(Line::from(Span::styled(
                 "INTERCEPTED REQUEST:",
-                Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+                Style::default(),
             )));
         }
         lines.push(Line::from(""));
@@ -2987,34 +3096,21 @@ fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
         vec![]
     };
 
-    // Create title with scroll indicator
-    let scroll_info = if total_lines > visible_lines {
-        let progress = ((app.intercept_details_scroll as f32
-            / (total_lines - visible_lines) as f32)
-            * 100.0) as u8;
-        format!("Request Details ({}% - vim: j/k/d/u/G/g)", progress)
-    } else {
-        "Request Details".to_string()
-    };
+    let progress = (total_lines > visible_lines).then(|| {
+        ((app.intercept_details_scroll as f32 / (total_lines - visible_lines) as f32) * 100.0) as u8
+    });
+    draw_detail_chrome(
+        f,
+        area,
+        format!("Request · {total_lines} lines"),
+        0,
+        progress,
+        matches!(app.focus, Focus::RequestSection),
+        false,
+    );
 
-    let details_block = if matches!(app.focus, Focus::RequestSection) {
-        Block::default()
-            .borders(Borders::ALL)
-            .title(scroll_info)
-            .border_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-    } else {
-        Block::default().borders(Borders::ALL).title(scroll_info)
-    };
-
-    let details = Paragraph::new(visible_content)
-        .block(details_block)
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(details, area);
+    let details = Paragraph::new(visible_content).wrap(Wrap { trim: false });
+    f.render_widget(details, inner_area);
 
     if total_lines > visible_lines {
         let mut scrollbar_state =
@@ -3068,6 +3164,33 @@ mod tests {
             headers: None,
         });
         app
+    }
+
+    #[test]
+    fn request_durations_use_green_yellow_and_red_thresholds() {
+        let mut exchange = app_with_request().exchanges.remove(0);
+        let started = std::time::UNIX_EPOCH;
+        exchange.request.as_mut().unwrap().timestamp = started;
+
+        for (duration, expected_text, expected_color) in [
+            (std::time::Duration::from_millis(999), "999ms", THEME_FOCUS),
+            (
+                std::time::Duration::from_secs(5),
+                "5.00s",
+                Color::Rgb(218, 170, 94),
+            ),
+            (
+                std::time::Duration::from_secs(6),
+                "6.00s",
+                Color::Rgb(202, 96, 103),
+            ),
+        ] {
+            exchange.response.as_mut().unwrap().timestamp = started + duration;
+            assert_eq!(
+                exchange_duration(&exchange),
+                (expected_text.to_string(), expected_color)
+            );
+        }
     }
 
     #[test]
@@ -3139,16 +3262,79 @@ mod tests {
 
     fn normal_panels(area: Rect, app: &App) -> (Rect, Rect, Rect) {
         let screen = screen_chunks(area, app);
-        let main = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(screen[1]);
-        let details = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(main[1]);
+        normal_panel_areas(screen[1], app)
+    }
 
-        (main[0], details[0], details[1])
+    #[test]
+    fn shell_uses_two_line_toolbar_and_one_line_command_strip() {
+        let mut app = app_with_request();
+        let area = Rect::new(0, 0, 160, 40);
+        let screen = screen_chunks(area, &app);
+
+        assert_eq!(screen[0].height, 2);
+        assert_eq!(screen[1].height, area.height - 3);
+        assert_eq!(screen[2].height, 1);
+        assert_eq!(screen[3].height, 0);
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let top = (0..area.width)
+            .map(|column| terminal.backend().buffer().get(column, 0).symbol())
+            .collect::<String>();
+        assert!(top.contains("HTTP"));
+        assert!(top.contains("RUNNING"));
+        assert!(top.contains("RPC"));
+        assert_eq!(
+            terminal.backend().buffer().get(0, screen[2].y).bg,
+            THEME_SURFACE
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .get(area.width - 1, screen[1].y + 2)
+                .bg,
+            THEME_BACKGROUND
+        );
+
+        app.notice = Some("Saved".to_string());
+        assert_eq!(screen_chunks(area, &app)[3].height, 1);
+    }
+
+    #[test]
+    fn requests_are_a_sidebar_beside_stacked_details() {
+        let app = app_with_request();
+        let area = Rect::new(0, 0, 160, 40);
+        let (requests, request, response) = normal_panels(area, &app);
+
+        assert!(requests.width >= REQUEST_SIDEBAR_MIN_WIDTH);
+        assert!(requests.width <= REQUEST_SIDEBAR_MAX_WIDTH);
+        assert!(requests.width > 42);
+        assert!(requests.width < request.width);
+        assert_eq!(request.x, requests.right());
+        assert_eq!(response.x, request.x);
+        assert_eq!(response.width, request.width);
+        assert_eq!(response.y, request.bottom());
+    }
+
+    #[test]
+    fn hidden_request_sidebar_gives_details_the_full_width() {
+        let mut app = app_with_request();
+        let area = Rect::new(0, 0, 160, 40);
+        let main = screen_chunks(area, &app)[1];
+
+        app.toggle_request_list();
+
+        let (requests, request, response) = normal_panels(area, &app);
+        assert_eq!(requests.width, 0);
+        assert_eq!(request.x, main.x);
+        assert_eq!(request.width, main.width);
+        assert_eq!(response.width, main.width);
+        assert_eq!(
+            panel_focus(area, &app, request.x + 2, request.y + 2),
+            Some(Focus::RequestSection)
+        );
     }
 
     fn annotation(
@@ -3169,6 +3355,108 @@ mod tests {
             message: message.to_string(),
             text,
         }
+    }
+
+    #[test]
+    fn normal_panels_use_borderless_titles_and_amber_annotation_counts() {
+        let mut app = app_with_request();
+        app.add_annotation(annotation(
+            "note",
+            Focus::ResponseSection,
+            2,
+            2,
+            "Check this",
+            vec!["RESPONSE:".to_string()],
+        ));
+        let area = Rect::new(0, 0, 160, 40);
+        let (requests, request, response) = normal_panels(area, &app);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        for panel in [requests, request, response] {
+            assert_eq!(buffer.get(panel.x, panel.y).symbol(), "R");
+            assert_ne!(buffer.get(panel.right() - 1, panel.y).symbol(), "┐");
+        }
+
+        let diamond = (response.x..response.right())
+            .find(|column| buffer.get(*column, response.y).symbol() == "◆")
+            .unwrap();
+        assert_eq!(buffer.get(diamond, response.y).fg, ANNOTATION_AMBER);
+        assert_eq!(buffer.get(diamond + 1, response.y).symbol(), "1");
+        assert_eq!(buffer.get(diamond + 1, response.y).fg, ANNOTATION_AMBER);
+    }
+
+    #[test]
+    fn intercept_panels_use_the_same_borderless_chrome() {
+        let mut app = App::new();
+        app.app_mode = AppMode::Paused;
+        let area = Rect::new(0, 0, 160, 40);
+        let main = screen_chunks(area, &app)[1];
+        let panels = main_columns(main, true);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.get(panels[0].x, panels[0].y).symbol(), "P");
+        assert_eq!(buffer.get(panels[1].x, panels[1].y).symbol(), "R");
+        assert_ne!(buffer.get(panels[1].right() - 1, panels[1].y).symbol(), "┐");
+    }
+
+    #[test]
+    fn request_sidebar_keeps_transport_id_time_and_notes() {
+        let mut app = app_with_request();
+        app.add_annotation(annotation(
+            "note",
+            Focus::RequestSection,
+            2,
+            2,
+            "Check this",
+            vec!["Method: eth_call".to_string()],
+        ));
+        let area = Rect::new(0, 0, 160, 40);
+        let (requests, _, _) = normal_panels(area, &app);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| draw_message_list(frame, requests, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Requests · 1"));
+        assert!(rendered.contains("Transport"));
+        assert!(rendered.contains("eth_call"));
+        assert!(rendered.contains("ID"));
+        assert!(rendered.contains("Time"));
+        assert!(rendered.contains("HTTP"));
+        assert!(rendered.contains("◆1"));
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .get(requests.x + 1, requests.y + 2)
+                .bg,
+            THEME_SELECTED
+        );
+        let row = requests.y + 2;
+        let row_text = (requests.x..requests.right())
+            .map(|column| terminal.backend().buffer().get(column, row).symbol())
+            .collect::<String>();
+        let method_offset = u16::try_from(row_text.find("eth_call").unwrap()).unwrap();
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .get(requests.x + method_offset, row)
+                .fg,
+            THEME_METHOD
+        );
     }
 
     #[test]
@@ -3662,6 +3950,27 @@ mod tests {
     }
 
     #[test]
+    fn annotation_navigation_is_advertised_for_every_normal_focus() {
+        let mut app = App::new();
+        for focus in [
+            Focus::MessageList,
+            Focus::RequestSection,
+            Focus::ResponseSection,
+            Focus::StatusHeader,
+        ] {
+            app.focus = focus;
+            assert!(get_keybinds_for_mode(&app)
+                .iter()
+                .any(|keybind| keybind.key == "[/]"));
+        }
+
+        app.app_mode = AppMode::Paused;
+        assert!(!get_keybinds_for_mode(&app)
+            .iter()
+            .any(|keybind| keybind.key == "[/]"));
+    }
+
+    #[test]
     fn prefix_offers_add_annotation_only_during_visual_selection() {
         let mut app = app_with_request();
         app.focus = Focus::RequestSection;
@@ -3830,23 +4139,23 @@ mod tests {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
             .split(screen[0]);
-        let target_start = header[0].x + 11;
+        let target_start = header[0].x + 10;
         let filter_start = target_start + "Press t to set target".len() as u16 + 4;
 
         assert_eq!(
-            mouse_action(area, &app, target_start, header[0].y + 1),
+            mouse_action(area, &app, target_start, header[0].y),
             Some(MouseAction::EditTarget)
         );
         assert_eq!(
-            mouse_action(area, &app, filter_start, header[0].y + 1),
+            mouse_action(area, &app, filter_start, header[0].y),
             Some(MouseAction::EditFilter)
         );
         assert_eq!(
-            mouse_action(area, &app, header[1].x + 2, header[1].y + 1),
+            mouse_action(area, &app, header[1].x + 2, header[1].y),
             Some(MouseAction::SetProxyRunning(true))
         );
         assert_eq!(
-            mouse_action(area, &app, header[1].x + 11, header[1].y + 1),
+            mouse_action(area, &app, header[1].x + 11, header[1].y),
             Some(MouseAction::SetProxyRunning(false))
         );
     }
@@ -3887,7 +4196,7 @@ mod tests {
             title.push_str(terminal.backend().buffer().get(column, main.y).symbol());
             title
         });
-        assert!(title.contains("Response Details"));
+        assert!(title.contains("Response · Body"));
         assert!(!title.contains("Requests"));
         assert!(panel_visible_lines(area, &app, app.focus) > split_visible_lines);
         assert_eq!(
@@ -3919,6 +4228,39 @@ mod tests {
             message_list_action(area, &app, 2),
             Some(MouseAction::SelectExchange(3))
         );
+    }
+
+    #[test]
+    fn request_scrollbar_is_muted_not_annotation_amber() {
+        let mut app = app_with_request();
+        for id in 2..8 {
+            app.add_message(JsonRpcMessage {
+                id: Some(serde_json::json!(id)),
+                method: Some(format!("method_{id}")),
+                params: None,
+                result: None,
+                error: None,
+                timestamp: std::time::SystemTime::now(),
+                direction: MessageDirection::Request,
+                transport: TransportType::Http,
+                headers: None,
+            });
+        }
+        let area = Rect::new(0, 0, 80, 5);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| draw_message_list(frame, area, &app))
+            .unwrap();
+
+        let thumb = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "▐")
+            .unwrap();
+        assert_eq!(thumb.fg, THEME_MUTED);
+        assert_ne!(thumb.fg, ANNOTATION_AMBER);
     }
 
     #[test]

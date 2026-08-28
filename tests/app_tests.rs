@@ -551,6 +551,27 @@ fn detail_cursor_and_scroll_survive_focus_changes() {
 }
 
 #[test]
+fn hidden_request_list_is_not_focusable() {
+    let mut app = App::new();
+    app.focus = Focus::MessageList;
+
+    app.toggle_request_list();
+
+    assert!(!app.request_list_visible);
+    assert_eq!(app.focus, Focus::RequestSection);
+
+    app.switch_focus_reverse();
+    assert_eq!(app.focus, Focus::StatusHeader);
+    app.switch_focus();
+    assert_eq!(app.focus, Focus::RequestSection);
+
+    app.toggle_request_list();
+    app.set_focus(Focus::StatusHeader);
+    app.switch_focus();
+    assert_eq!(app.focus, Focus::MessageList);
+}
+
+#[test]
 fn inline_editor_edits_multiline_unicode_text() {
     let mut editor = TextEditor::new(EditorTarget::NewRequest, "aé\ncd".to_string());
 
@@ -832,7 +853,7 @@ fn adding_an_annotation_preserves_the_viewport() {
 }
 
 #[test]
-fn annotation_navigation_spans_exchanges_in_the_focused_panel() {
+fn annotation_navigation_is_global_and_selects_the_target_tab() {
     let annotation = |id: &str, panel: Focus, tab: DetailTab, exchange, line| LineAnnotation {
         id: id.to_string(),
         exchange_index: exchange,
@@ -868,29 +889,118 @@ fn annotation_navigation_spans_exchanges_in_the_focused_panel() {
         annotation("exchange-1", Focus::RequestSection, DetailTab::Body, 1, 1),
     ];
 
-    assert!(app.focus_next_annotation());
-    assert_eq!(app.active_annotation_id.as_deref(), Some("request-2a"));
-    assert!(app.focus_next_annotation());
-    assert_eq!(app.active_annotation_id.as_deref(), Some("request-2b"));
-    assert!(app.focus_next_annotation());
-    assert_eq!(app.active_annotation_id.as_deref(), Some("request-5"));
+    for id in ["request-2a", "request-2b", "request-5", "response-1"] {
+        assert!(app.focus_next_annotation());
+        assert_eq!(app.active_annotation_id.as_deref(), Some(id));
+        assert!(app.line_selection.is_none());
+    }
+    assert_eq!(app.focus, Focus::ResponseSection);
+    assert_eq!(app.response_tab, 1);
+
     assert!(app.focus_next_annotation());
     assert_eq!(app.active_annotation_id.as_deref(), Some("exchange-1"));
     assert_eq!(app.selected_exchange, 1);
-    assert!(!app.focus_next_annotation());
+    assert_eq!(app.focus, Focus::RequestSection);
+
+    assert!(app.focus_next_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("headers-1"));
+    assert_eq!(app.selected_exchange, 0);
+    assert_eq!(app.request_tab, 0);
+
+    assert!(app.focus_next_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("request-2a"));
+    assert_eq!(app.request_tab, 1);
+
+    assert!(app.focus_previous_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("headers-1"));
+    assert_eq!(app.request_tab, 0);
+
+    assert!(app.focus_previous_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("exchange-1"));
+    assert_eq!(app.selected_exchange, 1);
+
+    assert!(app.focus_previous_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("response-1"));
+    assert_eq!(app.selected_exchange, 0);
+    assert_eq!(app.focus, Focus::ResponseSection);
 
     assert!(app.focus_previous_annotation());
     assert_eq!(app.active_annotation_id.as_deref(), Some("request-5"));
-    assert_eq!(app.selected_exchange, 0);
-    assert!(app.focus_previous_annotation());
-    assert_eq!(app.active_annotation_id.as_deref(), Some("request-2b"));
-    assert!(app.focus_previous_annotation());
-    assert_eq!(app.active_annotation_id.as_deref(), Some("request-2a"));
-    assert!(!app.focus_previous_annotation());
+    assert_eq!(app.focus, Focus::RequestSection);
+}
 
-    app.set_focus(Focus::ResponseSection);
+#[test]
+fn annotation_navigation_starts_from_the_selected_exchange_outside_details() {
+    let mut app = App::new();
+    for id in 0..2 {
+        app.add_message(JsonRpcMessage {
+            id: Some(serde_json::json!(id)),
+            method: Some(format!("method_{id}")),
+            params: None,
+            result: None,
+            error: None,
+            timestamp: std::time::SystemTime::now(),
+            direction: MessageDirection::Request,
+            transport: TransportType::Http,
+            headers: None,
+        });
+    }
+    app.annotations = vec![
+        LineAnnotation {
+            id: "request".to_string(),
+            exchange_index: 0,
+            panel: Focus::RequestSection,
+            tab: DetailTab::Body,
+            start_line: 2,
+            end_line: 2,
+            message: "request".to_string(),
+            text: vec!["request".to_string()],
+        },
+        LineAnnotation {
+            id: "response".to_string(),
+            exchange_index: 0,
+            panel: Focus::ResponseSection,
+            tab: DetailTab::Body,
+            start_line: 2,
+            end_line: 2,
+            message: "response".to_string(),
+            text: vec!["response".to_string()],
+        },
+        LineAnnotation {
+            id: "next-exchange".to_string(),
+            exchange_index: 1,
+            panel: Focus::RequestSection,
+            tab: DetailTab::Headers,
+            start_line: 1,
+            end_line: 1,
+            message: "next".to_string(),
+            text: vec!["next".to_string()],
+        },
+    ];
+
+    app.select_exchange(0);
+    app.set_focus(Focus::MessageList);
     assert!(app.focus_next_annotation());
-    assert_eq!(app.active_annotation_id.as_deref(), Some("response-1"));
+    assert_eq!(app.active_annotation_id.as_deref(), Some("request"));
+    assert_eq!(app.focus, Focus::RequestSection);
+
+    app.select_exchange(0);
+    app.set_focus(Focus::MessageList);
+    assert!(app.focus_previous_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("response"));
+    assert_eq!(app.focus, Focus::ResponseSection);
+
+    app.select_exchange(1);
+    app.set_focus(Focus::StatusHeader);
+    assert!(app.focus_next_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("next-exchange"));
+    assert_eq!(app.selected_exchange, 1);
+    assert_eq!(app.focus, Focus::RequestSection);
+    assert_eq!(app.request_tab, 0);
+
+    assert!(app.focus_next_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("request"));
+    assert_eq!(app.selected_exchange, 0);
 }
 
 #[test]

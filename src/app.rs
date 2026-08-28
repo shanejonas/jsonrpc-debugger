@@ -868,6 +868,7 @@ pub struct App {
     pub control_port: u16,
     pub overlay: Overlay,
     pub panel_fullscreen: bool,
+    pub request_list_visible: bool,
     pub session: Option<SessionSummary>,
     pub sessions: Vec<SessionSummary>,
     pub selected_session: usize,
@@ -1068,6 +1069,7 @@ impl App {
             control_port: 8081,
             overlay: Overlay::None,
             panel_fullscreen: false,
+            request_list_visible: true,
             session: None,
             sessions: Vec::new(),
             selected_session: 0,
@@ -1437,6 +1439,15 @@ impl App {
         if annotation.exchange_index != self.selected_exchange {
             self.select_exchange(annotation.exchange_index);
         }
+        match annotation.panel {
+            Focus::RequestSection => {
+                self.request_tab = usize::from(annotation.tab == DetailTab::Body)
+            }
+            Focus::ResponseSection => {
+                self.response_tab = usize::from(annotation.tab == DetailTab::Body)
+            }
+            Focus::MessageList | Focus::StatusHeader => return,
+        }
         self.reveal_lines(
             annotation.panel,
             annotation.start_line,
@@ -1456,54 +1467,83 @@ impl App {
     }
 
     fn focus_adjacent_annotation(&mut self, next: bool) -> bool {
-        let panel = self.focus;
-        let Some(cursor) = self.detail_cursor_line(panel) else {
-            return false;
-        };
-        let Some(tab) = self.detail_tab(panel) else {
-            return false;
-        };
         let selected_exchange = self.selected_exchange;
         let id = {
-            let mut annotations = self
-                .annotations
-                .iter()
-                .filter(|annotation| annotation.panel == panel && annotation.tab == tab)
-                .collect::<Vec<_>>();
-            annotations.sort_by_key(|annotation| {
+            let panel_order = |panel| match panel {
+                Focus::RequestSection => 0,
+                Focus::ResponseSection => 1,
+                Focus::MessageList => 2,
+                Focus::StatusHeader => 3,
+            };
+            let tab_order = |tab| match tab {
+                DetailTab::Headers => 0,
+                DetailTab::Body => 1,
+            };
+            let position = |annotation: &LineAnnotation| {
                 (
                     annotation.exchange_index,
+                    panel_order(annotation.panel),
+                    tab_order(annotation.tab),
+                )
+            };
+            let mut annotations = self.annotations.iter().collect::<Vec<_>>();
+            annotations.sort_by_key(|annotation| {
+                (
+                    position(annotation),
                     annotation.start_line,
                     annotation.end_line,
                 )
             });
+
             let active = self.active_annotation_id.as_deref().and_then(|id| {
-                annotations.iter().position(|annotation| {
-                    annotation.id == id
-                        && annotation.exchange_index == selected_exchange
-                        && (annotation.start_line..=annotation.end_line).contains(&cursor)
-                })
+                annotations
+                    .iter()
+                    .position(|annotation| annotation.id == id)
             });
             let annotation = if let Some(index) = active {
                 if next {
-                    annotations.get(index + 1)
+                    annotations.get(index + 1).or_else(|| annotations.first())
                 } else {
                     index
                         .checked_sub(1)
                         .and_then(|index| annotations.get(index))
+                        .or_else(|| annotations.last())
+                }
+            } else if let (Some(tab), Some(cursor)) = (
+                self.detail_tab(self.focus),
+                self.detail_cursor_line(self.focus),
+            ) {
+                let anchor = (selected_exchange, panel_order(self.focus), tab_order(tab));
+                if next {
+                    annotations
+                        .iter()
+                        .find(|annotation| {
+                            position(annotation) > anchor
+                                || (position(annotation) == anchor && annotation.end_line >= cursor)
+                        })
+                        .or_else(|| annotations.first())
+                } else {
+                    annotations
+                        .iter()
+                        .rev()
+                        .find(|annotation| {
+                            position(annotation) < anchor
+                                || (position(annotation) == anchor
+                                    && annotation.start_line <= cursor)
+                        })
+                        .or_else(|| annotations.last())
                 }
             } else if next {
-                annotations.iter().find(|annotation| {
-                    annotation.exchange_index > selected_exchange
-                        || (annotation.exchange_index == selected_exchange
-                            && annotation.end_line >= cursor)
-                })
+                annotations
+                    .iter()
+                    .find(|annotation| annotation.exchange_index >= selected_exchange)
+                    .or_else(|| annotations.first())
             } else {
-                annotations.iter().rev().find(|annotation| {
-                    annotation.exchange_index < selected_exchange
-                        || (annotation.exchange_index == selected_exchange
-                            && annotation.start_line <= cursor)
-                })
+                annotations
+                    .iter()
+                    .rev()
+                    .find(|annotation| annotation.exchange_index <= selected_exchange)
+                    .or_else(|| annotations.last())
             };
             annotation.map(|annotation| annotation.id.clone())
         };
@@ -1512,6 +1552,7 @@ impl App {
         };
 
         self.focus_annotation(&id);
+        self.clear_line_selection();
         true
     }
 
@@ -1660,6 +1701,14 @@ impl App {
             return;
         }
         self.panel_fullscreen = fullscreen;
+        self.mark_changed();
+    }
+
+    pub fn toggle_request_list(&mut self) {
+        self.request_list_visible = !self.request_list_visible;
+        if !self.request_list_visible && self.focus == Focus::MessageList {
+            self.focus = Focus::RequestSection;
+        }
         self.mark_changed();
     }
 
@@ -1920,7 +1969,8 @@ impl App {
             Focus::MessageList => Focus::RequestSection,
             Focus::RequestSection => Focus::ResponseSection,
             Focus::ResponseSection => Focus::StatusHeader,
-            Focus::StatusHeader => Focus::MessageList,
+            Focus::StatusHeader if self.request_list_visible => Focus::MessageList,
+            Focus::StatusHeader => Focus::RequestSection,
         };
         self.mark_changed();
     }
@@ -1928,7 +1978,8 @@ impl App {
     pub fn switch_focus_reverse(&mut self) {
         self.focus = match self.focus {
             Focus::MessageList => Focus::StatusHeader,
-            Focus::RequestSection => Focus::MessageList,
+            Focus::RequestSection if self.request_list_visible => Focus::MessageList,
+            Focus::RequestSection => Focus::StatusHeader,
             Focus::ResponseSection => Focus::RequestSection,
             Focus::StatusHeader => Focus::ResponseSection,
         };

@@ -1450,6 +1450,10 @@ async fn run_attached_app(
                 KeyCode::Char('?') => app.show_help(),
                 KeyCode::Char('z') => app.set_panel_fullscreen(!app.panel_fullscreen),
                 KeyCode::Char('y') => copy_focused_panel(terminal, app)?,
+                KeyCode::Char('r') => {
+                    app.close_overlay();
+                    app.toggle_request_list();
+                }
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Esc => app.close_overlay(),
                 _ => {}
@@ -1470,6 +1474,10 @@ async fn run_attached_app(
                 KeyCode::Char(character) => app.handle_input_char(character),
                 _ => {}
             }
+            continue;
+        }
+
+        if navigate_request(app, key.code) {
             continue;
         }
 
@@ -1799,7 +1807,6 @@ async fn run_app(
                                     )
                                     .await;
                                 }
-                                terminal.clear()?;
                             }
                             KeyCode::Esc => {
                                 app.cancel_editing();
@@ -1879,6 +1886,10 @@ async fn run_app(
                 }
 
                 // Normal mode key handling
+                if navigate_request(&mut app, key.code) {
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Esc => {
                         app.clear_line_selection();
@@ -1915,18 +1926,14 @@ async fn run_app(
                     KeyCode::Left => {
                         if app.is_status_focused() {
                             let desired_running = !app.is_running;
-                            if set_proxy_running(
+                            set_proxy_running(
                                 &mut app,
                                 desired_running,
                                 &mut runtime.proxy_server,
                                 &runtime.message_sender,
                                 &runtime.proxy_state,
                             )
-                            .await
-                            {
-                                terminal.clear()?;
-                                terminal.draw(|f| ui::draw(f, &app))?;
-                            }
+                            .await;
                         } else if app.app_mode == app::AppMode::Normal {
                             if app.is_request_section_focused() {
                                 app.previous_request_tab();
@@ -1940,18 +1947,14 @@ async fn run_app(
                     KeyCode::Right => {
                         if app.is_status_focused() {
                             let desired_running = !app.is_running;
-                            if set_proxy_running(
+                            set_proxy_running(
                                 &mut app,
                                 desired_running,
                                 &mut runtime.proxy_server,
                                 &runtime.message_sender,
                                 &runtime.proxy_state,
                             )
-                            .await
-                            {
-                                terminal.clear()?;
-                                terminal.draw(|f| ui::draw(f, &app))?;
-                            }
+                            .await;
                         } else if app.app_mode == app::AppMode::Normal {
                             if app.is_request_section_focused() {
                                 app.next_request_tab();
@@ -2093,18 +2096,14 @@ async fn run_app(
                     KeyCode::Char('h') => {
                         if app.is_status_focused() && app.app_mode == app::AppMode::Normal {
                             let desired_running = !app.is_running;
-                            if set_proxy_running(
+                            set_proxy_running(
                                 &mut app,
                                 desired_running,
                                 &mut runtime.proxy_server,
                                 &runtime.message_sender,
                                 &runtime.proxy_state,
                             )
-                            .await
-                            {
-                                terminal.clear()?;
-                                terminal.draw(|f| ui::draw(f, &app))?;
-                            }
+                            .await;
                             continue;
                         }
 
@@ -2145,23 +2144,18 @@ async fn run_app(
                     {
                         // Resume all pending requests
                         app.resume_all_requests();
-                        terminal.clear()?;
                     }
                     KeyCode::Char('l') => {
                         if app.is_status_focused() && app.app_mode == app::AppMode::Normal {
                             let desired_running = !app.is_running;
-                            if set_proxy_running(
+                            set_proxy_running(
                                 &mut app,
                                 desired_running,
                                 &mut runtime.proxy_server,
                                 &runtime.message_sender,
                                 &runtime.proxy_state,
                             )
-                            .await
-                            {
-                                terminal.clear()?;
-                                terminal.draw(|f| ui::draw(f, &app))?;
-                            }
+                            .await;
                         } else if app.app_mode == app::AppMode::Normal
                             && (app.is_request_section_focused()
                                 || app.is_response_section_focused())
@@ -2286,6 +2280,10 @@ async fn handle_overlay_key(
                 app.close_overlay();
                 app.start_renaming_session();
             }
+            KeyCode::Char('r') => {
+                app.close_overlay();
+                app.toggle_request_list();
+            }
             KeyCode::Char('c') => {
                 app.close_overlay();
                 open_new_request(app);
@@ -2293,7 +2291,6 @@ async fn handle_overlay_key(
             KeyCode::Char('p') => {
                 app.close_overlay();
                 app.toggle_pause_mode();
-                terminal.clear()?;
             }
             KeyCode::Char('t') => {
                 app.close_overlay();
@@ -2302,17 +2299,14 @@ async fn handle_overlay_key(
             KeyCode::Char('x') => {
                 app.close_overlay();
                 let desired_running = !app.is_running;
-                if set_proxy_running(
+                set_proxy_running(
                     app,
                     desired_running,
                     &mut runtime.proxy_server,
                     &runtime.message_sender,
                     &runtime.proxy_state,
                 )
-                .await
-                {
-                    terminal.clear()?;
-                }
+                .await;
             }
             KeyCode::Char('q') => {
                 stop_proxy(&mut runtime.proxy_server).await;
@@ -2355,6 +2349,19 @@ async fn handle_overlay_key(
     }
 
     Ok(false)
+}
+
+fn navigate_request(app: &mut App, key: KeyCode) -> bool {
+    if app.app_mode != AppMode::Normal {
+        return false;
+    }
+
+    match key {
+        KeyCode::Char(',') => app.select_previous(),
+        KeyCode::Char('.') => app.select_next(),
+        _ => return false,
+    }
+    true
 }
 
 fn is_fullscreen_key(key: &KeyEvent) -> bool {
@@ -2510,9 +2517,7 @@ async fn handle_mouse_event(
         ui::MouseAction::EditFilter => app.start_filtering_requests(),
         ui::MouseAction::SetProxyRunning(should_run) => {
             app.set_focus(app::Focus::StatusHeader);
-            if set_proxy_running(app, should_run, proxy_server, message_sender, proxy_state).await {
-                terminal.clear()?;
-            }
+            set_proxy_running(app, should_run, proxy_server, message_sender, proxy_state).await;
         }
         ui::MouseAction::SelectExchange(index) => {
             app.set_focus(app::Focus::MessageList);
@@ -2782,9 +2787,9 @@ async fn set_proxy_running(
     proxy_server: &mut Option<JoinHandle<()>>,
     message_sender: &mpsc::UnboundedSender<app::JsonRpcMessage>,
     proxy_state: &ProxyState,
-) -> bool {
+) {
     if should_run == app.is_running {
-        return false;
+        return;
     }
 
     if should_run {
@@ -2813,8 +2818,6 @@ async fn set_proxy_running(
         }
         app.toggle_proxy();
     }
-
-    true
 }
 
 #[cfg(test)]
@@ -2922,6 +2925,26 @@ mod tests {
             transport: app::TransportType::Http,
             headers: None,
         }
+    }
+
+    #[test]
+    fn request_navigation_keys_work_from_details() {
+        let mut app = App::new();
+        app.add_message(rpc_message(1, app::MessageDirection::Request));
+        app.add_message(rpc_message(2, app::MessageDirection::Request));
+        app.select_exchange(0);
+        app.set_focus(app::Focus::ResponseSection);
+
+        assert!(navigate_request(&mut app, KeyCode::Char('.')));
+        assert_eq!(app.selected_exchange, 1);
+        assert_eq!(app.focus, app::Focus::ResponseSection);
+
+        assert!(navigate_request(&mut app, KeyCode::Char(',')));
+        assert_eq!(app.selected_exchange, 0);
+
+        app.app_mode = AppMode::Paused;
+        assert!(!navigate_request(&mut app, KeyCode::Char('.')));
+        assert_eq!(app.selected_exchange, 0);
     }
 
     #[test]
