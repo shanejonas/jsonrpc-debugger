@@ -89,7 +89,7 @@ enum TargetMode {
         command: Vec<OsString>,
     },
 
-    /// Attach a read-only TUI to a transparent wrapper
+    /// Attach an interactive TUI to a transparent wrapper
     Attach {
         /// Wrapper control-plane URL
         #[arg(default_value = "http://127.0.0.1:8081")]
@@ -369,7 +369,7 @@ fn save_editor(app: &mut App, request_result_sender: &mpsc::UnboundedSender<Resu
                 tokio::spawn(async move {
                     let _ = sender.send(app::send_new_request(request).await.map(|_| ()));
                 });
-                app.notice = Some("Sending request…".to_string());
+                app.set_notice("Sending request…");
                 return;
             }
             Err(error) => Err(error),
@@ -377,7 +377,7 @@ fn save_editor(app: &mut App, request_result_sender: &mpsc::UnboundedSender<Resu
     };
 
     match result {
-        Ok(notice) => app.notice = Some(notice),
+        Ok(notice) => app.set_notice(notice),
         Err(error) => {
             editor.error = Some(error);
             app.editor = Some(editor);
@@ -668,12 +668,6 @@ async fn handle_control_command(
             Ok(control::state(app))
         }
         ControlAction::SetPaused { paused } => {
-            if app.proxy_config.transparent {
-                let _ = reply.send(Err(ControlError::invalid_params(
-                    "transparent wrappers cannot pause the external client yet",
-                )));
-                return;
-            }
             if paused {
                 app.clear_line_selection();
             }
@@ -687,6 +681,9 @@ async fn handle_control_command(
             if app.app_mode != mode {
                 app.app_mode = mode;
                 app.mark_changed();
+            }
+            if let Ok(mut shared_mode) = proxy_state.app_mode.lock() {
+                *shared_mode = app.app_mode;
             }
             Ok(control::state(app))
         }
@@ -1262,10 +1259,9 @@ async fn run_transparent_wrap(
 ) -> Result<()> {
     let target = stdio::display_command(command);
     let (message_sender, message_receiver) = mpsc::unbounded_channel();
-    let (_pending_sender, pending_receiver) = mpsc::unbounded_channel();
+    let (pending_sender, pending_receiver) = mpsc::unbounded_channel();
     let (control_sender, control_receiver) = mpsc::unbounded_channel();
     let shared_app_mode = Arc::new(Mutex::new(AppMode::Normal));
-    let (pending_sender, _pending_messages) = mpsc::unbounded_channel();
     let proxy_state = ProxyState {
         app_mode: shared_app_mode.clone(),
         pending_sender,
@@ -1308,13 +1304,22 @@ async fn run_transparent_wrap(
         change_waiters: Vec::new(),
     };
     let relay_command = command.to_vec();
-    let mut relay =
-        tokio::spawn(async move { stdio::wrap(&relay_command, framing, message_sender).await });
+    let relay_state = runtime.proxy_state.clone();
+    let mut relay = tokio::spawn(async move {
+        stdio::wrap(&relay_command, framing, message_sender, relay_state).await
+    });
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
     loop {
         record_new_messages(&mut app, &mut runtime.history);
+        if let Ok(mut shared_mode) = runtime.shared_app_mode.try_lock() {
+            *shared_mode = app.app_mode;
+        }
+        while let Ok(pending_request) = runtime.pending_receiver.try_recv() {
+            app.pending_requests.push(pending_request);
+            app.mark_changed();
+        }
         while let Ok(command) = runtime.control_receiver.try_recv() {
             let Some(command) = register_change_waiter(&app, command, &mut runtime.change_waiters)
             else {
@@ -1413,20 +1418,21 @@ async fn run_attached_app(
                     match client.snapshot(state).await {
                         Ok(snapshot) => {
                             if let Err(error) = snapshot.apply(app) {
-                                app.notice = Some(format!("Error: {error}"));
+                                app.set_notice(format!("Error: {error}"));
                             } else {
                                 *revision = next_revision;
                             }
                         }
-                        Err(error) => app.notice = Some(format!("Error: {error}")),
+                        Err(error) => app.set_notice(format!("Error: {error}")),
                     }
                 }
                 Ok(_) => {}
-                Err(error) => app.notice = Some(format!("Error: {error}")),
+                Err(error) => app.set_notice(format!("Error: {error}")),
             }
             last_refresh = Instant::now();
         }
 
+        app.clear_expired_notice();
         terminal.draw(|frame| ui::draw(frame, app))?;
         if !event::poll(std::time::Duration::from_millis(50))? {
             continue;
@@ -1450,6 +1456,27 @@ async fn run_attached_app(
                 KeyCode::Char('?') => app.show_help(),
                 KeyCode::Char('z') => app.set_panel_fullscreen(!app.panel_fullscreen),
                 KeyCode::Char('y') => copy_focused_panel(terminal, app)?,
+                KeyCode::Char('p') => {
+                    app.close_overlay();
+                    let paused = app.app_mode != AppMode::Paused;
+                    match client.set_paused(paused).await {
+                        Ok(()) => {
+                            app.app_mode = if paused {
+                                AppMode::Paused
+                            } else if app.pending_requests.is_empty() {
+                                AppMode::Normal
+                            } else {
+                                AppMode::Intercepting
+                            };
+                            app.set_notice(if paused {
+                                "Client requests paused"
+                            } else {
+                                "New client requests resumed"
+                            });
+                        }
+                        Err(error) => app.set_notice(format!("Error: {error}")),
+                    }
+                }
                 KeyCode::Char('r') => {
                     app.close_overlay();
                     app.toggle_request_list();
@@ -1463,6 +1490,19 @@ async fn run_attached_app(
         if app.overlay == Overlay::Help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 app.close_overlay();
+            }
+            continue;
+        }
+        if app.editor.is_some() {
+            let action = app
+                .editor
+                .as_mut()
+                .map(|editor| handle_editor_key(editor, key))
+                .unwrap_or(EditorAction::None);
+            match action {
+                EditorAction::None => {}
+                EditorAction::Save => save_attached_editor(app, client).await,
+                EditorAction::Cancel => app.editor = None,
             }
             continue;
         }
@@ -1484,25 +1524,53 @@ async fn run_attached_app(
         match key.code {
             KeyCode::Esc => app.clear_line_selection(),
             KeyCode::Enter => {
-                if !enter_request_list(app) {
+                if app.app_mode == AppMode::Normal && !enter_request_list(app) {
                     copy_focused_panel(terminal, app)?;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if app.is_message_list_focused() {
-                    app.select_previous();
-                } else {
-                    move_focused_detail_cursor(app, -1, terminal.size()?);
+            KeyCode::Up => match app.app_mode {
+                AppMode::Normal => {
+                    if app.is_message_list_focused() {
+                        app.select_previous();
+                    } else {
+                        move_focused_detail_cursor(app, -1, terminal.size()?);
+                    }
                 }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if app.is_message_list_focused() {
-                    app.select_next();
-                } else {
-                    move_focused_detail_cursor(app, 1, terminal.size()?);
+                AppMode::Paused | AppMode::Intercepting => app.select_previous_pending(),
+            },
+            KeyCode::Down => match app.app_mode {
+                AppMode::Normal => {
+                    if app.is_message_list_focused() {
+                        app.select_next();
+                    } else {
+                        move_focused_detail_cursor(app, 1, terminal.size()?);
+                    }
                 }
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
+                AppMode::Paused | AppMode::Intercepting => app.select_next_pending(),
+            },
+            KeyCode::Char('k') => match app.app_mode {
+                AppMode::Normal => {
+                    if app.is_message_list_focused() {
+                        app.select_previous();
+                    } else {
+                        move_focused_detail_cursor(app, -1, terminal.size()?);
+                    }
+                }
+                AppMode::Paused | AppMode::Intercepting => app.scroll_intercept_details_up(),
+            },
+            KeyCode::Char('j') => match app.app_mode {
+                AppMode::Normal => {
+                    if app.is_message_list_focused() {
+                        app.select_next();
+                    } else {
+                        move_focused_detail_cursor(app, 1, terminal.size()?);
+                    }
+                }
+                AppMode::Paused | AppMode::Intercepting => {
+                    app.intercept_details_scroll += 1;
+                }
+            },
+            KeyCode::Left | KeyCode::Char('h') if app.app_mode == AppMode::Normal => {
                 if app.is_request_section_focused() {
                     app.previous_request_tab();
                 } else if app.is_response_section_focused() {
@@ -1511,7 +1579,7 @@ async fn run_attached_app(
                     app.select_previous();
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Right | KeyCode::Char('l') if app.app_mode == AppMode::Normal => {
                 if app.is_request_section_focused() {
                     app.next_request_tab();
                 } else if app.is_response_section_focused() {
@@ -1520,31 +1588,166 @@ async fn run_attached_app(
                     app.select_next();
                 }
             }
-            KeyCode::Tab => app.switch_focus(),
-            KeyCode::BackTab => app.switch_focus_reverse(),
-            KeyCode::Char('u') => {
-                move_focused_detail_cursor(app, -10, terminal.size()?);
-            }
-            KeyCode::Char('d') => {
-                move_focused_detail_cursor(app, 10, terminal.size()?);
-            }
-            KeyCode::Char('g') => {
-                move_focused_detail_cursor(app, i64::MIN, terminal.size()?);
-            }
-            KeyCode::Char('G') => {
-                move_focused_detail_cursor(app, i64::MAX, terminal.size()?);
-            }
-            KeyCode::Char('[') => {
+            KeyCode::Tab if app.app_mode == AppMode::Normal => app.switch_focus(),
+            KeyCode::BackTab if app.app_mode == AppMode::Normal => app.switch_focus_reverse(),
+            KeyCode::Char('u') => match app.app_mode {
+                AppMode::Normal => move_focused_detail_cursor(app, -10, terminal.size()?),
+                AppMode::Paused | AppMode::Intercepting => app.page_up_intercept_details(),
+            },
+            KeyCode::Char('d') => match app.app_mode {
+                AppMode::Normal => move_focused_detail_cursor(app, 10, terminal.size()?),
+                AppMode::Paused | AppMode::Intercepting => app.page_down_intercept_details(),
+            },
+            KeyCode::Char('g') => match app.app_mode {
+                AppMode::Normal => move_focused_detail_cursor(app, i64::MIN, terminal.size()?),
+                AppMode::Paused | AppMode::Intercepting => app.goto_top_intercept_details(),
+            },
+            KeyCode::Char('G') => match app.app_mode {
+                AppMode::Normal => move_focused_detail_cursor(app, i64::MAX, terminal.size()?),
+                AppMode::Paused | AppMode::Intercepting => {
+                    app.goto_bottom_intercept_details(1000, 20)
+                }
+            },
+            KeyCode::Char('[') if app.app_mode == AppMode::Normal => {
                 app.focus_previous_annotation();
             }
-            KeyCode::Char(']') => {
+            KeyCode::Char(']') if app.app_mode == AppMode::Normal => {
                 app.focus_next_annotation();
             }
             KeyCode::Char('/') => app.start_filtering_requests(),
-            KeyCode::Char('v') => toggle_visual_selection(app),
+            KeyCode::Char('v') if app.app_mode == AppMode::Normal => toggle_visual_selection(app),
+            KeyCode::Char('a') if !app.pending_requests.is_empty() => {
+                allow_attached_pending(app, client).await;
+            }
+            KeyCode::Char('e') if !app.pending_requests.is_empty() => {
+                if let Some(content) = app.get_pending_request_json() {
+                    app.open_editor(EditorTarget::PendingRequest, content);
+                }
+            }
+            KeyCode::Char('c') if !app.pending_requests.is_empty() => {
+                if let Some(content) = app.get_pending_response_template() {
+                    app.open_editor(EditorTarget::PendingResponse, content);
+                }
+            }
+            KeyCode::Char('b') if !app.pending_requests.is_empty() => {
+                block_attached_pending(app, client).await;
+            }
+            KeyCode::Char('r') if !app.pending_requests.is_empty() => {
+                resume_attached_pending(app, client).await;
+            }
             _ => {}
         }
     }
+}
+
+async fn allow_attached_pending(app: &mut App, client: &attach::ControlClient) {
+    let Some(pending) = app.get_selected_pending() else {
+        return;
+    };
+    let id = pending.id.clone();
+    let request = match pending.modified_request.as_deref() {
+        Some(request) => match serde_json::from_str(request) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                app.set_notice(format!("Error: invalid request: {error}"));
+                return;
+            }
+        },
+        None => None,
+    };
+    match client.allow(&id, request).await {
+        Ok(()) => {
+            remove_attached_pending(app);
+            app.set_notice("Request allowed");
+        }
+        Err(error) => app.set_notice(format!("Error: {error}")),
+    }
+}
+
+async fn block_attached_pending(app: &mut App, client: &attach::ControlClient) {
+    let Some(id) = app.get_selected_pending().map(|pending| pending.id.clone()) else {
+        return;
+    };
+    match client.block(&id).await {
+        Ok(()) => {
+            remove_attached_pending(app);
+            app.set_notice("Request blocked");
+        }
+        Err(error) => app.set_notice(format!("Error: {error}")),
+    }
+}
+
+async fn resume_attached_pending(app: &mut App, client: &attach::ControlClient) {
+    if let Err(error) = client.set_paused(false).await {
+        app.set_notice(format!("Error: {error}"));
+        return;
+    }
+    let pending = app
+        .pending_requests
+        .iter()
+        .map(|pending| {
+            let request = pending
+                .modified_request
+                .as_deref()
+                .and_then(|request| serde_json::from_str(request).ok());
+            (pending.id.clone(), request)
+        })
+        .collect::<Vec<_>>();
+    for (id, request) in pending {
+        if let Err(error) = client.allow(&id, request).await {
+            app.set_notice(format!("Error: {error}"));
+            return;
+        }
+    }
+    app.pending_requests.clear();
+    app.selected_pending = 0;
+    app.app_mode = AppMode::Normal;
+    app.set_notice("All client requests resumed");
+}
+
+async fn save_attached_editor(app: &mut App, client: &attach::ControlClient) {
+    let Some(mut editor) = app.editor.take() else {
+        return;
+    };
+    let content = editor.content();
+    let result = match editor.target {
+        EditorTarget::PendingRequest => app
+            .apply_edited_json(content)
+            .map(|_| "Request updated".to_string()),
+        EditorTarget::PendingResponse => complete_attached_pending(app, client, &content).await,
+        EditorTarget::PendingHeaders => Err("Stdio requests do not have headers".to_string()),
+        EditorTarget::NewRequest => Err("Attached wrappers cannot create requests".to_string()),
+    };
+    match result {
+        Ok(notice) => app.set_notice(notice),
+        Err(error) => {
+            editor.error = Some(error);
+            app.editor = Some(editor);
+        }
+    }
+}
+
+async fn complete_attached_pending(
+    app: &mut App,
+    client: &attach::ControlClient,
+    content: &str,
+) -> Result<String, String> {
+    let response =
+        serde_json::from_str(content).map_err(|error| format!("Invalid JSON: {error}"))?;
+    let id = app
+        .get_selected_pending()
+        .map(|pending| pending.id.clone())
+        .ok_or_else(|| "No pending request selected".to_string())?;
+    client.complete(&id, response).await?;
+    remove_attached_pending(app);
+    Ok("Request completed".to_string())
+}
+
+fn remove_attached_pending(app: &mut App) {
+    app.pending_requests.remove(app.selected_pending);
+    app.selected_pending = app
+        .selected_pending
+        .min(app.pending_requests.len().saturating_sub(1));
 }
 
 async fn run_app(
@@ -1555,6 +1758,7 @@ async fn run_app(
     let mut should_draw = true;
 
     loop {
+        let notice_expired = app.clear_expired_notice();
         // Check for new messages from proxy
         let received_messages = record_new_messages(&mut app, &mut runtime.history);
 
@@ -1573,7 +1777,7 @@ async fn run_app(
 
         let mut received_request_result = false;
         while let Ok(result) = runtime.request_result_receiver.try_recv() {
-            app.notice = Some(match result {
+            app.set_notice(match result {
                 Ok(()) if app.filter_text.is_empty() => "Request sent".to_string(),
                 Ok(()) => "Request sent; filter is active".to_string(),
                 Err(error) => format!("Error: {}", error),
@@ -1605,6 +1809,7 @@ async fn run_app(
         resolve_change_waiters(&app, &mut runtime.change_waiters);
 
         if should_draw
+            || notice_expired
             || received_messages
             || received_pending_request
             || received_request_result
@@ -1759,14 +1964,14 @@ async fn run_app(
                                 match result {
                                     Ok(()) => {
                                         app.cancel_editing();
-                                        app.notice = Some(if annotation_id.is_some() {
+                                        app.set_notice(if annotation_id.is_some() {
                                             "Annotation updated".to_string()
                                         } else {
                                             "Annotation added".to_string()
                                         });
                                     }
                                     Err(error) => {
-                                        app.notice = Some(format!("Error: {}", error.message));
+                                        app.set_notice(format!("Error: {}", error.message));
                                     }
                                 }
                             }
@@ -1787,8 +1992,7 @@ async fn run_app(
                                         if let Err(error) =
                                             runtime.history.update_target(&session_id, &target)
                                         {
-                                            app.notice =
-                                                Some(format!("Error: save target: {error}"));
+                                            app.set_notice(format!("Error: save target: {error}"));
                                             continue;
                                         }
                                     }
@@ -1833,10 +2037,10 @@ async fn run_app(
                                 ) {
                                     Ok(()) => {
                                         app.cancel_editing();
-                                        app.notice = Some("Session created".to_string());
+                                        app.set_notice("Session created");
                                     }
                                     Err(error) => {
-                                        app.notice = Some(format!("Error: {}", error.message));
+                                        app.set_notice(format!("Error: {}", error.message));
                                     }
                                 }
                             }
@@ -1861,15 +2065,13 @@ async fn run_app(
                                     ) {
                                         Ok(()) => {
                                             app.cancel_editing();
-                                            app.notice = Some("Session renamed".to_string());
+                                            app.set_notice("Session renamed");
                                         }
                                         Err(error) => {
-                                            app.notice = Some(format!("Error: {}", error.message));
+                                            app.set_notice(format!("Error: {}", error.message));
                                         }
                                     },
-                                    None => {
-                                        app.notice = Some("Error: No active session".to_string())
-                                    }
+                                    None => app.set_notice("Error: No active session"),
                                 }
                             }
                             KeyCode::Esc => app.cancel_editing(),
@@ -2195,7 +2397,7 @@ async fn run_app(
                 Err(error) => format!("Control plane stopped: {error}"),
                 Ok(Ok(())) => "Control plane stopped".to_string(),
             };
-            app.notice = Some(format!("Error: {error}"));
+            app.set_notice(format!("Error: {error}"));
             should_draw = true;
         }
     }
@@ -2221,7 +2423,7 @@ fn record_new_messages(app: &mut App, history: &mut HistoryStore) -> bool {
             }
         }
         Err(error) => {
-            app.notice = Some(format!("Error: save history: {error}"));
+            app.set_notice(format!("Error: save history: {error}"));
             for message in messages {
                 app.add_message(message);
             }
@@ -2255,10 +2457,10 @@ async fn handle_overlay_key(
                     .map(|annotation| annotation.id.clone());
                 match annotation_id {
                     Some(id) => match remove_annotation(app, &runtime.history, &id) {
-                        Ok(()) => app.notice = Some("Annotation deleted".to_string()),
-                        Err(error) => app.notice = Some(format!("Error: {}", error.message)),
+                        Ok(()) => app.set_notice("Annotation deleted"),
+                        Err(error) => app.set_notice(format!("Error: {}", error.message)),
                     },
-                    None => app.notice = Some("No annotation under cursor".to_string()),
+                    None => app.set_notice("No annotation under cursor"),
                 }
             }
             KeyCode::Char('y') => {
@@ -2269,7 +2471,7 @@ async fn handle_overlay_key(
                 Ok(sessions) => app.show_sessions(sessions),
                 Err(error) => {
                     app.close_overlay();
-                    app.notice = Some(format!("Error: list sessions: {error}"));
+                    app.set_notice(format!("Error: list sessions: {error}"));
                 }
             },
             KeyCode::Char('n') => {
@@ -2337,7 +2539,7 @@ async fn handle_overlay_key(
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            app.notice = Some(format!("Error: {}", error.message));
+                            app.set_notice(format!("Error: {}", error.message));
                         }
                     }
                 }
@@ -2465,7 +2667,7 @@ async fn handle_mouse_event(
                                 }
                                 Ok(_) => {}
                                 Err(error) => {
-                                    app.notice = Some(format!("Error: {}", error.message));
+                                    app.set_notice(format!("Error: {}", error.message));
                                 }
                             }
                         }

@@ -219,7 +219,7 @@
     },
     {
       "name": "debugger.setPaused",
-      "summary": "Enable or disable HTTP data-plane interception",
+      "summary": "Enable or disable client-request interception",
       "params": [
         { "name": "paused", "required": true, "schema": { "type": "boolean" } }
       ],

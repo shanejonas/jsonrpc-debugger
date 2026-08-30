@@ -16,7 +16,7 @@ Drive the live debugger or inspect a transparent wrapper. Treat an attached TUI 
 Read `getState.dataPlane` before acting:
 
 - `http` means the debugger drives the target. `proxyPort` contains its HTTP ingress.
-- `stdio` means a transparent wrapper. `proxyPort` is null and the external client owns stdin/stdout.
+- `stdio` means a transparent wrapper. `proxyPort` is null and the external client owns request IDs while the wrapper can pause and resolve its requests.
 
 `getState.transport` identifies the target wire format. Stdio uses `stdio-json-lines` or `stdio-content-length`. Its command comes from `getState.target` and cannot change through the control plane.
 
@@ -40,6 +40,142 @@ rpc debugger.setFocus '{"panel":"history"}'
 ```
 
 Treat a JSON-RPC `error` envelope as failure even when HTTP returns 200. The runtime OpenRPC document returned by `rpc.discover` is the authority for methods and parameters.
+
+## Debug MCP From Either Side
+
+MCP uses JSON-RPC over newline-delimited stdio or Streamable HTTP. Choose the debugger role from `getState`, not from the command name:
+
+- `dataPlane: "http"` with `transport: "stdio-json-lines"` is driver mode. The debugger acts as the MCP client and `debugger.sendRequest` may send messages.
+- `dataPlane: "stdio"` with `transport: "stdio-json-lines"` is wrapper mode. A real client owns the connection; inspect or intercept its messages, but never inject one.
+- `dataPlane: "http"` with `transport: "http"` is HTTP proxy mode. Send Streamable HTTP requests through `proxyPort` with their MCP headers intact.
+
+### Identify the protocol era
+
+MCP `2026-07-28` and later is stateless. There is no `initialize` or `notifications/initialized` handshake and no `Mcp-Session-Id`. Every client request carries these fields in `params._meta`:
+
+- `io.modelcontextprotocol/protocolVersion` is required.
+- `io.modelcontextprotocol/clientCapabilities` is required and should contain only capabilities relevant to that request.
+- `io.modelcontextprotocol/clientInfo` is recommended.
+
+`server/discover` is an optional first call for modern clients and mandatory for modern servers. A dual-era stdio client should use it as a probe before any other request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "discover-1",
+  "method": "server/discover",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "io.modelcontextprotocol/clientInfo": {
+        "name": "jsonrpc-debugger",
+        "version": "1.0.0"
+      }
+    }
+  }
+}
+```
+
+Interpret the probe carefully:
+
+- A `DiscoverResult` means modern MCP. Select a version from `supportedVersions` and make direct calls with per-request `_meta`.
+- A recognized modern error such as `UnsupportedProtocolVersionError` means modern MCP. Retry with one of its advertised versions; do not initialize.
+- Any other error or a reasonable timeout means legacy MCP over stdio. Fall back to the `initialize` handshake.
+
+MCP `2025-11-25` and earlier is legacy. For legacy traffic only: send `initialize`, read the negotiated version and capabilities, send `notifications/initialized`, then call advertised methods. In wrapper mode, determine the era from the real client's traffic and do not add a second handshake.
+
+### Act as the MCP client
+
+Start the server behind the HTTP driver:
+
+```bash
+jsonrpc-debugger --port 8080 stdio -- npx -y @modelcontextprotocol/server-everything
+```
+
+For stdio, send the `server/discover` probe through `debugger.sendRequest`. Continue directly with modern calls, or use the legacy handshake only when the probe identifies a legacy server. A modern tool call looks like:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "tool-1",
+  "method": "tools/call",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "io.modelcontextprotocol/clientInfo": {
+        "name": "jsonrpc-debugger",
+        "version": "1.0.0"
+      }
+    },
+    "name": "echo",
+    "arguments": {"message": "hello"}
+  }
+}
+```
+
+Common discovery calls are `tools/list`, `resources/list`, `resources/templates/list`, and `prompts/list`. Exercise concrete operations such as `tools/call`, `resources/read`, and `prompts/get` with unique request IDs.
+
+Modern results must include `resultType`. `complete` is final; `input_required` is a Multi Round-Trip Request that the client answers by retrying the original request with `inputResponses` and the returned `requestState`. Modern servers do not initiate JSON-RPC requests. Legacy servers may; in wrapper mode, let the external client answer them.
+
+MCP tool failures often arrive inside a successful JSON-RPC result as `result.isError: true`; count them separately from JSON-RPC `error` envelopes. Correlate `notifications/progress` with the originating call through `_meta.progressToken`.
+
+### Send Streamable HTTP correctly
+
+For MCP `2026-07-28`, send each JSON-RPC message as its own POST through the debugger proxy. Include:
+
+- `Content-Type: application/json`
+- `Accept: application/json, text/event-stream`
+- `MCP-Protocol-Version`, matching `params._meta.io.modelcontextprotocol/protocolVersion`
+- `Mcp-Method`, matching the JSON-RPC `method`
+- `Mcp-Name` for `tools/call`, `resources/read`, and `prompts/get`, matching `params.name` or `params.uri`
+- Any `Mcp-Param-{Name}` required by `x-mcp-header` annotations in the selected tool's `inputSchema`
+
+The body is the source of truth. Modern servers reject missing or mismatched mirrored headers with HTTP 400 and JSON-RPC error `-32020` (`HeaderMismatch`). Header names are case-insensitive; method and name values are case-sensitive.
+
+`debugger.sendRequest` cannot set custom HTTP headers. Use an HTTP client against `proxyPort` when driving Streamable HTTP, and then inspect the captured body and headers through the control plane. For example:
+
+```bash
+curl -fsS http://127.0.0.1:8080/mcp \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -H 'mcp-protocol-version: 2026-07-28' \
+  -H 'mcp-method: tools/call' \
+  -H 'mcp-name: echo' \
+  --data '{"jsonrpc":"2.0","id":"tool-1","method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"jsonrpc-debugger","version":"1.0.0"}},"name":"echo","arguments":{"message":"hello"}}}'
+```
+
+Configure the debugger target as the MCP server origin so the local `/mcp` path maps to its `/mcp` endpoint. The proxy forwards MCP headers. Stdio has no header layer: method, name, protocol version, capabilities, and client identity stay in the JSON-RPC body.
+
+The HTTP proxy currently handles ordinary JSON responses, not request-scoped SSE streams. If a target selects `text/event-stream`, use the captured request for header/body inspection but do not treat the debugger's response parse failure as a target MCP failure.
+
+Do not confuse routing headers with MCP cache freshness. `Mcp-Method` and `Mcp-Name` let intermediaries distinguish traffic without parsing the body. Cacheable results such as `server/discover`, `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, and `resources/read` carry `ttlMs` and `cacheScope`; stable tool ordering improves prompt-cache hits.
+
+### Observe a real MCP client
+
+Replace the client's MCP server command with a transparent wrapper:
+
+```json
+{
+  "command": "jsonrpc-debugger",
+  "args": [
+    "--control-port", "8096",
+    "wrap", "--",
+    "npx", "-y", "@modelcontextprotocol/server-everything"
+  ]
+}
+```
+
+Open the shared TUI separately:
+
+```bash
+jsonrpc-debugger attach http://127.0.0.1:8096
+```
+
+The wrapper must launch with the MCP connection; it cannot splice into an existing stdio pipe. Use a unique control port per MCP server. `Ctrl-B p` pauses client-originated requests before the server receives them; `a`, `e`, `c`, `b`, and `r` allow, edit, complete, block, or resume. Server messages continue flowing to avoid deadlocks. Do not complete an idless notification because it has no response.
+
+For modern traffic, verify every client request has the required per-request `_meta`; there will be no HTTP headers in a stdio wrapper. For legacy traffic, verify initialization precedes normal operations and inspect any server-initiated requests without answering on the real client's behalf.
 
 ## Inspect Before Acting
 
@@ -73,7 +209,7 @@ Use `debugger.sendRequest` only when `getState.dataPlane` is `http`. It sends a 
 
 Stdio driver requests time out after 120 seconds by default. `stdio --request-timeout <SECONDS>` changes the limit. A `-32603` response containing `stdio request timed out` comes from the debugger, not the target.
 
-Never inject requests into a transparent stdio wrapper. The external MCP/LSP client owns response routing. Use `debugger.getHistory`, `debugger.waitForChange`, or `jsonrpc-debugger attach` to observe it.
+Never inject requests into a transparent stdio wrapper. The external MCP/LSP client owns response routing. Use `debugger.getHistory`, `debugger.waitForChange`, or `jsonrpc-debugger attach` to observe it, and use interception to pause or resolve client-originated requests.
 
 ## Run Dense Audits
 
@@ -88,7 +224,9 @@ Do not visually select findings during the background audit. Persistent annotati
 
 ## Intercept Requests
 
-Interception requires the HTTP data plane. Do not call `debugger.setPaused` when `getState.dataPlane` is `stdio`.
+Interception works in HTTP driver mode and transparent stdio wrapper mode. In a wrapper, only client-originated requests pause; server messages continue flowing to avoid deadlocks.
+
+### Driver mode
 
 Interception requires concurrent calls:
 
@@ -100,6 +238,10 @@ Interception requires concurrent calls:
 6. Disable pause and verify the pending count returns to zero.
 
 Use `allow` to forward the original or a replacement request, `block` for a debugger-generated error, and `complete` for a supplied response without forwarding.
+
+### Wrapper mode
+
+For a transparent wrapper, call `debugger.setPaused`, wait for the external client to create a pending request, then resolve it through the same `debugger.getPending` and `debugger.resolvePending` methods. Do not call `debugger.sendRequest`.
 
 ## Work With Sessions
 

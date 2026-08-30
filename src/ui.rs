@@ -3,8 +3,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, Paragraph, Row, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
+        Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, Paragraph, Row, Table,
+        TableState, Wrap,
     },
     Frame,
 };
@@ -28,6 +28,49 @@ const THEME_SELECTED: Color = Color::Rgb(54, 70, 64);
 const REQUEST_SIDEBAR_MIN_WIDTH: u16 = 50;
 const REQUEST_SIDEBAR_MAX_WIDTH: u16 = 72;
 const COMPACT_REQUEST_LIST_WIDTH: u16 = 80;
+
+fn draw_vertical_scrollbar(
+    f: &mut Frame,
+    rail: Rect,
+    position: usize,
+    content_length: usize,
+    viewport_length: usize,
+) {
+    if rail.width == 0 {
+        return;
+    }
+
+    let x = rail.right() - 1;
+    for row in scrollbar_thumb_rows(rail.height, position, content_length, viewport_length) {
+        f.render_widget(
+            Paragraph::new(Span::styled("█", Style::default().fg(THEME_MUTED))),
+            Rect::new(x, rail.y + row, 1, 1),
+        );
+    }
+}
+
+fn scrollbar_thumb_rows(
+    rail_height: u16,
+    position: usize,
+    content_length: usize,
+    viewport_length: usize,
+) -> std::ops::Range<u16> {
+    if rail_height == 0 || content_length == 0 || viewport_length >= content_length {
+        return 0..0;
+    }
+
+    let track_height = usize::from(rail_height);
+    let thumb_height = (track_height * viewport_length / content_length).clamp(1, track_height);
+    let max_scroll = content_length - viewport_length;
+    let max_start = track_height - thumb_height;
+    let start = position
+        .min(max_scroll)
+        .saturating_mul(max_start)
+        .saturating_add(max_scroll / 2)
+        / max_scroll;
+
+    start as u16..(start + thumb_height) as u16
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MouseAction {
@@ -245,7 +288,6 @@ fn screen_chunks(area: Rect, app: &App) -> std::rc::Rc<[Rect]> {
             Constraint::Length(2),
             Constraint::Min(10),
             Constraint::Length(footer_height(app, area.width)),
-            Constraint::Length(u16::from(app.notice.is_some())),
         ])
         .split(area)
 }
@@ -582,7 +624,7 @@ fn clicked_detail_row(
         return None;
     }
 
-    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let width = usize::from(area.width.saturating_sub(3)).max(1);
     let gutter_width = detail_gutter_width(content.len());
     let clicked_column = usize::from(column.saturating_sub(area.x.saturating_add(1)));
     let mut visible_row = usize::from(row.saturating_sub(area.y + 1));
@@ -652,7 +694,7 @@ fn detail_line_screen_rows(
     annotations: &[&LineAnnotation],
     target_line: usize,
 ) -> Option<(u16, u16)> {
-    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let width = usize::from(area.width.saturating_sub(3)).max(1);
     let gutter_width = detail_gutter_width(content.len());
     let visible_height = usize::from(area.height.saturating_sub(2));
     let mut visible_row: usize = 0;
@@ -712,14 +754,14 @@ pub fn annotation_editor_scroll(area: Rect, app: &App) -> Option<(Focus, usize)>
 }
 
 fn annotation_button_rect(area: Rect, row: u16) -> Option<Rect> {
-    if area.width < 5
+    if area.width < 6
         || row <= area.y
         || row >= area.y.saturating_add(area.height).saturating_sub(1)
     {
         return None;
     }
     Some(Rect::new(
-        area.x.saturating_add(area.width).saturating_sub(4),
+        area.x.saturating_add(area.width).saturating_sub(5),
         row,
         3,
         1,
@@ -965,18 +1007,6 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_footer(f, chunks[2], app);
 
-    if let Some(notice) = &app.notice {
-        let color = if notice.starts_with("Error:") {
-            Color::Red
-        } else {
-            Color::Green
-        };
-        f.render_widget(
-            Paragraph::new(notice.as_str()).style(Style::default().fg(color).bg(THEME_SURFACE)),
-            chunks[3],
-        );
-    }
-
     if app.editor.is_some() {
         draw_text_editor(f, app);
     } else {
@@ -1001,11 +1031,12 @@ fn draw_keybind_help(f: &mut Frame, app: &App) {
     let lines = if app.proxy_config.transparent {
         vec![
             Line::from(Span::styled(
-                "Attached viewer",
+                "Attached wrapper",
                 Style::default().fg(THEME_BLUE),
             )),
             Line::from("^B z  fullscreen panel"),
             Line::from("^B y  copy focused panel as Markdown"),
+            Line::from("^B p  pause client requests"),
             Line::from("^B r  show/hide request list"),
             Line::from("^B q  quit           ^B ?  this help"),
             Line::from(""),
@@ -1014,7 +1045,7 @@ fn draw_keybind_help(f: &mut Frame, app: &App) {
             Line::from("d/u page   g/G top/bottom   [/] annotations"),
             Line::from(",/. previous/next request"),
             Line::from("Requests: Enter response   Details: Enter copy Markdown"),
-            Line::from("The external client owns the stdio data plane."),
+            Line::from("Paused calls can be allowed, edited, completed, or blocked."),
         ]
     } else {
         vec![
@@ -1661,6 +1692,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         .highlight_style(highlight_style)
         .highlight_symbol("› ")
         .highlight_spacing(HighlightSpacing::Always);
+    let table_area = Rect::new(body.x, body.y, body.width.saturating_sub(2), body.height);
 
     let mut table_state = TableState::default();
     table_state.select(
@@ -1668,21 +1700,33 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
             .checked_sub(offset)
             .filter(|position| *position < visible_rows),
     );
-    f.render_stateful_widget(table, body, &mut table_state);
+    f.render_stateful_widget(table, table_area, &mut table_state);
 
-    if filtered.len() > 1 {
-        let mut scrollbar_state = ScrollbarState::new(filtered.len())
-            .position(offset)
-            .viewport_content_length(visible_rows);
+    if filtered.len() > visible_rows && visible_rows > 0 {
+        let rail = Rect::new(
+            body.x,
+            body.y.saturating_add(1),
+            body.width,
+            body.height.saturating_sub(1),
+        );
 
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(None)
-            .thumb_symbol("▐")
-            .thumb_style(Style::default().fg(THEME_MUTED));
+        draw_vertical_scrollbar(f, rail, offset, filtered.len(), visible_rows);
 
-        f.render_stateful_widget(scrollbar, body, &mut scrollbar_state);
+        let annotated_positions = filtered
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (index, _))| {
+                app.annotations
+                    .iter()
+                    .any(|annotation| annotation.exchange_index == *index)
+                    .then_some(position)
+            })
+            .collect::<Vec<_>>();
+        draw_scrollbar_markers(
+            f,
+            rail,
+            scrollbar_rows(rail.height, &annotated_positions, filtered.len()),
+        );
     }
 }
 
@@ -2075,11 +2119,17 @@ fn draw_detail_chrome(
     );
 }
 
-fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
-    let inner_area = area.inner(&Margin {
+fn detail_content_area(area: Rect) -> Rect {
+    let mut inner = area.inner(&Margin {
         vertical: 1,
         horizontal: 1,
     });
+    inner.width = inner.width.saturating_sub(1);
+    inner
+}
+
+fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
+    let inner_area = detail_content_area(area);
     let cursor_line = app
         .detail_cursor_line(Focus::RequestSection)
         .filter(|_| app.focus == Focus::RequestSection);
@@ -2136,22 +2186,11 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(details, inner_area);
 
     if total_lines > visible_lines {
-        let mut scrollbar_state = ScrollbarState::new(total_lines).position(start_line);
-
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(None)
-            .thumb_symbol("▐");
-
-        f.render_stateful_widget(
-            scrollbar,
-            area.inner(&Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut scrollbar_state,
-        );
+        let rail = area.inner(&Margin {
+            vertical: 1,
+            horizontal: 0,
+        });
+        draw_vertical_scrollbar(f, rail, start_line, total_lines, visible_lines);
         draw_annotation_scrollbar_markers(f, area, &annotations, source_lines);
     }
     draw_annotation_button(
@@ -2252,10 +2291,7 @@ fn response_detail_lines_for(
 }
 
 fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
-    let inner_area = area.inner(&Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
+    let inner_area = detail_content_area(area);
     let cursor_line = app
         .detail_cursor_line(Focus::ResponseSection)
         .filter(|_| app.focus == Focus::ResponseSection);
@@ -2312,22 +2348,11 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(details, inner_area);
 
     if total_lines > visible_lines {
-        let mut scrollbar_state = ScrollbarState::new(total_lines).position(start_line);
-
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(None)
-            .thumb_symbol("▐");
-
-        f.render_stateful_widget(
-            scrollbar,
-            area.inner(&Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut scrollbar_state,
-        );
+        let rail = area.inner(&Margin {
+            vertical: 1,
+            horizontal: 0,
+        });
+        draw_vertical_scrollbar(f, rail, start_line, total_lines, visible_lines);
         draw_annotation_scrollbar_markers(f, area, &annotations, source_lines);
     }
     draw_annotation_button(
@@ -2384,12 +2409,21 @@ fn draw_annotation_scrollbar_markers(
         vertical: 1,
         horizontal: 0,
     });
-    if rail.width == 0 || rail.height == 0 {
+    draw_scrollbar_markers(
+        f,
+        rail,
+        annotation_scrollbar_rows(rail.height, annotations, total_lines),
+    );
+}
+
+fn draw_scrollbar_markers(f: &mut Frame, rail: Rect, rows: Vec<u16>) {
+    if rail.width < 2 || rail.height == 0 {
         return;
     }
 
-    let x = rail.x + rail.width - 1;
-    for row in annotation_scrollbar_rows(rail.height, annotations, total_lines) {
+    let x = rail.x + rail.width - 2;
+    for row in rows {
+        let y = rail.y + row;
         f.render_widget(
             Paragraph::new(Span::styled(
                 "▐",
@@ -2397,7 +2431,7 @@ fn draw_annotation_scrollbar_markers(
                     .fg(ANNOTATION_AMBER)
                     .add_modifier(Modifier::BOLD),
             )),
-            Rect::new(x, rail.y + row, 1, 1),
+            Rect::new(x, y, 1, 1),
         );
     }
 }
@@ -2411,14 +2445,23 @@ fn annotation_scrollbar_rows(
         return Vec::new();
     }
 
-    let rail_end = usize::from(rail_height.saturating_sub(1));
-    let document_end = total_lines.saturating_sub(1).max(1);
-    let mut rows = annotations
+    let positions = annotations
         .iter()
-        .map(|annotation| {
-            let line = annotation.end_line.clamp(1, total_lines) - 1;
-            (line * rail_end / document_end) as u16
-        })
+        .map(|annotation| annotation.end_line.clamp(1, total_lines) - 1)
+        .collect::<Vec<_>>();
+    scrollbar_rows(rail_height, &positions, total_lines)
+}
+
+fn scrollbar_rows(rail_height: u16, positions: &[usize], total_items: usize) -> Vec<u16> {
+    if rail_height == 0 || total_items == 0 {
+        return Vec::new();
+    }
+
+    let rail_end = usize::from(rail_height.saturating_sub(1));
+    let document_end = total_items.saturating_sub(1).max(1);
+    let mut rows = positions
+        .iter()
+        .map(|position| ((*position).min(document_end) * rail_end / document_end) as u16)
         .collect::<Vec<_>>();
     rows.sort_unstable();
     rows.dedup();
@@ -2470,6 +2513,7 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
             return vec![
                 KeybindInfo::new("?", "keybinds", 1),
                 KeybindInfo::new("y", "copy markdown", 1),
+                KeybindInfo::new("p", "pause", 1),
                 KeybindInfo::new(
                     "r",
                     if app.request_list_visible {
@@ -2658,6 +2702,21 @@ fn arrange_keybinds_responsive(
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    if app.overlay == Overlay::None {
+        if let Some(notice) = app.notice() {
+            let color = if notice.starts_with("Error:") {
+                Color::Red
+            } else {
+                Color::Green
+            };
+            f.render_widget(
+                Paragraph::new(notice).style(Style::default().fg(color).bg(THEME_SURFACE)),
+                area,
+            );
+            return;
+        }
+    }
+
     let keybinds = get_keybinds_for_mode(app);
     let available_width = area.width as usize;
 
@@ -3113,22 +3172,16 @@ fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(details, inner_area);
 
     if total_lines > visible_lines {
-        let mut scrollbar_state =
-            ScrollbarState::new(total_lines).position(app.intercept_details_scroll);
-
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(None)
-            .thumb_symbol("▐");
-
-        f.render_stateful_widget(
-            scrollbar,
-            area.inner(&Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut scrollbar_state,
+        let rail = area.inner(&Margin {
+            vertical: 1,
+            horizontal: 0,
+        });
+        draw_vertical_scrollbar(
+            f,
+            rail,
+            app.intercept_details_scroll,
+            total_lines,
+            visible_lines,
         );
     }
 }
@@ -3274,7 +3327,6 @@ mod tests {
         assert_eq!(screen[0].height, 2);
         assert_eq!(screen[1].height, area.height - 3);
         assert_eq!(screen[2].height, 1);
-        assert_eq!(screen[3].height, 0);
 
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -3298,8 +3350,22 @@ mod tests {
             THEME_BACKGROUND
         );
 
-        app.notice = Some("Saved".to_string());
-        assert_eq!(screen_chunks(area, &app)[3].height, 1);
+        app.set_notice("Saved");
+        let noticed = screen_chunks(area, &app);
+        assert_eq!(noticed[1].height, area.height - 3);
+        assert_eq!(noticed[2].height, 1);
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let footer = (0..area.width)
+            .map(|column| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .get(column, noticed[2].y)
+                    .symbol()
+            })
+            .collect::<String>();
+        assert!(footer.starts_with("Saved"));
     }
 
     #[test]
@@ -3925,18 +3991,28 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_thumb_size_stays_fixed_while_position_changes() {
+        let positions = [0, 1, 5, 10, 18, 23];
+        let thumbs = positions.map(|position| scrollbar_thumb_rows(11, position, 30, 7));
+
+        assert!(thumbs.iter().all(|thumb| thumb.len() == 2));
+        assert_eq!(thumbs[0], 0..2);
+        assert_eq!(thumbs[5], 9..11);
+    }
+
+    #[test]
     fn annotation_scrollbar_marker_renders_in_amber() {
         let mut app = app_with_request();
+        let total_lines = request_detail_lines(&app).len();
         app.add_annotation(annotation(
             "marker",
             Focus::RequestSection,
-            2,
-            2,
+            total_lines,
+            total_lines,
             "marked",
-            vec!["Method: eth_call".to_string()],
+            vec!["}".to_string()],
         ));
         let area = Rect::new(0, 0, 40, 6);
-        let total_lines = request_detail_lines(&app).len();
         let row = annotation_scrollbar_rows(4, &[&app.annotations[0]], total_lines)[0];
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
 
@@ -3944,9 +4020,35 @@ mod tests {
             .draw(|frame| draw_request_details(frame, area, &app))
             .unwrap();
 
-        let marker = terminal.backend().buffer().get(area.width - 1, 1 + row);
+        let marker = terminal.backend().buffer().get(area.width - 2, 1 + row);
         assert_eq!(marker.symbol(), "▐");
         assert_eq!(marker.fg, ANNOTATION_AMBER);
+    }
+
+    #[test]
+    fn annotation_marker_and_scrollbar_use_separate_rails() {
+        let mut app = app_with_request();
+        app.add_annotation(annotation(
+            "marker",
+            Focus::RequestSection,
+            1,
+            1,
+            "marked",
+            vec!["Request:".to_string()],
+        ));
+        let area = Rect::new(0, 0, 40, 6);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+
+        terminal
+            .draw(|frame| draw_request_details(frame, area, &app))
+            .unwrap();
+
+        let marker = terminal.backend().buffer().get(area.width - 2, 1);
+        let thumb = terminal.backend().buffer().get(area.width - 1, 1);
+        assert_eq!(marker.symbol(), "▐");
+        assert_eq!(marker.fg, ANNOTATION_AMBER);
+        assert_eq!(thumb.symbol(), "█");
+        assert_eq!(thumb.fg, THEME_MUTED);
     }
 
     #[test]
@@ -4231,7 +4333,7 @@ mod tests {
     }
 
     #[test]
-    fn request_scrollbar_is_muted_not_annotation_amber() {
+    fn request_list_uses_separate_annotation_and_scrollbar_rails() {
         let mut app = app_with_request();
         for id in 2..8 {
             app.add_message(JsonRpcMessage {
@@ -4246,19 +4348,32 @@ mod tests {
                 headers: None,
             });
         }
+        app.add_annotation(annotation(
+            "note",
+            Focus::RequestSection,
+            1,
+            1,
+            "marked",
+            vec!["Request:".to_string()],
+        ));
+        app.history_scroll = Some(0);
         let area = Rect::new(0, 0, 80, 5);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
             .draw(|frame| draw_message_list(frame, area, &app))
             .unwrap();
 
+        let marker = terminal
+            .backend()
+            .buffer()
+            .get(area.right() - 3, area.y + 2);
         let thumb = terminal
             .backend()
             .buffer()
-            .content()
-            .iter()
-            .find(|cell| cell.symbol() == "▐")
-            .unwrap();
+            .get(area.right() - 2, area.y + 2);
+        assert_eq!(marker.symbol(), "▐");
+        assert_eq!(marker.fg, ANNOTATION_AMBER);
+        assert_eq!(thumb.symbol(), "█");
         assert_eq!(thumb.fg, THEME_MUTED);
         assert_ne!(thumb.fg, ANNOTATION_AMBER);
     }

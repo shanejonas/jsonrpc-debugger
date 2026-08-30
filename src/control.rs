@@ -934,7 +934,7 @@ pub fn pending(app: &App) -> Value {
                     "id": pending.id,
                     "request": pending.modified_request.as_ref()
                         .and_then(|request| serde_json::from_str::<Value>(request).ok())
-                        .unwrap_or_else(|| message_body(&pending.original_request)),
+                        .unwrap_or_else(|| pending.original_body.clone()),
                     "headers": pending.modified_headers.as_ref()
                         .or(pending.original_request.headers.as_ref()),
                     "modified": pending.modified_request.is_some()

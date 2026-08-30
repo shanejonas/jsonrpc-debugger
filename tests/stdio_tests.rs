@@ -1,9 +1,15 @@
 use jsonrpc_debugger::{
-    app::TransportType,
-    stdio::{relay, Framer, Framing, StreamTransport, DEFAULT_REQUEST_TIMEOUT},
+    app::{AppMode, ProxyDecision, TransportType},
+    proxy::ProxyState,
+    stdio::{
+        relay, relay_with_interception, Framer, Framing, StreamTransport, DEFAULT_REQUEST_TIMEOUT,
+    },
 };
 use serde_json::json;
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -266,6 +272,78 @@ async fn transparent_relay_forwards_bytes_it_cannot_decode() {
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].result, Some(json!("still alive")));
+}
+
+#[tokio::test]
+async fn transparent_content_length_relay_pauses_and_blocks_requests() {
+    let framing = Framing::ContentLength;
+    let (client, relay_client) = tokio::io::duplex(4096);
+    let (server, relay_server) = tokio::io::duplex(4096);
+    let (mut client_reader, mut client_writer) = split(client);
+    let (relay_client_reader, relay_client_writer) = split(relay_client);
+    let (mut server_reader, mut server_writer) = split(server);
+    let (relay_server_reader, relay_server_writer) = split(relay_server);
+    let (message_sender, _message_receiver) = mpsc::unbounded_channel();
+    let (pending_sender, mut pending_receiver) = mpsc::unbounded_channel();
+    let proxy_state = ProxyState {
+        app_mode: Arc::new(Mutex::new(AppMode::Paused)),
+        pending_sender,
+    };
+    let relay = tokio::spawn(relay_with_interception(
+        relay_client_reader,
+        relay_client_writer,
+        relay_server_reader,
+        relay_server_writer,
+        framing,
+        message_sender,
+        proxy_state,
+    ));
+    let encoder = Framer::new(framing);
+
+    let request = json!({"jsonrpc": "2.0", "id": "allow-1", "method": "example/run"});
+    let request_frame = encoder.encode(&request).unwrap();
+    client_writer.write_all(&request_frame).await.unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(1), pending_receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.original_body, request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), server_reader.read_u8())
+            .await
+            .is_err()
+    );
+    pending
+        .decision_sender
+        .send(ProxyDecision::Allow(None, None))
+        .unwrap();
+    let mut forwarded = vec![0; request_frame.len()];
+    server_reader.read_exact(&mut forwarded).await.unwrap();
+    assert_eq!(forwarded, request_frame);
+
+    let request = json!({"jsonrpc": "2.0", "id": "block-1", "method": "example/block"});
+    client_writer
+        .write_all(&encoder.encode(&request).unwrap())
+        .await
+        .unwrap();
+    let pending = tokio::time::timeout(Duration::from_secs(1), pending_receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    pending.decision_sender.send(ProxyDecision::Block).unwrap();
+    let mut response = [0; 4096];
+    let count = tokio::time::timeout(Duration::from_secs(1), client_reader.read(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut decoder = Framer::new(framing);
+    let blocked = decoder.decode(&response[..count]).unwrap().remove(0);
+    assert_eq!(blocked["id"], "block-1");
+    assert_eq!(blocked["error"]["code"], -32603);
+
+    client_writer.shutdown().await.unwrap();
+    server_writer.shutdown().await.unwrap();
+    relay.await.unwrap().unwrap();
 }
 
 async fn transparent_round_trip(

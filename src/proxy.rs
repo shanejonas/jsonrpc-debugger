@@ -224,6 +224,7 @@ async fn handle_proxy_request(
             let pending_request = PendingRequest {
                 id: Uuid::new_v4().to_string(),
                 original_request: request_message,
+                original_body: body.clone(),
                 modified_request: None,
                 modified_headers: None,
                 decision_sender,

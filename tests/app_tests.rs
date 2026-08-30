@@ -1021,6 +1021,12 @@ fn unpausing_with_pending_requests_keeps_them_visible() {
             transport: TransportType::Http,
             headers: None,
         },
+        original_body: serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_chainId",
+            "params": []
+        }),
         modified_request: None,
         modified_headers: None,
         decision_sender,

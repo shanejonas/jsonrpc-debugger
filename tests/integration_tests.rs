@@ -17,6 +17,9 @@ fn skill_flag_prints_the_bundled_agent_skill() {
     assert!(stdout.contains("debugger.find"));
     assert!(stdout.contains("getState.dataPlane"));
     assert!(stdout.contains("transparent stdio wrapper"));
+    assert!(stdout.contains("2026-07-28"));
+    assert!(stdout.contains("server/discover"));
+    assert!(stdout.contains("Mcp-Method"));
     assert!(output.stderr.is_empty());
 }
 

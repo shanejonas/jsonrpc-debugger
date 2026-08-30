@@ -68,7 +68,7 @@ Open the TUI from another terminal:
 jsonrpc-debugger attach http://127.0.0.1:8096
 ```
 
-The attached TUI is read-only. It follows live history and supports navigation, filtering, fullscreen panels, and Markdown copy without competing with the protocol client for response IDs.
+The attached TUI follows live history without competing with the protocol client for response IDs. Press `Ctrl-B p` to pause client requests before they reach the server, then allow, edit, complete, block, or resume them from the interception view.
 
 ### Drive stdio servers over HTTP
 
@@ -172,7 +172,7 @@ In HTTP and stdio driver modes, an agent can:
 - Create, select, or rename sessions.
 - Export portable history or replay it without forwarding requests.
 
-Transparent `wrap` mode keeps one client on one matching data plane. Agents can inspect its state and durable history, but cannot inject requests or pause the external client.
+Transparent `wrap` mode keeps one client on one matching data plane. Agents can inspect its state and durable history or pause and resolve client requests, but cannot inject new requests into the external client's response stream.
 
 Line selections are shared but temporary. Annotations stick to their exchange until a person presses `Ctrl-B d` or an agent removes one by ID. Highlights can move without erasing the notes around them.
 

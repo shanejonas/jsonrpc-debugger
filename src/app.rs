@@ -1,4 +1,8 @@
-use std::{collections::HashMap, ffi::OsString, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
@@ -825,6 +829,7 @@ pub enum ProxyDecision {
 pub struct PendingRequest {
     pub id: String,
     pub original_request: JsonRpcMessage,
+    pub original_body: serde_json::Value,
     pub modified_request: Option<String>, // JSON string for editing
     pub modified_headers: Option<HashMap<String, String>>, // Modified headers
     pub decision_sender: oneshot::Sender<ProxyDecision>,
@@ -864,7 +869,8 @@ pub struct App {
     pub annotations: Vec<LineAnnotation>,
     pub active_annotation_id: Option<String>,
     pub editor: Option<TextEditor>,
-    pub notice: Option<String>,
+    notice: Option<String>,
+    notice_expires_at: Option<Instant>,
     pub control_port: u16,
     pub overlay: Overlay,
     pub panel_fullscreen: bool,
@@ -1066,6 +1072,7 @@ impl App {
             active_annotation_id: None,
             editor: None,
             notice: None,
+            notice_expires_at: None,
             control_port: 8081,
             overlay: Overlay::None,
             panel_fullscreen: false,
@@ -2065,7 +2072,7 @@ impl App {
     // Target editing methods
     pub fn start_editing_target(&mut self) {
         if self.proxy_config.stdio.is_some() {
-            self.notice = Some("The stdio command is configured at startup".to_string());
+            self.set_notice("The stdio command is configured at startup");
             self.mark_changed();
             return;
         }
@@ -2480,25 +2487,38 @@ impl App {
     }
 
     pub fn get_pending_request_json(&self) -> Option<String> {
-        if let Some(pending) = self.get_selected_pending() {
-            // Get the original request JSON and format it nicely
-            let json_value = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": pending.original_request.method,
-                "params": pending.original_request.params,
-                "id": pending.original_request.id
-            });
-
-            // Pretty print the JSON for editing
-            serde_json::to_string_pretty(&json_value).ok()
-        } else {
-            None
-        }
+        let pending = self.get_selected_pending()?;
+        serde_json::to_string_pretty(&pending.original_body).ok()
     }
 
     pub fn open_editor(&mut self, target: EditorTarget, content: String) {
         self.editor = Some(TextEditor::new(target, content));
+        self.clear_notice();
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+        self.notice_expires_at = Some(Instant::now() + Duration::from_secs(3));
+    }
+
+    pub fn clear_expired_notice(&mut self) -> bool {
+        if self
+            .notice_expires_at
+            .is_none_or(|deadline| Instant::now() < deadline)
+        {
+            return false;
+        }
+        self.clear_notice();
+        true
+    }
+
+    fn clear_notice(&mut self) {
         self.notice = None;
+        self.notice_expires_at = None;
     }
 
     pub fn apply_edited_json(&mut self, edited_json: String) -> Result<(), String> {
@@ -2731,4 +2751,22 @@ pub async fn send_new_request(request: OutboundRequest) -> Result<serde_json::Va
         .json()
         .await
         .map_err(|error| format!("Invalid JSON response: {error}"))
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    #[test]
+    fn notices_expire_after_their_deadline() {
+        let mut app = App::new();
+        app.set_notice("Saved");
+        assert_eq!(app.notice(), Some("Saved"));
+        assert!(!app.clear_expired_notice());
+
+        app.notice_expires_at = Some(Instant::now());
+        assert!(app.clear_expired_notice());
+        assert_eq!(app.notice(), None);
+        assert_eq!(app.notice_expires_at, None);
+    }
 }
