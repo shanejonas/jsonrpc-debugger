@@ -2,12 +2,7 @@
 
 Debug JSON-RPC yourself or hand the debugger to an agent.
 
-`jsonrpc-debugger` is a local JSON-RPC proxy and transparent stdio wrapper with two interfaces over the same live session:
-
-- A terminal UI for people.
-- A localhost JSON-RPC control plane for agents and scripts.
-
-Both inspect the same history. Driver mode can also send requests and intercept traffic.
+`jsonrpc-debugger` is a local proxy and transparent stdio wrapper. Its terminal UI and localhost JSON-RPC control plane share the same live, durable session.
 
 ## Install
 
@@ -21,18 +16,13 @@ Install the latest source instead:
 cargo install --git https://github.com/shanejonas/jsonrpc-debugger
 ```
 
-## Start
+## HTTP proxy
 
 ```bash
 jsonrpc-debugger --port 8080 --target http://localhost:8090
 ```
 
-This starts:
-
-- The JSON-RPC proxy on `http://127.0.0.1:8080`.
-- The agent control plane on `http://127.0.0.1:8081`.
-
-Send traffic to the proxy:
+This starts the proxy on `http://127.0.0.1:8080` and the agent control plane on `http://127.0.0.1:8081`. Send JSON-RPC traffic to the proxy:
 
 ```bash
 curl http://127.0.0.1:8080 \
@@ -40,101 +30,54 @@ curl http://127.0.0.1:8080 \
   -d '{"jsonrpc":"2.0","id":1,"method":"example_ping","params":[]}'
 ```
 
-The control port defaults to the proxy port plus one. Override it with `--control-port`.
+Override the control plane with `--control-port`.
 
-### Wrap stdio servers
+## Stdio servers
 
-Use `wrap` when a real MCP, ACP, LSP, or DAP client should talk through the debugger. The debugger preserves the server's native stdio framing instead of exposing an HTTP proxy.
-
-MCP and ACP use newline-delimited JSON:
+Use `wrap` when a real MCP, ACP, LSP, or DAP client should own the connection while the debugger observes and intercepts it:
 
 ```bash
+# MCP and ACP: newline-delimited JSON
 jsonrpc-debugger --control-port 8096 \
   wrap -- npx -y @modelcontextprotocol/server-everything
-```
 
-LSP and DAP use `Content-Length` framing:
-
-```bash
+# LSP and DAP: Content-Length framing
 jsonrpc-debugger --control-port 8096 \
   wrap --framing content-length -- gopls
 ```
 
-Point the real client at that command. The client owns the wrapper's stdin and stdout. The debugger forwards child stderr to its own stderr and records requests, responses, batches, notifications, and server requests.
-
-Open the TUI from another terminal:
+Point the real client at the wrapper command, then open the TUI from another terminal:
 
 ```bash
 jsonrpc-debugger attach http://127.0.0.1:8096
 ```
 
-The attached TUI follows live history without competing with the protocol client for response IDs. Press `Ctrl-B p` to pause client requests before they reach the server, then allow, edit, complete, block, or resume them from the interception view.
-
-### Drive stdio servers over HTTP
-
-Use `stdio` when a person, curl, or an agent should act as the JSON-RPC client. Newline-delimited framing works with MCP and ACP servers:
+Use `stdio` when a person, curl, or an agent should drive the child through the debugger's HTTP proxy:
 
 ```bash
 jsonrpc-debugger --port 8080 stdio -- npx my-mcp-server
-```
-
-LSP and DAP servers use `Content-Length` framing:
-
-```bash
 jsonrpc-debugger --port 8080 stdio --framing content-length -- rust-analyzer
 ```
 
-This mode keeps the local HTTP proxy on port `8080`. Requests from the TUI, control plane, or another HTTP client travel through the child process. Server notifications appear in history as notifications instead of pending requests.
+Stdio requests time out after 120 seconds. Change the limit with `--request-timeout <SECONDS>`.
 
-Stdio requests time out after 120 seconds by default. Change the upper bound with `--request-timeout <SECONDS>`.
+## Terminal UI
 
-## Use it yourself
+The TUI combines request history, request and response details, interception, inline editing, search, and durable annotations. Press `Ctrl-B ?` for commands and keybindings.
 
-The TUI shows request history beside the selected request and response. It supports the keyboard, mouse, and an inline Vim-style JSON editor.
+Sessions survive restarts in `~/.config/jsonrpc-debugger/sqlite.db`. Set `XDG_CONFIG_HOME` or `JSONRPC_DEBUGGER_CONFIG_DIR` to move the database.
 
-| Action | Input |
-| --- | --- |
-| Focus a panel | Hover or click it |
-| Scroll a panel | Mouse wheel or `j` / `k` |
-| Change tabs or inputs | Click them |
-| Select a line | Click its line number |
-| Select a line range | Click, then Shift-click |
-| Open the selected response | `Enter` from Requests |
-| Copy details or status as Markdown | `Enter` |
-| Copy any focused panel as Markdown | `Ctrl-B y` |
-| Open commands / keybinds | `Ctrl-B` / `Ctrl-B ?` |
-| Fullscreen the focused panel | `Ctrl-B z` |
-| Open saved sessions / start a new one | `Ctrl-B s` / `Ctrl-B n` |
-| Rename the current session | `Ctrl-B R` |
-| Annotate one line | Hover it, then click `+` |
-| Annotate a Vim selection | `v`, select lines, then `Ctrl-B a` |
-| Edit an annotation | Click its amber note |
-| Previous / next annotation | `[` / `]` |
-| Delete the focused annotation | `Ctrl-B d` |
-| Pause new requests | `Ctrl-B p` |
-| Allow or block an intercepted request | `a` / `b` |
-| Edit a request body or headers | `e` / `h` |
-| Complete an intercepted request | `c` |
-| Create a request | `Ctrl-B c` |
-| Quit | `Ctrl-B q` or `Ctrl-C` |
+## Agent control
 
-The request list copies as a Markdown table with `Ctrl-B y`. Request bodies, responses, headers, and status copy as Markdown with `Enter` or `Ctrl-B y`.
+The control plane is a JSON-RPC 2.0 server. Agents can inspect history, search saved sessions, annotate evidence, reveal matches in the TUI, send requests, and control interception while you watch.
 
-The inline editor supports normal Vim motions and operators such as `w`, `b`, `e`, `cw`, `dw`, `dd`, `u`, and `p`. Save with `:w`; cancel with `:q!`.
-
-History and line annotations survive restarts in `~/.config/jsonrpc-debugger/sqlite.db`. One-line notes sit beside their source line. Range notes sit below the selection. Amber scrollbar ticks show annotations above and below the current view. Set `XDG_CONFIG_HOME` or `JSONRPC_DEBUGGER_CONFIG_DIR` to move the database.
-
-## Let an agent drive it
-
-The control plane is itself a JSON-RPC 2.0 server. An agent can operate the debugger while you watch the same actions happen in the TUI.
-
-Print the agent skill bundled with your installed version:
+Print the bundled agent skill:
 
 ```bash
 jsonrpc-debugger --skill
 ```
 
-Ask the running debugger what it supports:
+Discover the live API:
 
 ```bash
 curl http://127.0.0.1:8081 \
@@ -142,45 +85,7 @@ curl http://127.0.0.1:8081 \
   -d '{"jsonrpc":"2.0","id":1,"method":"rpc.discover"}'
 ```
 
-Read its current state:
-
-```bash
-curl http://127.0.0.1:8081 \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"debugger.getState"}'
-```
-
-Search every saved session without changing the TUI:
-
-```bash
-curl http://127.0.0.1:8081 \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":3,"method":"debugger.find","params":{"query":"eth_call"}}'
-```
-
-In HTTP and stdio driver modes, an agent can:
-
-- Read state, history, pending requests, and numbered panel content.
-- Search durable sessions, complete exchanges, and annotations without changing the TUI.
-- Pass a search result reference to `debugger.revealLines` to open and highlight it.
-- List old sessions and page through their persistent history without changing the TUI.
-- Wait for revisions without polling.
-- Send requests through the debugger.
-- Select exchanges, focus panels, scroll, and highlight line ranges.
-- Add persistent line annotations and remove them by ID.
-- Change the target or filter and control interception.
-- Create, select, or rename sessions.
-- Export portable history or replay it without forwarding requests.
-
-Transparent `wrap` mode keeps one client on one matching data plane. Agents can inspect its state and durable history or pause and resolve client requests, but cannot inject new requests into the external client's response stream.
-
-Line selections are shared but temporary. Annotations stick to their exchange until a person presses `Ctrl-B d` or an agent removes one by ID. Highlights can move without erasing the notes around them.
-
-The complete API lives in [`openrpc.json`](openrpc.json) and is available at runtime through `rpc.discover`.
-
-## Intercept requests
-
-Press `Ctrl-B p` or call `debugger.setPaused`. New requests wait in the debugger until a person or agent allows, blocks, edits, or completes them with a custom response. Those focused actions stay on direct keys because they only apply while a request is waiting.
+The complete API lives in [`openrpc.json`](openrpc.json).
 
 ## Develop
 

@@ -7,10 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-30
+
 ### Added
 
 - `debugger.find` searches durable sessions, exchanges, and annotations. Its line references open and highlight exact matches.
-- New and edited annotations use an inline editor below their source lines. Detail lines show a hover `+` for quick annotations, and clicking an amber note edits it. `[` and `]` move between annotations in the focused panel. `Ctrl-B a` still annotates Vim selections.
+- Transparent stdio sessions can pause and resolve requests without taking ownership away from the real client.
+
+### Changed
+
+- The TUI uses a compact request sidebar with stacked details and stable diff-based redraws.
+- Annotations use an inline editor and navigate across exchanges from any panel.
+- Stdio requests have bounded waits so silent children cannot hang the debugger forever.
 
 ## [0.3.1] - 2026-08-21
 
