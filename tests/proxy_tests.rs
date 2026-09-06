@@ -286,7 +286,7 @@ fn test_message_channel_integration() {
 
     // Should have one exchange with our request
     assert_eq!(app.exchanges().len(), 1);
-    let last_exchange = app.exchanges().last().unwrap();
+    let last_exchange = app.exchanges().last().unwrap().unwrap();
     assert_eq!(last_exchange.method, Some("test_method".to_string()));
     assert_eq!(
         last_exchange.id,
@@ -339,7 +339,7 @@ fn test_multiple_message_handling() {
     assert_eq!(app.exchanges().len(), initial_count + 5);
 
     // Check the last exchange
-    let last_exchange = app.exchanges().last().unwrap();
+    let last_exchange = app.exchanges().last().unwrap().unwrap();
     assert_eq!(last_exchange.method, Some("method_5".to_string()));
     assert_eq!(
         last_exchange.id,

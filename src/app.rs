@@ -1,11 +1,13 @@
+use crate::exchange_store::{ExchangeStore, ExchangeSummary};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     ffi::OsString,
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JsonRpcMessage {
     pub id: Option<serde_json::Value>,
     pub method: Option<String>,
@@ -18,7 +20,7 @@ pub struct JsonRpcMessage {
     pub headers: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JsonRpcExchange {
     pub id: Option<serde_json::Value>,
     pub method: Option<String>,
@@ -37,19 +39,19 @@ impl JsonRpcExchange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MessageDirection {
     Request,
     Response,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Framing {
     JsonLines,
     ContentLength,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransportType {
     Http,
     HttpBatch,
@@ -879,9 +881,39 @@ pub struct PendingRequest {
     pub decision_sender: oneshot::Sender<ProxyDecision>,
 }
 
+#[derive(Default)]
+struct FilteredExchanges {
+    filter: String,
+    scanned: usize,
+    indices: Vec<usize>,
+}
+
+struct AnnotationNavigation {
+    order: Vec<usize>,
+    positions: HashMap<String, usize>,
+}
+
+fn annotation_panel_order(panel: Focus) -> usize {
+    match panel {
+        Focus::RequestSection => 0,
+        Focus::ResponseSection => 1,
+        Focus::MessageList => 2,
+        Focus::StatusHeader => 3,
+    }
+}
+
+fn annotation_position(annotation: &LineAnnotation) -> (usize, usize, usize) {
+    (
+        annotation.exchange_index,
+        annotation_panel_order(annotation.panel),
+        usize::from(annotation.tab == DetailTab::Body),
+    )
+}
+
 #[allow(dead_code)]
 pub struct App {
-    exchanges: Vec<JsonRpcExchange>,
+    exchanges: ExchangeStore,
+    filtered_exchanges: RefCell<FilteredExchanges>,
     pending_exchanges: HashMap<Option<serde_json::Value>, Vec<usize>>,
     pub selected_exchange: usize,
     pub filter_text: String,
@@ -915,7 +947,13 @@ pub struct App {
     pub annotation_hover: Option<DetailHover>,
     pub annotation_edit_id: Option<String>,
     pub annotation_reply_id: Option<String>,
-    pub annotations: Vec<LineAnnotation>,
+    annotations: Vec<LineAnnotation>,
+    annotation_indices: HashMap<usize, Vec<usize>>,
+    annotation_revision: u64,
+    annotation_navigation: Option<AnnotationNavigation>,
+    pub(crate) request_detail_cache: RefCell<crate::ui::DetailCache>,
+    pub(crate) response_detail_cache: RefCell<crate::ui::DetailCache>,
+    pub(crate) remote_annotation_revision: Option<u64>,
     pub active_annotation_id: Option<String>,
     pub editor: Option<TextEditor>,
     notice: Option<String>,
@@ -953,15 +991,17 @@ pub struct StdioConfig {
     pub request_timeout: Duration,
 }
 
-fn exchange_status(exchange: &JsonRpcExchange) -> &'static str {
+fn exchange_status(exchange: &ExchangeSummary) -> &'static str {
     if exchange.is_notification() {
         return "Notification";
     }
-    match &exchange.response {
-        None => "Pending",
-        Some(response) if response.error.is_some() => "Error",
-        Some(_) => "Success",
+    if exchange.response_timestamp.is_none() {
+        return "Pending";
     }
+    if exchange.has_error {
+        return "Error";
+    }
+    "Success"
 }
 
 fn display_id(id: Option<&serde_json::Value>) -> String {
@@ -980,11 +1020,12 @@ pub fn request_matches_filter(
     filter.is_empty() || method.unwrap_or("").contains(filter) || display_id(id).contains(filter)
 }
 
-fn exchange_duration(exchange: &JsonRpcExchange) -> String {
-    let (Some(request), Some(response)) = (&exchange.request, &exchange.response) else {
+fn exchange_duration(exchange: &ExchangeSummary) -> String {
+    let (Some(request), Some(response)) = (exchange.request_timestamp, exchange.response_timestamp)
+    else {
         return "-".to_string();
     };
-    let Ok(duration) = response.timestamp.duration_since(request.timestamp) else {
+    let Ok(duration) = response.duration_since(request) else {
         return "-".to_string();
     };
 
@@ -1078,7 +1119,8 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self {
-            exchanges: Vec::new(),
+            exchanges: ExchangeStore::default(),
+            filtered_exchanges: RefCell::default(),
             pending_exchanges: HashMap::new(),
             selected_exchange: 0,
             filter_text: String::new(),
@@ -1119,6 +1161,12 @@ impl App {
             annotation_edit_id: None,
             annotation_reply_id: None,
             annotations: Vec::new(),
+            annotation_indices: HashMap::new(),
+            annotation_revision: 0,
+            annotation_navigation: None,
+            request_detail_cache: RefCell::default(),
+            response_detail_cache: RefCell::default(),
+            remote_annotation_revision: None,
             active_annotation_id: None,
             editor: None,
             notice: None,
@@ -1169,7 +1217,10 @@ impl App {
         exchanges: Vec<JsonRpcExchange>,
         annotations: Vec<LineAnnotation>,
     ) {
+        self.clear_detail_cache();
+        self.remote_annotation_revision = None;
         self.exchanges.clear();
+        *self.filtered_exchanges.get_mut() = FilteredExchanges::default();
         self.pending_exchanges.clear();
         for exchange in exchanges {
             self.push_exchange(exchange);
@@ -1189,13 +1240,32 @@ impl App {
         self.annotation_hover = None;
         self.annotation_edit_id = None;
         self.annotation_reply_id = None;
-        self.annotations = annotations;
+        self.set_annotations(annotations);
         self.active_annotation_id = None;
         self.reset_details_scroll();
         self.request_details_scroll = 0;
         self.response_details_scroll = 0;
         self.reset_detail_cursors();
         self.mark_changed();
+    }
+
+    pub fn activate_cached_session(
+        &mut self,
+        session: SessionSummary,
+        exchanges: ExchangeStore,
+        annotations: Vec<LineAnnotation>,
+    ) {
+        self.activate_session(session, Vec::new(), annotations);
+        self.exchanges = exchanges;
+        for (index, exchange) in self.exchanges.summaries().iter().enumerate() {
+            if !exchange.is_notification() && exchange.response_timestamp.is_none() {
+                self.pending_exchanges
+                    .entry(exchange.id.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        self.selected_exchange = self.exchanges.len().saturating_sub(1);
     }
 
     pub fn show_prefix(&mut self) {
@@ -1286,7 +1356,30 @@ impl App {
                     self.pending_exchanges.remove(&message.id);
                 }
                 if let Some(index) = index {
-                    self.exchanges[index].response = Some(message);
+                    self.invalidate_detail_cache(index);
+                    match self.exchanges.load(index) {
+                        Ok(()) => {
+                            if let Err(error) = self.exchanges.set_response(index, message) {
+                                self.set_notice(format!("Error: {error:#}"));
+                            }
+                        }
+                        Err(error) => {
+                            self.pending_exchanges
+                                .entry(message.id.clone())
+                                .or_default()
+                                .push(index);
+                            // Retain the incoming message even if its cached request is unreadable.
+                            self.push_exchange(JsonRpcExchange {
+                                id: message.id.clone(),
+                                method: None,
+                                request: None,
+                                timestamp: message.timestamp,
+                                transport: message.transport,
+                                response: Some(message),
+                            });
+                            self.set_notice(format!("Error: {error:#}"));
+                        }
+                    }
                 } else {
                     // No matching request found, create exchange with just response
                     let exchange = JsonRpcExchange {
@@ -1307,7 +1400,7 @@ impl App {
         self.mark_changed();
     }
 
-    pub fn exchanges(&self) -> &[JsonRpcExchange] {
+    pub fn exchanges(&self) -> &ExchangeStore {
         &self.exchanges
     }
 
@@ -1315,18 +1408,36 @@ impl App {
         self.pending_exchanges.values().flatten().copied()
     }
 
+    fn invalidate_detail_cache(&mut self, index: usize) {
+        self.request_detail_cache.get_mut().invalidate(index);
+        self.response_detail_cache.get_mut().invalidate(index);
+    }
+
+    fn clear_detail_cache(&mut self) {
+        *self.request_detail_cache.get_mut() = Default::default();
+        *self.response_detail_cache.get_mut() = Default::default();
+    }
+
     pub(crate) fn push_exchange(&mut self, exchange: JsonRpcExchange) {
+        self.invalidate_detail_cache(self.exchanges.len());
         if !exchange.is_notification() && exchange.response.is_none() {
             self.pending_exchanges
                 .entry(exchange.id.clone())
                 .or_default()
                 .push(self.exchanges.len());
         }
-        self.exchanges.push(exchange);
+        if let Err(error) = self.exchanges.push(exchange) {
+            self.set_notice(format!("Error: {error:#}"));
+        }
     }
 
     pub(crate) fn replace_exchange(&mut self, index: usize, exchange: JsonRpcExchange) {
-        let old_id = &self.exchanges[index].id;
+        self.invalidate_detail_cache(index);
+        let summary = &self.exchanges.summaries()[index];
+        if summary.id != exchange.id || summary.method != exchange.method {
+            *self.filtered_exchanges.get_mut() = FilteredExchanges::default();
+        }
+        let old_id = &self.exchanges.summaries()[index].id;
         if let Some(indices) = self.pending_exchanges.get_mut(old_id) {
             indices.retain(|pending| *pending != index);
             if indices.is_empty() {
@@ -1341,35 +1452,54 @@ impl App {
             let position = indices.partition_point(|pending| *pending < index);
             indices.insert(position, index);
         }
-        self.exchanges[index] = exchange;
+        if let Err(error) = self.exchanges.replace(index, exchange) {
+            self.set_notice(format!("Error: {error:#}"));
+        }
         self.mark_changed();
     }
 
-    pub fn get_selected_exchange(&self) -> Option<&JsonRpcExchange> {
+    pub fn get_selected_exchange(
+        &self,
+    ) -> anyhow::Result<Option<std::borrow::Cow<'_, JsonRpcExchange>>> {
         self.exchanges.get(self.selected_exchange)
     }
 
     pub fn filtered_exchange_indices(&self) -> Vec<usize> {
-        self.exchanges
-            .iter()
-            .enumerate()
-            .filter(|(_, exchange)| {
-                request_matches_filter(
+        self.filtered_exchanges().to_vec()
+    }
+
+    pub(crate) fn filtered_exchanges(&self) -> std::cell::Ref<'_, [usize]> {
+        let stale = {
+            let cache = self.filtered_exchanges.borrow();
+            cache.filter != self.filter_text || cache.scanned != self.exchanges.len()
+        };
+        if stale {
+            let mut cache = self.filtered_exchanges.borrow_mut();
+            if cache.filter != self.filter_text {
+                cache.filter.clone_from(&self.filter_text);
+                cache.scanned = 0;
+                cache.indices.clear();
+            }
+            for index in cache.scanned..self.exchanges.len() {
+                let exchange = &self.exchanges.summaries()[index];
+                if request_matches_filter(
                     exchange.method.as_deref(),
                     exchange.id.as_ref(),
                     &self.filter_text,
-                )
-            })
-            .map(|(index, _)| index)
-            .collect()
+                ) {
+                    cache.indices.push(index);
+                }
+            }
+            cache.scanned = self.exchanges.len();
+        }
+        std::cell::Ref::map(self.filtered_exchanges.borrow(), |cache| {
+            cache.indices.as_slice()
+        })
     }
 
     pub fn history_scroll_offset(&self, visible_rows: usize) -> usize {
-        let indices = self.filtered_exchange_indices();
-        let selected = indices
-            .iter()
-            .position(|index| *index == self.selected_exchange)
-            .unwrap_or(0);
+        let indices = self.filtered_exchanges();
+        let selected = indices.binary_search(&self.selected_exchange).unwrap_or(0);
         let visible_rows = visible_rows.max(1);
         let followed = selected.saturating_sub(visible_rows.saturating_sub(1));
         let max_scroll = indices.len().saturating_sub(visible_rows);
@@ -1380,7 +1510,7 @@ impl App {
         let previous = self.history_scroll_offset(visible_rows);
         let distance = usize::try_from(lines.unsigned_abs()).unwrap_or(usize::MAX);
         let max_scroll = self
-            .filtered_exchange_indices()
+            .filtered_exchanges()
             .len()
             .saturating_sub(visible_rows.max(1));
         let current = if lines >= 0 {
@@ -1522,8 +1652,66 @@ impl App {
         self.annotation_hover = hover;
     }
 
+    pub fn annotations(&self) -> &[LineAnnotation] {
+        &self.annotations
+    }
+
+    pub fn annotation_revision(&self) -> u64 {
+        self.annotation_revision
+    }
+
+    pub fn exchange_annotations(
+        &self,
+        index: usize,
+    ) -> impl DoubleEndedIterator<Item = &LineAnnotation> {
+        self.annotation_indices
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.annotations[*index])
+    }
+
+    pub(crate) fn annotated_exchange_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.annotation_indices.keys().copied()
+    }
+
+    pub fn annotation_count(&self, index: usize) -> usize {
+        self.annotation_indices.get(&index).map_or(0, Vec::len)
+    }
+
+    pub fn set_annotations(&mut self, annotations: Vec<LineAnnotation>) {
+        self.annotations = annotations;
+        if self
+            .active_annotation_id
+            .as_ref()
+            .is_some_and(|id| !self.annotations.iter().any(|note| &note.id == id))
+        {
+            self.active_annotation_id = None;
+        }
+        self.rebuild_annotation_indices();
+        self.annotation_revision = self.annotation_revision.wrapping_add(1);
+        self.mark_changed();
+    }
+
+    fn rebuild_annotation_indices(&mut self) {
+        self.annotation_navigation = None;
+        self.annotation_indices.clear();
+        for (index, annotation) in self.annotations.iter().enumerate() {
+            self.annotation_indices
+                .entry(annotation.exchange_index)
+                .or_default()
+                .push(index);
+        }
+    }
+
     pub fn add_annotation(&mut self, annotation: LineAnnotation) {
+        self.annotation_navigation = None;
+        self.annotation_indices
+            .entry(annotation.exchange_index)
+            .or_default()
+            .push(self.annotations.len());
         self.annotations.push(annotation);
+        self.annotation_revision = self.annotation_revision.wrapping_add(1);
         self.mark_changed();
     }
 
@@ -1536,17 +1724,13 @@ impl App {
             return false;
         };
         annotation.message = message;
+        self.annotation_revision = self.annotation_revision.wrapping_add(1);
         self.mark_changed();
         true
     }
 
     pub fn focus_annotation(&mut self, id: &str) {
-        let Some(annotation) = self
-            .annotations
-            .iter()
-            .find(|annotation| annotation.id == id)
-            .cloned()
-        else {
+        let Some(annotation) = self.annotation_by_id(id).cloned() else {
             return;
         };
         if annotation.exchange_index != self.selected_exchange {
@@ -1579,91 +1763,96 @@ impl App {
         self.focus_adjacent_annotation(true)
     }
 
+    pub fn annotation_by_id(&self, id: &str) -> Option<&LineAnnotation> {
+        if let Some(navigation) = &self.annotation_navigation {
+            let position = *navigation.positions.get(id)?;
+            return Some(&self.annotations[navigation.order[position]]);
+        }
+        self.annotations
+            .iter()
+            .find(|annotation| annotation.id == id)
+    }
+
+    fn ensure_annotation_navigation(&mut self) {
+        if self.annotation_navigation.is_some() {
+            return;
+        }
+        let mut order = (0..self.annotations.len()).collect::<Vec<_>>();
+        order.sort_by_key(|index| {
+            let note = &self.annotations[*index];
+            (
+                annotation_position(note),
+                note.start_line,
+                note.end_line,
+                note.created_at_ms,
+                note.id.as_str(),
+            )
+        });
+        let positions = order
+            .iter()
+            .enumerate()
+            .map(|(position, index)| (self.annotations[*index].id.clone(), position))
+            .collect();
+        self.annotation_navigation = Some(AnnotationNavigation { order, positions });
+    }
+
     fn focus_adjacent_annotation(&mut self, next: bool) -> bool {
-        let selected_exchange = self.selected_exchange;
-        let id = {
-            let panel_order = |panel| match panel {
-                Focus::RequestSection => 0,
-                Focus::ResponseSection => 1,
-                Focus::MessageList => 2,
-                Focus::StatusHeader => 3,
-            };
-            let tab_order = |tab| match tab {
-                DetailTab::Headers => 0,
-                DetailTab::Body => 1,
-            };
-            let position = |annotation: &LineAnnotation| {
-                (
-                    annotation.exchange_index,
-                    panel_order(annotation.panel),
-                    tab_order(annotation.tab),
-                )
-            };
-            let mut annotations = self.annotation_list().into_iter().collect::<Vec<_>>();
-            annotations.sort_by_key(|annotation| {
-                (
-                    position(annotation),
-                    annotation.start_line,
-                    annotation.end_line,
-                )
-            });
-
-            let active = self.active_annotation_id.as_deref().and_then(|id| {
-                annotations
-                    .iter()
-                    .position(|annotation| annotation.id == id)
-            });
-            let annotation = if let Some(index) = active {
-                if next {
-                    annotations.get(index + 1).or_else(|| annotations.first())
-                } else {
-                    index
-                        .checked_sub(1)
-                        .and_then(|index| annotations.get(index))
-                        .or_else(|| annotations.last())
-                }
-            } else if let (Some(tab), Some(cursor)) = (
-                self.detail_tab(self.focus),
-                self.detail_cursor_line(self.focus),
-            ) {
-                let anchor = (selected_exchange, panel_order(self.focus), tab_order(tab));
-                if next {
-                    annotations
-                        .iter()
-                        .find(|annotation| {
-                            position(annotation) > anchor
-                                || (position(annotation) == anchor && annotation.end_line >= cursor)
-                        })
-                        .or_else(|| annotations.first())
-                } else {
-                    annotations
-                        .iter()
-                        .rev()
-                        .find(|annotation| {
-                            position(annotation) < anchor
-                                || (position(annotation) == anchor
-                                    && annotation.start_line <= cursor)
-                        })
-                        .or_else(|| annotations.last())
-                }
-            } else if next {
-                annotations
-                    .iter()
-                    .find(|annotation| annotation.exchange_index >= selected_exchange)
-                    .or_else(|| annotations.first())
-            } else {
-                annotations
-                    .iter()
-                    .rev()
-                    .find(|annotation| annotation.exchange_index <= selected_exchange)
-                    .or_else(|| annotations.last())
-            };
-            annotation.map(|annotation| annotation.id.clone())
-        };
-        let Some(id) = id else {
+        if self.annotations.is_empty() {
             return false;
+        }
+        self.ensure_annotation_navigation();
+        let navigation = self.annotation_navigation.as_ref().unwrap();
+        let count = navigation.order.len();
+        let note_at = |position| &self.annotations[navigation.order[position]];
+        let active = self
+            .active_annotation_id
+            .as_deref()
+            .and_then(|id| navigation.positions.get(id))
+            .copied();
+        let position = if let Some(position) = active {
+            if next {
+                (position + 1) % count
+            } else {
+                position.checked_sub(1).unwrap_or(count - 1)
+            }
+        } else if let (Some(tab), Some(cursor)) = (
+            self.detail_tab(self.focus),
+            self.detail_cursor_line(self.focus),
+        ) {
+            let anchor = (
+                self.selected_exchange,
+                annotation_panel_order(self.focus),
+                usize::from(tab == DetailTab::Body),
+            );
+            if next {
+                (0..count)
+                    .find(|position| {
+                        let note = note_at(*position);
+                        annotation_position(note) > anchor
+                            || (annotation_position(note) == anchor && note.end_line >= cursor)
+                    })
+                    .unwrap_or(0)
+            } else {
+                (0..count)
+                    .rev()
+                    .find(|position| {
+                        let note = note_at(*position);
+                        annotation_position(note) < anchor
+                            || (annotation_position(note) == anchor && note.start_line <= cursor)
+                    })
+                    .unwrap_or(count - 1)
+            }
+        } else if next {
+            (0..count)
+                .find(|position| note_at(*position).exchange_index >= self.selected_exchange)
+                .unwrap_or(0)
+        } else {
+            (0..count)
+                .rev()
+                .find(|position| note_at(*position).exchange_index <= self.selected_exchange)
+                .unwrap_or(count - 1)
         };
-
+        let id = note_at(position).id.clone();
         self.focus_annotation(&id);
         self.clear_line_selection();
         true
@@ -1680,6 +1869,8 @@ impl App {
             }
         }
         self.annotations.retain(|note| note.id != id);
+        self.rebuild_annotation_indices();
+        self.annotation_revision = self.annotation_revision.wrapping_add(1);
         if self.active_annotation_id.as_deref() == Some(id) {
             self.active_annotation_id = None;
         }
@@ -1754,13 +1945,19 @@ impl App {
         panel: Focus,
     ) -> impl DoubleEndedIterator<Item = &LineAnnotation> {
         let tab = self.detail_tab(panel);
-        self.annotation_list()
-            .into_iter()
-            .filter(move |annotation| {
-                annotation.exchange_index == self.selected_exchange
-                    && annotation.panel == panel
-                    && Some(annotation.tab) == tab
-            })
+        let mut notes = self
+            .exchange_annotations(self.selected_exchange)
+            .filter(|annotation| annotation.panel == panel && Some(annotation.tab) == tab)
+            .collect::<Vec<_>>();
+        notes.sort_by_key(|note| {
+            (
+                note.start_line,
+                note.end_line,
+                note.created_at_ms,
+                note.id.as_str(),
+            )
+        });
+        notes.into_iter()
     }
 
     pub fn selection_overlaps_annotation(&self) -> bool {
@@ -1852,14 +2049,21 @@ impl App {
     }
 
     pub fn set_focus(&mut self, focus: Focus) {
-        if self.focus == focus {
+        let fullscreen = self.panel_fullscreen && focus != Focus::StatusHeader;
+        if self.focus == focus && self.panel_fullscreen == fullscreen {
             return;
         }
         self.focus = focus;
+        self.panel_fullscreen = fullscreen;
         self.mark_changed();
     }
 
+    pub fn is_panel_fullscreen(&self) -> bool {
+        self.panel_fullscreen && self.focus != Focus::StatusHeader
+    }
+
     pub fn set_panel_fullscreen(&mut self, fullscreen: bool) {
+        let fullscreen = fullscreen && self.focus != Focus::StatusHeader;
         if self.panel_fullscreen == fullscreen {
             return;
         }
@@ -1946,7 +2150,7 @@ impl App {
         ];
 
         for index in self.filtered_exchange_indices() {
-            let exchange = &self.exchanges[index];
+            let exchange = &self.exchanges.summaries()[index];
             lines.push(format!(
                 "| {} | {} | {} | {} | {} |",
                 exchange_status(exchange),
@@ -1961,9 +2165,12 @@ impl App {
     }
 
     fn request_markdown(&self) -> Option<String> {
-        let exchange = self.get_selected_exchange()?;
+        let exchange = match self.get_selected_exchange() {
+            Ok(exchange) => exchange?,
+            Err(error) => return Some(format!("Error: {error:#}")),
+        };
         let request = exchange.request.as_ref()?;
-        let mut markdown = exchange_heading("Request", exchange);
+        let mut markdown = exchange_heading("Request", &exchange);
 
         if self.request_tab == 0 {
             markdown.push_str(&headers_markdown(request.headers.as_ref()));
@@ -1975,7 +2182,10 @@ impl App {
     }
 
     fn response_markdown(&self) -> Option<String> {
-        let exchange = self.get_selected_exchange()?;
+        let exchange = match self.get_selected_exchange() {
+            Ok(exchange) => exchange?,
+            Err(error) => return Some(format!("Error: {error:#}")),
+        };
         let response = exchange.response.as_ref()?;
         let mut markdown = "# Response\n".to_string();
 
@@ -2133,6 +2343,10 @@ impl App {
         self.focus = match self.focus {
             Focus::MessageList => Focus::RequestSection,
             Focus::RequestSection => Focus::ResponseSection,
+            Focus::ResponseSection if self.panel_fullscreen && self.request_list_visible => {
+                Focus::MessageList
+            }
+            Focus::ResponseSection if self.panel_fullscreen => Focus::RequestSection,
             Focus::ResponseSection => Focus::StatusHeader,
             Focus::StatusHeader if self.request_list_visible => Focus::MessageList,
             Focus::StatusHeader => Focus::RequestSection,
@@ -2142,8 +2356,10 @@ impl App {
 
     pub fn switch_focus_reverse(&mut self) {
         self.focus = match self.focus {
+            Focus::MessageList if self.panel_fullscreen => Focus::ResponseSection,
             Focus::MessageList => Focus::StatusHeader,
             Focus::RequestSection if self.request_list_visible => Focus::MessageList,
+            Focus::RequestSection if self.panel_fullscreen => Focus::ResponseSection,
             Focus::RequestSection => Focus::StatusHeader,
             Focus::ResponseSection => Focus::RequestSection,
             Focus::StatusHeader => Focus::ResponseSection,
@@ -2388,119 +2604,11 @@ impl App {
     }
 
     pub fn get_request_details_content_lines(&self) -> usize {
-        if let Some(exchange) = self.get_selected_exchange() {
-            let mut line_count = 0;
-
-            // Basic exchange info
-            line_count += 1; // Transport line
-
-            if exchange.method.is_some() {
-                line_count += 1;
-            }
-            if exchange.id.is_some() {
-                line_count += 1;
-            }
-
-            // Request section
-            line_count += 1; // Blank line before section
-            line_count += 1; // Section header
-            line_count += 1; // Tabs line
-
-            if let Some(request) = &exchange.request {
-                match self.request_tab {
-                    0 => match &request.headers {
-                        Some(headers) if !headers.is_empty() => {
-                            line_count += headers.len();
-                        }
-                        Some(_) | None => {
-                            line_count += 1;
-                        }
-                    },
-                    _ => {
-                        let mut request_json = serde_json::Map::new();
-                        request_json.insert(
-                            "jsonrpc".to_string(),
-                            serde_json::Value::String("2.0".to_string()),
-                        );
-                        if let Some(id) = &request.id {
-                            request_json.insert("id".to_string(), id.clone());
-                        }
-                        if let Some(method) = &request.method {
-                            request_json.insert(
-                                "method".to_string(),
-                                serde_json::Value::String(method.clone()),
-                            );
-                        }
-                        if let Some(params) = &request.params {
-                            request_json.insert("params".to_string(), params.clone());
-                        }
-
-                        if let Ok(json_str) =
-                            serde_json::to_string_pretty(&serde_json::Value::Object(request_json))
-                        {
-                            line_count += json_str.lines().count();
-                        }
-                    }
-                }
-            } else {
-                line_count += 1;
-            }
-
-            line_count
-        } else {
-            1
-        }
+        crate::ui::detail_line_count(self, Focus::RequestSection).unwrap_or(0)
     }
 
     pub fn get_response_details_content_lines(&self) -> usize {
-        if let Some(exchange) = self.get_selected_exchange() {
-            let mut line_count = 0;
-
-            // Response section
-            line_count += 1; // Section header
-            line_count += 1; // Tabs line
-
-            if let Some(response) = &exchange.response {
-                match self.response_tab {
-                    0 => match &response.headers {
-                        Some(headers) if !headers.is_empty() => {
-                            line_count += headers.len();
-                        }
-                        Some(_) | None => {
-                            line_count += 1;
-                        }
-                    },
-                    _ => {
-                        let mut response_json = serde_json::Map::new();
-                        response_json.insert(
-                            "jsonrpc".to_string(),
-                            serde_json::Value::String("2.0".to_string()),
-                        );
-                        if let Some(id) = &response.id {
-                            response_json.insert("id".to_string(), id.clone());
-                        }
-                        if let Some(result) = &response.result {
-                            response_json.insert("result".to_string(), result.clone());
-                        }
-                        if let Some(error) = &response.error {
-                            response_json.insert("error".to_string(), error.clone());
-                        }
-
-                        if let Ok(json_str) =
-                            serde_json::to_string_pretty(&serde_json::Value::Object(response_json))
-                        {
-                            line_count += json_str.lines().count();
-                        }
-                    }
-                }
-            } else {
-                line_count += 1;
-            }
-
-            line_count
-        } else {
-            1
-        }
+        crate::ui::detail_line_count(self, Focus::ResponseSection).unwrap_or(0)
     }
 
     pub fn get_intercept_details_content_lines(&self) -> usize {

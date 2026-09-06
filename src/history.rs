@@ -164,6 +164,7 @@ impl HistoryStore {
             .map_err(Into::into)
     }
 
+    #[allow(dead_code)] // Full-history library API; the TUI uses load_cached_session.
     pub fn load_session(
         &self,
         id: &str,
@@ -176,6 +177,30 @@ impl HistoryStore {
             .into_iter()
             .map(|(_, exchange)| exchange)
             .collect();
+        Ok((session, exchanges, self.annotations(id)?))
+    }
+
+    pub fn load_cached_session(
+        &self,
+        id: &str,
+    ) -> Result<(
+        SessionSummary,
+        crate::exchange_store::ExchangeStore,
+        Vec<LineAnnotation>,
+    )> {
+        let session = self
+            .session(id)?
+            .ok_or_else(|| anyhow!("session not found: {id}"))?;
+        let mut exchanges = crate::exchange_store::ExchangeStore::default();
+        let mut statement = self.connection.prepare(
+            "SELECT exchange_json FROM exchanges WHERE session_id = ?1 ORDER BY sequence",
+        )?;
+        let mut rows = statement.query([id])?;
+        while let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            let exchange: SessionExchange = serde_json::from_str(&json)?;
+            exchanges.push(exchange.try_into().map_err(anyhow::Error::msg)?)?;
+        }
         Ok((session, exchanges, self.annotations(id)?))
     }
 
@@ -1286,6 +1311,39 @@ mod tests {
                 message: "Edited".to_string(),
                 ..original
             }]
+        );
+    }
+    #[test]
+    fn cached_session_preserves_payloads_indices_and_pending_requests() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store.create_session(Some("large"), "test").unwrap();
+        for id in 0..3 {
+            let mut message = request(id);
+            message.params = Some(json!({"blob": "x".repeat(5 * 1024 * 1024)}));
+            store.record_messages(&session.id, &[message]).unwrap();
+        }
+        store.record_messages(&session.id, &[response(0)]).unwrap();
+        store
+            .add_annotation(&session.id, &annotation("old-note", 0))
+            .unwrap();
+        let (session, exchanges, notes) = store.load_cached_session(&session.id).unwrap();
+        let mut app = crate::app::App::new();
+        app.activate_cached_session(session, exchanges, notes);
+        assert_eq!(app.exchanges().len(), 3);
+        assert_eq!(app.selected_exchange, 2);
+        let mut pending = app.pending_exchange_indices().collect::<Vec<_>>();
+        pending.sort_unstable();
+        assert_eq!(pending, [1, 2]);
+        assert_eq!(app.annotation_count(0), 1);
+        app.select_exchange(0);
+        let exchange = app.get_selected_exchange().unwrap().unwrap();
+        assert!(exchange.response.is_some());
+        assert_eq!(
+            exchange.request.as_ref().unwrap().params.as_ref().unwrap()["blob"]
+                .as_str()
+                .unwrap()
+                .len(),
+            5 * 1024 * 1024
         );
     }
 }

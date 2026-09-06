@@ -84,7 +84,7 @@ fn test_full_exchange_flow() {
 
     // Navigate to the exchange
     app.selected_exchange = app.exchanges().len() - 1;
-    let selected_exchange = app.get_selected_exchange().unwrap();
+    let selected_exchange = app.get_selected_exchange().unwrap().unwrap();
 
     // Verify the exchange has both request and response
     assert!(selected_exchange.request.is_some());
@@ -148,8 +148,8 @@ fn test_websocket_vs_http_exchanges() {
     // Should have 2 exchanges
     assert_eq!(app.exchanges().len(), 2);
 
-    let http_exchange = &app.exchanges()[0];
-    let ws_exchange = &app.exchanges()[1];
+    let http_exchange = &app.exchanges().get(0).unwrap().unwrap();
+    let ws_exchange = &app.exchanges().get(1).unwrap().unwrap();
 
     // HTTP exchange should have headers in request
     assert!(http_exchange.request.as_ref().unwrap().headers.is_some());
@@ -200,7 +200,7 @@ fn test_error_handling() {
 
     // Should have 1 exchange with error response
     assert_eq!(app.exchanges().len(), 1);
-    let exchange = app.exchanges().last().unwrap();
+    let exchange = app.exchanges().last().unwrap().unwrap();
 
     assert!(exchange.request.is_some());
     assert!(exchange.response.is_some());

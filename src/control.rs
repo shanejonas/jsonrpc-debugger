@@ -17,11 +17,14 @@ use warp::{http::StatusCode, Filter, Reply};
 #[derive(Debug)]
 pub enum ControlAction {
     Discover,
-    GetState,
+    GetState {
+        include_annotations: bool,
+    },
     GetUpdates {
         session_id: Option<String>,
         next_index: usize,
         pending_indices: Vec<usize>,
+        annotation_revision: Option<u64>,
     },
     WaitForChange {
         after_revision: u64,
@@ -312,8 +315,26 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
 
     match method {
         "rpc.discover" => Ok(ControlAction::Discover),
-        "debugger.getState" => Ok(ControlAction::GetState),
+        "debugger.getState" => Ok(ControlAction::GetState {
+            include_annotations: optional(params, 0, "includeAnnotations")
+                .map(|value| {
+                    value.as_bool().ok_or_else(|| {
+                        ControlError::invalid_params("includeAnnotations must be a boolean")
+                    })
+                })
+                .transpose()?
+                .unwrap_or(true),
+        }),
         "debugger.getUpdates" => Ok(ControlAction::GetUpdates {
+            annotation_revision: optional(params, 3, "annotationRevision")
+                .map(|value| {
+                    value.as_u64().ok_or_else(|| {
+                        ControlError::invalid_params(
+                            "annotationRevision must be a nonnegative integer",
+                        )
+                    })
+                })
+                .transpose()?,
             session_id: optional_string(params, 0, "sessionId")?.map(str::to_string),
             next_index: optional_usize(params, 1, "nextIndex")?.unwrap_or(0),
             pending_indices: optional(params, 2, "pendingIndices")
@@ -638,6 +659,10 @@ pub fn discovery(port: u16) -> Value {
 }
 
 pub fn state(app: &App) -> Value {
+    state_with_annotations(app, true)
+}
+
+pub fn state_with_annotations(app: &App, include_annotations: bool) -> Value {
     let line_selection = app.line_selection.as_ref().map(|selection| {
         json!({
             "panel": focus_name(selection.panel),
@@ -647,12 +672,12 @@ pub fn state(app: &App) -> Value {
         })
     });
     let annotations = app
-        .annotations
-        .iter()
-        .filter(|annotation| annotation.exchange_index == app.selected_exchange)
+        .exchange_annotations(app.selected_exchange)
+        .filter(|_| include_annotations)
         .map(annotation_value)
         .collect::<Vec<_>>();
-    json!({
+    let mut state = json!({
+        "annotationRevision": app.annotation_revision(),
         "revision": app.revision(),
         "running": app.is_running,
         "mode": mode_name(&app.app_mode),
@@ -663,7 +688,7 @@ pub fn state(app: &App) -> Value {
         "transport": app.proxy_config.transport.name(),
         "filter": app.filter_text,
         "focus": focus_name(app.focus),
-        "fullscreen": app.panel_fullscreen,
+        "fullscreen": app.is_panel_fullscreen(),
         "lineSelection": line_selection,
         "visualSelectionActive": app.visual_selection_active,
         "annotations": annotations,
@@ -685,7 +710,11 @@ pub fn state(app: &App) -> Value {
         "pendingCount": app.pending_requests.len(),
         "overlay": overlay_name(app.overlay),
         "session": app.session,
-    })
+    });
+    if !include_annotations {
+        state.as_object_mut().unwrap().remove("annotations");
+    }
+    state
 }
 
 /// Read a consistent snapshot of new exchanges and completed outstanding requests.
@@ -694,7 +723,17 @@ pub fn updates(
     app: &App,
     session_id: Option<&str>,
     next_index: usize,
+    pending_indices: Vec<usize>,
+) -> ControlResult {
+    updates_since(app, session_id, next_index, pending_indices, None)
+}
+
+pub fn updates_since(
+    app: &App,
+    session_id: Option<&str>,
+    next_index: usize,
     mut pending_indices: Vec<usize>,
+    annotation_revision: Option<u64>,
 ) -> ControlResult {
     let session = app
         .session
@@ -712,26 +751,38 @@ pub fn updates(
     }
     pending_indices.sort_unstable();
     pending_indices.dedup();
-    let completed = pending_indices
-        .into_iter()
-        .filter(|index| app.exchanges()[*index].response.is_some());
+    let completed = pending_indices.into_iter().filter(|index| {
+        app.exchanges().summaries()[*index]
+            .response_timestamp
+            .is_some()
+    });
     let exchanges = completed
         .chain(start..app.exchanges().len())
         .map(|index| {
-            let mut exchange = serde_json::to_value(SessionExchange::from(&app.exchanges()[index]))
+            let payload = app
+                .exchanges()
+                .get(index)
+                .map_err(|error| ControlError::runtime(format!("{error:#}")))?
+                .expect("exchange index is in bounds");
+            let mut exchange = serde_json::to_value(SessionExchange::from(payload.as_ref()))
                 .expect("session exchanges are serializable");
             exchange["index"] = json!(index);
-            exchange
+            Ok(exchange)
         })
-        .collect::<Vec<_>>();
-    Ok(json!({
-        "state": state(app),
+        .collect::<Result<Vec<_>, ControlError>>()?;
+    let include_annotations = reset || annotation_revision != Some(app.annotation_revision());
+    let mut result = json!({
+        "state": state_with_annotations(app, annotation_revision.is_none()),
+        "annotationRevision": app.annotation_revision(),
         "reset": reset,
         "nextIndex": app.exchanges().len(),
         "exchanges": exchanges,
         "pending": pending(app),
-        "annotations": annotations(app),
-    }))
+    });
+    if include_annotations {
+        result["annotations"] = annotations(app);
+    }
+    Ok(result)
 }
 
 pub fn change(app: &App, changed: bool) -> Value {
@@ -873,7 +924,11 @@ pub fn export_session(app: &App) -> Session {
         schema_version: 1,
         exported_at_ms: timestamp_ms(SystemTime::now()),
         target: app.proxy_config.target_url.clone(),
-        exchanges: app.exchanges().iter().map(SessionExchange::from).collect(),
+        exchanges: app
+            .exchanges()
+            .iter()
+            .map(|exchange| SessionExchange::from(exchange.unwrap().as_ref()))
+            .collect(),
     }
 }
 
@@ -1215,7 +1270,7 @@ mod tests {
             "params": {"sessionId":"session", "nextIndex":10, "pendingIndices":[0,4]}});
         assert!(
             matches!(parse_request(&request), Ok(ControlAction::GetUpdates {
-            session_id: Some(id), next_index: 10, pending_indices
+            session_id: Some(id), next_index: 10, pending_indices, ..
         }) if id == "session" && pending_indices == [0,4])
         );
         for invalid in [json!([-1]), json!([1.5]), json!(["1"]), json!({})] {
@@ -1225,7 +1280,7 @@ mod tests {
         request["params"] = json!([]);
         assert!(
             matches!(parse_request(&request), Ok(ControlAction::GetUpdates {
-            session_id: None, next_index: 0, pending_indices
+            session_id: None, next_index: 0, pending_indices, ..
         }) if pending_indices.is_empty())
         );
     }
@@ -1602,5 +1657,37 @@ mod tests {
         let (sender, _receiver) = mpsc::unbounded_channel();
 
         assert!(bind(port, sender).is_err());
+    }
+    #[test]
+    fn validates_annotation_update_and_polling_options() {
+        for invalid in [json!(-1), json!(1.5), json!("1")] {
+            assert!(parse_request(&json!({"jsonrpc":"2.0", "id":1, "method":"debugger.getUpdates", "params":{"annotationRevision":invalid}})).is_err());
+        }
+        assert!(matches!(
+            parse_request(
+                &json!({"jsonrpc":"2.0", "id":1, "method":"debugger.getUpdates", "params":{"annotationRevision":7}})
+            ),
+            Ok(ControlAction::GetUpdates {
+                annotation_revision: Some(7),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_request(
+                &json!({"jsonrpc":"2.0", "id":1, "method":"debugger.getState", "params":{}})
+            ),
+            Ok(ControlAction::GetState {
+                include_annotations: true
+            })
+        ));
+        assert!(matches!(
+            parse_request(
+                &json!({"jsonrpc":"2.0", "id":1, "method":"debugger.getState", "params":{"includeAnnotations":false}})
+            ),
+            Ok(ControlAction::GetState {
+                include_annotations: false
+            })
+        ));
+        assert!(parse_request(&json!({"jsonrpc":"2.0", "id":1, "method":"debugger.getState", "params":{"includeAnnotations":"false"}})).is_err());
     }
 }

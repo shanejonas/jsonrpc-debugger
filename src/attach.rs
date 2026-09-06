@@ -37,7 +37,8 @@ pub struct Snapshot {
     reset: bool,
     next_index: usize,
     exchanges: Vec<RemoteExchange>,
-    annotations: Vec<LineAnnotation>,
+    annotations: Option<Vec<LineAnnotation>>,
+    annotation_revision: Option<u64>,
     pending: Vec<RemotePending>,
 }
 
@@ -66,8 +67,11 @@ impl ControlClient {
     }
 
     pub async fn state(&self) -> Result<RemoteState, String> {
-        serde_json::from_value(self.call("debugger.getState", json!({})).await?)
-            .map_err(|error| error.to_string())
+        serde_json::from_value(
+            self.call("debugger.getState", json!({"includeAnnotations": false}))
+                .await?,
+        )
+        .map_err(|error| error.to_string())
     }
 
     pub async fn snapshot(&self, app: &App) -> Result<Snapshot, String> {
@@ -75,6 +79,9 @@ impl ControlClient {
             "nextIndex": app.exchanges().len(),
             "pendingIndices": app.pending_exchange_indices().collect::<Vec<_>>(),
         });
+        if let Some(revision) = app.remote_annotation_revision {
+            params["annotationRevision"] = json!(revision);
+        }
         if let Some(session) = &app.session {
             params["sessionId"] = json!(session.id);
         }
@@ -198,6 +205,9 @@ impl Snapshot {
         }
         let transport = parse_transport(&self.state.transport)?;
         let mode = parse_mode(&self.state.mode)?;
+        if self.reset && self.annotations.is_none() {
+            return Err("session reset requires annotations".to_string());
+        }
         let first_snapshot = app.session.is_none();
         if !self.reset
             && app.session.as_ref().map(|session| &session.id) != Some(&self.state.session.id)
@@ -240,7 +250,7 @@ impl Snapshot {
                     .into_iter()
                     .map(|(_, exchange)| exchange)
                     .collect(),
-                self.annotations,
+                self.annotations.unwrap_or_default(),
             );
         } else {
             for (index, exchange) in exchanges {
@@ -250,17 +260,13 @@ impl Snapshot {
                     app.push_exchange(exchange);
                 }
             }
-            app.annotations = self.annotations;
-            if app
-                .active_annotation_id
-                .as_ref()
-                .is_some_and(|id| !app.annotations.iter().any(|note| &note.id == id))
-            {
-                app.active_annotation_id = None;
+            if let Some(annotations) = self.annotations {
+                app.set_annotations(annotations);
             }
             app.session = Some(self.state.session);
             app.mark_changed();
         }
+        app.remote_annotation_revision = self.annotation_revision;
         app.app_mode = mode;
         app.pending_requests = self
             .pending

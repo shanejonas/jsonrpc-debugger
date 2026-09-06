@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-06
+
+### Changed
+
+- Keep an estimated 8 MiB of message payloads resident, spilling older bodies to temporary SQLite storage while retaining stable request indices. Saved sessions load incrementally; navigation, search, and late responses load archived payloads as needed. Metadata, annotations, formatted panels, and transient API/export responses are outside this budget.
+- Cache annotation navigation order and ID lookups, filter results, and selected-panel JSON formatting. Live traffic extends cached filters without rescanning history.
+- Format only visible annotation cards, group card rows by source line, and compute highlighting without scanning every note for every line. Counting panel lines reuses cached formatting.
+- `debugger.getUpdates` accepts an optional `annotationRevision` and omits unchanged annotations. Preserve local notes when `annotations` is absent; resets and clients omitting the revision still receive the complete list.
+- `debugger.getState` accepts `includeAnnotations: false` for lightweight polling. Read-only control queries no longer force main-TUI redraws.
+- Rust library: `App::exchanges()` returns `ExchangeStore`; `get` and `last` return fallible optional borrowed-or-owned exchanges, and `iter` yields fallible exchanges. `get_selected_exchange` is also fallible. Read annotations through `annotations()` and replace them through `set_annotations()`.
+
+### Fixed
+
+- Prevent the Running/Stopped header from becoming fullscreen. Tab and Shift-Tab skip it while fullscreen; focusing the header restores the normal layout.
+
+### Added
+
+- Reproducible benchmarks for annotation navigation, dense-panel rendering, large filtered histories, and resident memory usage.
+
 ## [0.7.0] - 2026-09-06
 
 ### Fixed

@@ -33,7 +33,7 @@ fn test_add_message() {
     app.add_message(test_message);
 
     assert_eq!(app.exchanges().len(), initial_count + 1);
-    let last_exchange = app.exchanges().last().unwrap();
+    let last_exchange = app.exchanges().last().unwrap().unwrap();
     assert_eq!(last_exchange.method, Some("test_method".to_string()));
     assert_eq!(
         last_exchange.id,
@@ -58,7 +58,7 @@ fn idless_requests_are_notifications() {
         headers: None,
     });
 
-    assert!(app.exchanges()[0].is_notification());
+    assert!(app.exchanges().get(0).unwrap().unwrap().is_notification());
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn test_get_selected_exchange() {
     let mut app = App::new();
 
     // Test with empty app
-    assert!(app.get_selected_exchange().is_none());
+    assert!(app.get_selected_exchange().unwrap().is_none());
 
     // Add a message and test selection
     let test_message = JsonRpcMessage {
@@ -123,7 +123,7 @@ fn test_get_selected_exchange() {
     };
     app.add_message(test_message);
 
-    let selected = app.get_selected_exchange();
+    let selected = app.get_selected_exchange().unwrap();
     assert!(selected.is_some());
     assert_eq!(selected.unwrap().method, Some("test_method".to_string()));
 }
@@ -230,14 +230,14 @@ fn test_request_response_pairing() {
     assert_eq!(app.exchanges().len(), 2);
 
     // Check first exchange is HTTP request-response pair
-    let first_exchange = &app.exchanges()[0];
+    let first_exchange = &app.exchanges().get(0).unwrap().unwrap();
     assert!(first_exchange.request.is_some());
     assert!(first_exchange.response.is_some());
     assert_eq!(first_exchange.method, Some("eth_getBalance".to_string()));
     assert!(matches!(first_exchange.transport, TransportType::Http));
 
     // Check second exchange is WebSocket request-response pair
-    let second_exchange = &app.exchanges()[1];
+    let second_exchange = &app.exchanges().get(1).unwrap().unwrap();
     assert!(second_exchange.request.is_some());
     assert!(second_exchange.response.is_some());
     assert_eq!(second_exchange.method, Some("eth_subscribe".to_string()));
@@ -722,7 +722,7 @@ fn adding_an_annotation_preserves_the_viewport() {
         text: vec!["evidence".to_string()],
     });
 
-    assert_eq!(app.annotations.len(), 1);
+    assert_eq!(app.annotations().len(), 1);
     assert_eq!(app.selected_exchange, 7);
     assert_eq!(app.focus, Focus::MessageList);
     assert_eq!((app.request_tab, app.response_tab), (0, 1));
@@ -765,14 +765,14 @@ fn annotation_navigation_is_global_and_selects_the_target_tab() {
     }
     app.select_exchange(0);
     app.focus = Focus::RequestSection;
-    app.annotations = vec![
+    app.set_annotations(vec![
         annotation("request-5", Focus::RequestSection, DetailTab::Body, 0, 5),
         annotation("response-1", Focus::ResponseSection, DetailTab::Body, 0, 1),
         annotation("request-2a", Focus::RequestSection, DetailTab::Body, 0, 2),
         annotation("request-2b", Focus::RequestSection, DetailTab::Body, 0, 2),
         annotation("headers-1", Focus::RequestSection, DetailTab::Headers, 0, 1),
         annotation("exchange-1", Focus::RequestSection, DetailTab::Body, 1, 1),
-    ];
+    ]);
 
     for id in ["request-2a", "request-2b", "request-5", "response-1"] {
         assert!(app.focus_next_annotation());
@@ -830,7 +830,7 @@ fn annotation_navigation_starts_from_the_selected_exchange_outside_details() {
             headers: None,
         });
     }
-    app.annotations = vec![
+    app.set_annotations(vec![
         LineAnnotation {
             parent_id: None,
             author: jsonrpc_debugger::app::AnnotationAuthor::Unknown,
@@ -870,7 +870,7 @@ fn annotation_navigation_starts_from_the_selected_exchange_outside_details() {
             message: "next".to_string(),
             text: vec!["next".to_string()],
         },
-    ];
+    ]);
 
     app.select_exchange(0);
     app.set_focus(Focus::MessageList);
@@ -962,19 +962,19 @@ fn pairs_duplicate_ids_newest_first_and_distinguishes_id_types() {
         Some(serde_json::json!(7)),
         MessageDirection::Response,
     ));
-    assert!(app.exchanges()[2].response.is_some());
-    assert!(app.exchanges()[0].response.is_none());
+    assert!(app.exchanges().get(2).unwrap().unwrap().response.is_some());
+    assert!(app.exchanges().get(0).unwrap().unwrap().response.is_none());
     app.add_message(pairing_message(
         Some(serde_json::json!(7)),
         MessageDirection::Response,
     ));
-    assert!(app.exchanges()[0].response.is_some());
-    assert!(app.exchanges()[1].response.is_none());
+    assert!(app.exchanges().get(0).unwrap().unwrap().response.is_some());
+    assert!(app.exchanges().get(1).unwrap().unwrap().response.is_none());
     app.add_message(pairing_message(
         Some(serde_json::json!("7")),
         MessageDirection::Response,
     ));
-    assert!(app.exchanges()[1].response.is_some());
+    assert!(app.exchanges().get(1).unwrap().unwrap().response.is_some());
     assert_eq!(app.pending_exchange_indices().count(), 0);
 }
 
@@ -986,13 +986,19 @@ fn response_index_survives_import_and_session_changes() {
         MessageDirection::Request,
     ));
     let mut app = App::new();
-    app.append_exchanges(source.exchanges().to_vec());
+    app.append_exchanges(
+        source
+            .exchanges()
+            .iter()
+            .map(|exchange| exchange.unwrap().into_owned())
+            .collect(),
+    );
     app.add_message(pairing_message(
         Some(serde_json::json!(1)),
         MessageDirection::Response,
     ));
     assert_eq!(app.exchanges().len(), 1);
-    assert!(app.exchanges()[0].response.is_some());
+    assert!(app.exchanges().get(0).unwrap().unwrap().response.is_some());
 
     source.add_message(pairing_message(
         Some(serde_json::json!(2)),
@@ -1007,19 +1013,23 @@ fn response_index_survives_import_and_session_changes() {
             updated_at_ms: 0,
             exchange_count: 2,
         },
-        source.exchanges().to_vec(),
+        source
+            .exchanges()
+            .iter()
+            .map(|exchange| exchange.unwrap().into_owned())
+            .collect(),
         Vec::new(),
     );
     app.add_message(pairing_message(
         Some(serde_json::json!(2)),
         MessageDirection::Response,
     ));
-    assert!(app.exchanges()[1].response.is_some());
+    assert!(app.exchanges().get(1).unwrap().unwrap().response.is_some());
     app.add_message(pairing_message(None, MessageDirection::Request));
     app.add_message(pairing_message(None, MessageDirection::Response));
-    assert!(app.exchanges()[2].is_notification());
-    assert!(app.exchanges()[2].response.is_none());
-    assert!(app.exchanges()[3].request.is_none());
+    assert!(app.exchanges().get(2).unwrap().unwrap().is_notification());
+    assert!(app.exchanges().get(2).unwrap().unwrap().response.is_none());
+    assert!(app.exchanges().get(3).unwrap().unwrap().request.is_none());
 }
 
 #[test]
@@ -1086,7 +1096,7 @@ fn persisted_threads_remain_intact_while_navigation_follows_the_flat_list() {
     }
     app.remove_annotation("reply");
     assert_eq!(
-        app.annotations
+        app.annotations()
             .iter()
             .find(|note| note.id == "nested")
             .unwrap()
@@ -1095,5 +1105,97 @@ fn persisted_threads_remain_intact_while_navigation_follows_the_flat_list() {
         Some("root")
     );
     app.remove_annotation("root");
-    assert!(app.annotations.iter().all(|note| note.parent_id.is_none()));
+    assert!(app
+        .annotations()
+        .iter()
+        .all(|note| note.parent_id.is_none()));
+}
+
+#[test]
+fn annotation_navigation_refreshes_after_insert_delete_and_snapshot_replacement() {
+    let note = |id: &str, line| LineAnnotation {
+        id: id.into(),
+        parent_id: None,
+        author: AnnotationAuthor::User,
+        created_at_ms: 0,
+        exchange_index: 0,
+        panel: Focus::RequestSection,
+        tab: DetailTab::Body,
+        start_line: line,
+        end_line: line,
+        message: id.into(),
+        text: vec![id.into()],
+    };
+    let mut app = App::new();
+    app.set_annotations(vec![note("c", 3), note("a", 1)]);
+    assert!(app.focus_next_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("a"));
+    app.add_annotation(note("b", 2));
+    assert!(app.focus_next_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("b"));
+    app.update_annotation("c", "Edited".into());
+    assert!(app.focus_next_annotation());
+    assert_eq!(app.annotation_by_id("c").unwrap().message, "Edited");
+    assert_eq!(app.active_annotation_id.as_deref(), Some("c"));
+    app.remove_annotation("b");
+    assert!(app.focus_previous_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("a"));
+    assert!(app.annotation_by_id("b").is_none());
+    // Remote snapshots can reuse an ID while changing its anchor and storage position.
+    app.set_annotations(vec![note("a", 4), note("d", 2)]);
+    assert!(app.focus_previous_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("d"));
+    assert!(app.focus_previous_annotation());
+    assert_eq!(app.active_annotation_id.as_deref(), Some("a"));
+    assert_eq!(app.request_details_cursor_line, 4);
+    app.set_annotations(vec![]);
+    assert!(!app.focus_next_annotation());
+    assert!(!app.focus_previous_annotation());
+}
+
+#[test]
+fn fullscreen_navigation_skips_status_with_and_without_the_request_list() {
+    for list_visible in [true, false] {
+        let mut app = App::new();
+        app.request_list_visible = list_visible;
+        app.set_focus(Focus::RequestSection);
+        app.set_panel_fullscreen(true);
+        app.switch_focus();
+        assert_eq!(app.focus, Focus::ResponseSection);
+        app.switch_focus();
+        assert_eq!(
+            app.focus,
+            if list_visible {
+                Focus::MessageList
+            } else {
+                Focus::RequestSection
+            }
+        );
+        app.switch_focus_reverse();
+        assert_eq!(app.focus, Focus::ResponseSection);
+        app.switch_focus_reverse();
+        assert_eq!(app.focus, Focus::RequestSection);
+        assert!(app.is_panel_fullscreen());
+        for _ in 0..12 {
+            app.switch_focus_reverse();
+            assert_ne!(app.focus, Focus::StatusHeader);
+            assert!(app.is_panel_fullscreen());
+        }
+    }
+}
+
+#[test]
+fn status_focus_exits_fullscreen_and_cannot_be_expanded() {
+    let mut app = App::new();
+    app.set_focus(Focus::ResponseSection);
+    app.set_panel_fullscreen(true);
+    app.set_focus(Focus::StatusHeader);
+    assert!(!app.panel_fullscreen);
+    app.set_panel_fullscreen(true);
+    assert!(!app.panel_fullscreen);
+    assert_eq!(app.focus, Focus::StatusHeader);
+    app.switch_focus_reverse();
+    assert_eq!(app.focus, Focus::ResponseSection);
+    app.set_panel_fullscreen(true);
+    assert!(app.is_panel_fullscreen());
 }

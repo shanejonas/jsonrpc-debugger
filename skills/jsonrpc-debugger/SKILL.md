@@ -191,7 +191,7 @@ For modern traffic, verify every client request has the required per-request `_m
 
 Use `debugger.selectExchange`, `debugger.setFocus`, `debugger.setFilter`, and `debugger.scrollPanel` to show the user what matters. Clear temporary filters afterward.
 
-Use `debugger.setFullscreen` to expand or restore the focused panel. Set focus first, then pass the desired `fullscreen` boolean. Read the current state from `debugger.getState.fullscreen`.
+Use `debugger.setFullscreen` to expand or restore the focused request list or details panel. The status header cannot be expanded; focusing it exits fullscreen. Set focus first, then pass the desired `fullscreen` boolean. Read the current state from `debugger.getState.fullscreen`.
 
 When the user says “this line” or “the selected line,” read `debugger.getState.lineSelection`. It contains the panel, one-based line range, and exact text.
 
@@ -276,4 +276,4 @@ rpc debugger.updateAnnotation '{"annotationId":"NOTE_ID","message":"Updated obse
 
 `debugger.annotateLines` creates a root; `debugger.replyAnnotation` inherits the parent's exact source reference. Both default to author `agent`; the TUI sends `user`. Messages contain 1–160 characters on one line. Edits preserve author, creation time, and parent. Deleting a note reparents its replies without deleting them. Annotation creation and replies preserve the user's viewport.
 
-In either TUI, click a card or navigate with `[` / `]`, then press `e` to edit. Notes, including existing replies, render as a flat list without inline action labels. Enter saves and Esc cancels. `Ctrl-B a` annotates a visual selection; `Ctrl-B d` deletes the selected note. `debugger.getUpdates` always includes the complete annotation list; replace local notes on every snapshot to synchronize replies, edits, and deletions.
+In either TUI, click a card or navigate with `[` / `]`, then press `e` to edit. Notes, including existing replies, render as a flat list without inline action labels. Enter saves and Esc cancels. `Ctrl-B a` annotates a visual selection; `Ctrl-B d` deletes the selected note. `debugger.getUpdates` accepts the previous `annotationRevision` to omit unchanged notes. Replace local notes when `annotations` is present and preserve them when it is absent. Resets always include the complete list, as do calls that omit `annotationRevision`. Use `debugger.getState` with `includeAnnotations: false` for lightweight polling.

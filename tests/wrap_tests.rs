@@ -125,7 +125,13 @@ mod unix {
         assert!(attached.proxy_config.transparent);
         assert_eq!(attached.exchanges().len(), 1);
         assert_eq!(
-            attached.exchanges()[0].method.as_deref(),
+            attached
+                .exchanges()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .method
+                .as_deref(),
             Some("example/run")
         );
 
@@ -175,14 +181,14 @@ mod unix {
             .apply(attached)
             .unwrap();
         let reply = attached
-            .annotations
+            .annotations()
             .iter()
             .find(|note| note.id == reply_id)
             .unwrap()
             .clone();
         assert_eq!(reply.parent_id.as_deref(), Some(root_id));
         assert_eq!(reply.author, AnnotationAuthor::User);
-        assert_eq!(reply.text, attached.annotations[0].text);
+        assert_eq!(reply.text, attached.annotations()[0].text);
         attached.start_editing_annotation(&reply_id);
         attached.input_buffer = "The regression test passes.".to_string();
         assert_eq!(client.save_annotation(attached).await.unwrap(), reply_id);
@@ -220,10 +226,10 @@ mod unix {
             .unwrap()
             .apply(attached)
             .unwrap();
-        assert_eq!(attached.annotations.len(), 2);
-        assert_eq!(attached.annotations[0].parent_id, None);
+        assert_eq!(attached.annotations().len(), 2);
+        assert_eq!(attached.annotations()[0].parent_id, None);
         assert_eq!(
-            attached.annotations[1].parent_id.as_deref(),
+            attached.annotations()[1].parent_id.as_deref(),
             Some(reply_id.as_str())
         );
         let missing = control_with_params(
@@ -254,7 +260,7 @@ mod unix {
             .apply(attached)
             .unwrap();
         let note = attached
-            .annotations
+            .annotations()
             .iter()
             .find(|note| note.id == user_root)
             .unwrap();

@@ -21,6 +21,7 @@ use tokio::time::Instant;
 mod app;
 mod attach;
 mod control;
+mod exchange_store;
 mod history;
 mod proxy;
 mod stdio;
@@ -428,12 +429,24 @@ async fn handle_control_command(
     let ControlCommand { action, reply } = command;
     let result = match action {
         ControlAction::Discover => Ok(control::discovery(app.control_port)),
-        ControlAction::GetState => Ok(control::state(app)),
+        ControlAction::GetState {
+            include_annotations,
+        } => Ok(control::state_with_annotations(app, include_annotations)),
         ControlAction::GetUpdates {
             session_id,
             next_index,
             pending_indices,
-        } => control::updates(app, session_id.as_deref(), next_index, pending_indices),
+            annotation_revision,
+        } => match annotation_revision {
+            Some(revision) => control::updates_since(
+                app,
+                session_id.as_deref(),
+                next_index,
+                pending_indices,
+                Some(revision),
+            ),
+            None => control::updates(app, session_id.as_deref(), next_index, pending_indices),
+        },
         ControlAction::WaitForChange { .. } => {
             unreachable!("wait commands are registered by run_app")
         }
@@ -861,6 +874,7 @@ fn detail_lines_at(
         .or_else(|| app.detail_tab(panel))
         .ok_or_else(|| ControlError::invalid_params("panel must be request or response"))?;
     ui::detail_lines_text_at(app, panel, exchange_index, tab)
+        .map_err(|error| ControlError::runtime(format!("{error:#}")))?
         .ok_or_else(|| ControlError::invalid_params("panel must be request or response"))
 }
 
@@ -908,17 +922,18 @@ fn reveal_lines_at(
     Ok(())
 }
 
-fn search_hits(app: &App, query: &str) -> Vec<SearchHit> {
+fn search_hits(app: &App, query: &str) -> Result<Vec<SearchHit>> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut hits = Vec::new();
-    for exchange_index in 0..app.exchanges().len() {
+    for (exchange_index, exchange) in app.exchanges().iter().enumerate() {
+        let exchange = exchange?;
         for panel in [app::Focus::RequestSection, app::Focus::ResponseSection] {
             for tab in [app::DetailTab::Headers, app::DetailTab::Body] {
-                let Some(lines) = ui::detail_lines_text_at(app, panel, exchange_index, tab) else {
+                let Some(lines) = ui::detail_lines_text_for(&exchange, panel, tab) else {
                     continue;
                 };
                 hits.extend(lines.iter().enumerate().filter_map(|(index, line)| {
@@ -933,7 +948,7 @@ fn search_hits(app: &App, query: &str) -> Vec<SearchHit> {
             }
         }
     }
-    hits.extend(app.annotations.iter().filter_map(|annotation| {
+    hits.extend(app.annotations().iter().filter_map(|annotation| {
         annotation
             .message
             .to_lowercase()
@@ -948,7 +963,7 @@ fn search_hits(app: &App, query: &str) -> Vec<SearchHit> {
     }));
     hits.sort_by_key(search_hit_order);
     hits.dedup();
-    hits
+    Ok(hits)
 }
 
 fn search_hit_order(hit: &SearchHit) -> (usize, usize, usize, usize, usize) {
@@ -959,7 +974,13 @@ fn search_hit_order(hit: &SearchHit) -> (usize, usize, usize, usize, usize) {
 
 fn apply_search(app: &mut App, area: ratatui::layout::Rect) {
     let query = app.input_buffer.trim().to_string();
-    let hits = search_hits(app, &query);
+    let hits = match search_hits(app, &query) {
+        Ok(hits) => hits,
+        Err(error) => {
+            app.set_notice(format!("Error: search history: {error:#}"));
+            return;
+        }
+    };
     let first = app.set_search_results(query.clone(), hits);
     if let Some(hit) = first {
         reveal_search_hit(app, area, hit);
@@ -1074,7 +1095,7 @@ fn build_reply(
         ));
     }
     let parent = app
-        .annotations
+        .annotations()
         .iter()
         .find(|note| note.id == id)
         .ok_or_else(|| ControlError::invalid_params(format!("Annotation not found: {id}")))?;
@@ -1111,7 +1132,7 @@ fn update_annotation(
 ) -> Result<(), ControlError> {
     let message = annotation_message(message)?;
     if !app
-        .annotations
+        .annotations()
         .iter()
         .any(|annotation| annotation.id == annotation_id)
     {
@@ -1208,7 +1229,7 @@ fn select_session(app: &mut App, history: &HistoryStore, id: &str) -> Result<boo
         ));
     }
     let (session, exchanges, annotations) = history
-        .load_session(id)
+        .load_cached_session(id)
         .map_err(|error| ControlError::runtime(error.to_string()))?;
     if app.proxy_config.stdio.is_some() && session.target != app.proxy_config.target_url {
         return Err(ControlError::invalid_params(
@@ -1217,7 +1238,7 @@ fn select_session(app: &mut App, history: &HistoryStore, id: &str) -> Result<boo
     }
     let target_changed = app.proxy_config.target_url != session.target;
     app.proxy_config.target_url = session.target.clone();
-    app.activate_session(session, exchanges, annotations);
+    app.activate_cached_session(session, exchanges, annotations);
     Ok(target_changed)
 }
 
@@ -2140,6 +2161,7 @@ async fn run_app(
             else {
                 continue;
             };
+            let revision_before = app.revision();
             handle_control_command(
                 &mut app,
                 command,
@@ -2153,7 +2175,7 @@ async fn run_app(
                 },
             )
             .await;
-            received_control_command = true;
+            received_control_command |= app.revision() != revision_before;
         }
         resolve_change_waiters(&app, &mut runtime.change_waiters);
 
@@ -3124,7 +3146,7 @@ fn center_active_annotation(app: &mut App, area: ratatui::layout::Rect) {
     let Some(note) = app
         .active_annotation_id
         .as_ref()
-        .and_then(|id| app.annotations.iter().find(|note| &note.id == id))
+        .and_then(|id| app.annotation_by_id(id))
         .cloned()
     else {
         return;
@@ -3576,7 +3598,7 @@ mod tests {
             text: vec!["result".to_string()],
         });
 
-        let hits = search_hits(&app, "NeEdLe");
+        let hits = search_hits(&app, "NeEdLe").unwrap();
         assert!(hits.iter().any(|hit| {
             hit.panel == app::Focus::RequestSection && hit.tab == app::DetailTab::Headers
         }));
@@ -3588,7 +3610,7 @@ mod tests {
         }));
 
         assert_eq!(
-            search_hits(&app, "payout"),
+            search_hits(&app, "payout").unwrap(),
             vec![SearchHit {
                 exchange_index: 0,
                 panel: app::Focus::ResponseSection,
@@ -3696,10 +3718,11 @@ mod tests {
         assert!(app
             .exchanges()
             .iter()
-            .all(|exchange| exchange.response.is_some()));
+            .all(|exchange| exchange.unwrap().response.is_some()));
         let persisted = history.load_session(&session.id).unwrap().1;
         assert_eq!(persisted.len(), app.exchanges().len());
-        for (persisted, displayed) in persisted.iter().zip(app.exchanges()) {
+        for (persisted, displayed) in persisted.iter().zip(app.exchanges().iter()) {
+            let displayed = displayed.unwrap();
             assert_eq!(persisted.id, displayed.id);
             assert_eq!(persisted.method, displayed.method);
             assert!(persisted.request.is_some());
@@ -3975,15 +3998,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(app.annotations[0].message, "Check this method");
+        assert_eq!(app.annotations()[0].message, "Check this method");
         assert!(!app.visual_selection_active);
         let session_id = app.session.as_ref().unwrap().id.clone();
-        assert_eq!(history.annotations(&session_id).unwrap(), app.annotations);
+        assert_eq!(history.annotations(&session_id).unwrap(), app.annotations());
 
-        let annotation_id = app.annotations[0].id.clone();
+        let annotation_id = app.annotations()[0].id.clone();
         update_annotation(&mut app, &history, &annotation_id, "Check the method name").unwrap();
-        assert_eq!(app.annotations[0].id, annotation_id);
-        assert_eq!(app.annotations[0].message, "Check the method name");
+        assert_eq!(app.annotations()[0].id, annotation_id);
+        assert_eq!(app.annotations()[0].message, "Check the method name");
         assert_eq!(
             history.annotations(&session_id).unwrap()[0].message,
             "Check the method name"
@@ -4026,7 +4049,7 @@ mod tests {
         assert!(!app.visual_selection_active);
         assert_eq!((selection.start_line, selection.end_line), (2, 3));
         assert_eq!(
-            app.annotations
+            app.annotations()
                 .first()
                 .map(|annotation| (annotation.start_line, annotation.end_line)),
             Some((2, 3))
@@ -4152,6 +4175,44 @@ mod tests {
         );
         let terminal_area = ratatui::layout::Rect::new(0, 0, 120, 24);
 
+        let revision_before_reads = app.revision();
+        for action in [
+            ControlAction::Discover,
+            ControlAction::GetState {
+                include_annotations: false,
+            },
+            ControlAction::GetUpdates {
+                session_id: None,
+                next_index: 0,
+                pending_indices: vec![],
+                annotation_revision: None,
+            },
+            ControlAction::GetAnnotations,
+            ControlAction::GetPending,
+            ControlAction::GetPanel {
+                focus: app::Focus::RequestSection,
+                exchange_index: Some(0),
+                tab: Some(app::DetailTab::Body),
+            },
+        ] {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            handle_control_command(
+                &mut app,
+                ControlCommand { action, reply },
+                ControlContext {
+                    terminal_area,
+                    proxy_server: &mut proxy_server,
+                    message_sender: &message_sender,
+                    proxy_state: &proxy_state,
+                    request_result_sender: &notice_sender,
+                    history: &mut history,
+                },
+            )
+            .await;
+            assert!(result.await.unwrap().is_ok());
+            assert_eq!(app.revision(), revision_before_reads);
+        }
+
         handle_control_command(
             &mut app,
             ControlCommand {
@@ -4171,6 +4232,7 @@ mod tests {
         )
         .await;
 
+        assert!(app.revision() > revision_before_reads);
         assert_eq!(app.focus, app::Focus::ResponseSection);
         assert_eq!(result.await.unwrap().unwrap()["focus"], "response");
 
@@ -4357,7 +4419,7 @@ mod tests {
         assert_eq!(app.annotation_reply_id.as_ref(), Some(&root_id));
         app.input_buffer = "Added a regression test.".to_string();
         save_annotation_draft(&mut app, &history, area).unwrap();
-        let reply = app.annotations[1].clone();
+        let reply = app.annotations()[1].clone();
         assert_eq!(reply.author, AnnotationAuthor::User);
         assert_eq!(reply.parent_id.as_ref(), Some(&root_id));
         assert_eq!((reply.start_line, reply.end_line), (2, 2));
@@ -4368,7 +4430,7 @@ mod tests {
         app.input_buffer = "Updated regression test.".to_string();
         save_annotation_draft(&mut app, &history, area).unwrap();
         assert_eq!(
-            app.annotations[1],
+            app.annotations()[1],
             LineAnnotation {
                 message: "Updated regression test.".to_string(),
                 ..reply.clone()

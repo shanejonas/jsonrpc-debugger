@@ -84,7 +84,13 @@ fn incremental_attach_completes_old_requests_without_resending_history_or_moving
     assert_eq!(delta["exchanges"][0]["index"], 0);
     assert_eq!(delta["exchanges"][1]["index"], 100);
     apply(delta, &mut attached);
-    assert!(attached.exchanges()[0].response.is_some());
+    assert!(attached
+        .exchanges()
+        .get(0)
+        .unwrap()
+        .unwrap()
+        .response
+        .is_some());
     assert_eq!(attached.exchanges().len(), 101);
     assert_eq!(
         attached.pending_exchange_indices().collect::<Vec<_>>(),
@@ -111,7 +117,10 @@ fn attach_resets_when_the_session_changes_or_the_cursor_is_stale() {
     assert_eq!(delta["reset"], true);
     apply(delta, &mut attached);
     assert_eq!(attached.session.as_ref().unwrap().id, "two");
-    assert_eq!(attached.exchanges()[0].id, Some(json!(2)));
+    assert_eq!(
+        attached.exchanges().get(0).unwrap().unwrap().id,
+        Some(json!(2))
+    );
     let reset = control::updates(&source, Some("two"), 999, vec![998]).unwrap();
     assert_eq!(reset["reset"], true);
     apply(reset, &mut attached);
@@ -157,7 +166,7 @@ fn attached_annotations_sync_replies_edits_deletions_and_preserve_drafts() {
     source.add_annotation(root.clone());
     let mut attached = App::new();
     apply(updates(&source, &attached), &mut attached);
-    assert_eq!(attached.annotations, vec![root.clone()]);
+    assert_eq!(attached.annotations(), vec![root.clone()]);
     source.add_annotation(LineAnnotation {
         id: "reply".to_string(),
         parent_id: Some(root.id.clone()),
@@ -167,24 +176,81 @@ fn attached_annotations_sync_replies_edits_deletions_and_preserve_drafts() {
     });
     attached.request_details_scroll = 4;
     apply(updates(&source, &attached), &mut attached);
-    assert_eq!(attached.annotations, source.annotations);
+    assert_eq!(attached.annotations(), source.annotations());
     assert_eq!(attached.request_details_scroll, 4);
     attached.start_editing_annotation("reply");
     attached.input_buffer = "Unsaved local draft".to_string();
     source.update_annotation("reply", "Remote edit".to_string());
     apply(updates(&source, &attached), &mut attached);
-    assert_eq!(attached.annotations[1].message, "Remote edit");
+    assert_eq!(attached.annotations()[1].message, "Remote edit");
     assert_eq!(attached.input_buffer, "Unsaved local draft");
     assert_eq!(attached.annotation_edit_id.as_deref(), Some("reply"));
     source.remove_annotation("root");
     apply(updates(&source, &attached), &mut attached);
-    assert_eq!(attached.annotations.len(), 1);
-    assert_eq!(attached.annotations[0].parent_id, None);
-    assert_eq!(attached.annotations[0].author, AnnotationAuthor::User);
+    assert_eq!(attached.annotations().len(), 1);
+    assert_eq!(attached.annotations()[0].parent_id, None);
+    assert_eq!(attached.annotations()[0].author, AnnotationAuthor::User);
     source.remove_annotation("reply");
     apply(updates(&source, &attached), &mut attached);
-    assert!(attached.annotations.is_empty());
+    assert!(attached.annotations().is_empty());
     assert_eq!(attached.active_annotation_id, None);
     assert_eq!(attached.annotation_edit_id.as_deref(), Some("reply"));
     assert_eq!(attached.input_buffer, "Unsaved local draft");
+}
+
+#[test]
+fn unchanged_annotations_are_omitted_and_attach_preserves_them() {
+    use jsonrpc_debugger::app::{AnnotationAuthor, DetailTab, Focus, LineAnnotation};
+    let mut source = source();
+    source.add_message(message(1, MessageDirection::Request));
+    source.add_annotation(LineAnnotation {
+        id: "note".into(),
+        parent_id: None,
+        author: AnnotationAuthor::User,
+        created_at_ms: 1,
+        exchange_index: 0,
+        panel: Focus::RequestSection,
+        tab: DetailTab::Body,
+        start_line: 2,
+        end_line: 2,
+        message: "Keep this note".into(),
+        text: vec!["id".into()],
+    });
+    let mut attached = App::new();
+    apply(updates(&source, &attached), &mut attached);
+    let revision = source.annotation_revision();
+    source.add_message(message(1, MessageDirection::Response));
+    let delta = control::updates_since(&source, Some("one"), 1, vec![0], Some(revision)).unwrap();
+    assert!(delta.get("annotations").is_none());
+    assert!(delta["state"].get("annotations").is_none());
+    apply(delta, &mut attached);
+    assert_eq!(attached.annotations(), source.annotations());
+    assert!(attached
+        .exchanges()
+        .get(0)
+        .unwrap()
+        .unwrap()
+        .response
+        .is_some());
+
+    source.update_annotation("note", "Updated".into());
+    let edit = control::updates_since(&source, Some("one"), 1, vec![], Some(revision)).unwrap();
+    assert_eq!(edit["annotations"][0]["message"], "Updated");
+    apply(edit, &mut attached);
+    assert_eq!(attached.annotations(), source.annotations());
+    let revision = source.annotation_revision();
+    source.remove_annotation("note");
+    let delete = control::updates_since(&source, Some("one"), 1, vec![], Some(revision)).unwrap();
+    assert_eq!(delete["annotations"], json!([]));
+    apply(delete, &mut attached);
+    assert!(attached.annotations().is_empty());
+    // An explicit session reset always supplies a full annotation list, even with an equal revision.
+    let reset =
+        control::updates_since(&source, None, 0, vec![], Some(source.annotation_revision()))
+            .unwrap();
+    assert_eq!(reset["annotations"], json!([]));
+    assert!(control::state_with_annotations(&source, false)
+        .get("annotations")
+        .is_none());
+    assert!(control::state(&source).get("annotations").is_some());
 }

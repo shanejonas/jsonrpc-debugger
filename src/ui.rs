@@ -1,3 +1,4 @@
+use crate::exchange_store::ExchangeSummary;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -13,6 +14,33 @@ use crate::app::{
     request_matches_filter, App, AppMode, DetailHover, EditorMode, Focus, InputMode,
     JsonRpcExchange, LineAnnotation, Overlay,
 };
+
+/// Only the selected exchange's two panels are retained. Content mutations clear both entries.
+#[derive(Default)]
+pub(crate) struct DetailCache {
+    key: Option<(usize, usize, bool)>,
+    lines: Vec<Line<'static>>,
+}
+
+impl DetailCache {
+    pub(crate) fn invalidate(&mut self, index: usize) {
+        if self.key.is_some_and(|key| key.0 == index) {
+            *self = Self::default();
+        }
+    }
+
+    fn lines(
+        &mut self,
+        key: (usize, usize, bool),
+        format: impl FnOnce() -> Vec<Line<'static>>,
+    ) -> &[Line<'static>] {
+        if self.key != Some(key) {
+            self.lines = format();
+            self.key = Some(key);
+        }
+        &self.lines
+    }
+}
 
 const ANNOTATION_AMBER: Color = Color::Rgb(245, 166, 35);
 const ANNOTATION_EDITOR_HEIGHT: usize = 5;
@@ -105,7 +133,7 @@ pub fn panel_focus(area: Rect, app: &App, column: u16, row: u16) -> Option<Focus
     if !contains(chunks[1], column, row) {
         return None;
     }
-    if app.panel_fullscreen {
+    if app.is_panel_fullscreen() {
         return Some(app.focus);
     }
 
@@ -131,7 +159,7 @@ pub fn panel_focus(area: Rect, app: &App, column: u16, row: u16) -> Option<Focus
 pub fn panel_visible_lines(area: Rect, app: &App, focus: Focus) -> usize {
     let chunks = screen_chunks(area, app);
     let main_height = chunks[1].height as usize;
-    if app.panel_fullscreen {
+    if app.is_panel_fullscreen() {
         return match focus {
             Focus::RequestSection | Focus::ResponseSection => main_height.saturating_sub(2),
             Focus::MessageList | Focus::StatusHeader => main_height.saturating_sub(3),
@@ -191,7 +219,7 @@ pub fn mouse_action(area: Rect, app: &App, column: u16, row: u16) -> Option<Mous
     if !contains(chunks[1], column, row) {
         return None;
     }
-    if app.panel_fullscreen {
+    if app.is_panel_fullscreen() {
         return fullscreen_mouse_action(chunks[1], app, column, row);
     }
 
@@ -387,7 +415,7 @@ fn status_header_action(area: Rect, column: u16, row: u16) -> Option<MouseAction
 }
 
 fn message_list_action(area: Rect, app: &App, row: u16) -> Option<MouseAction> {
-    let indices = app.filtered_exchange_indices();
+    let indices = app.filtered_exchanges();
     let first_row = area.y.saturating_add(2);
     let visible_rows = area.height.saturating_sub(2) as usize;
     if row < first_row || visible_rows == 0 || indices.is_empty() {
@@ -431,7 +459,7 @@ fn pending_list_action(area: Rect, app: &App, row: u16) -> Option<MouseAction> {
 }
 
 fn request_details_action(area: Rect, app: &App, column: u16, row: u16) -> Option<MouseAction> {
-    let exchange = app.get_selected_exchange();
+    let exchange = app.exchanges().summaries().get(app.selected_exchange);
     let tab_line = 3
         + usize::from(exchange.and_then(|value| value.method.as_ref()).is_some())
         + usize::from(exchange.and_then(|value| value.id.as_ref()).is_some());
@@ -463,7 +491,7 @@ fn request_details_action(area: Rect, app: &App, column: u16, row: u16) -> Optio
         &content,
         &annotations,
     );
-    let has_request = exchange.and_then(|value| value.request.as_ref()).is_some();
+    let has_request = exchange.is_some_and(|value| value.request_timestamp.is_some());
     if has_request && clicked == Some(ClickedDetail::Line(tab_line + 1)) {
         return tab_action(area, column, detail_gutter_width(content.len()))
             .map(MouseAction::SelectRequestTab);
@@ -509,8 +537,10 @@ fn response_details_action(area: Rect, app: &App, column: u16, row: u16) -> Opti
         &annotations,
     );
     let has_response = app
-        .get_selected_exchange()
-        .and_then(|exchange| exchange.response.as_ref())
+        .exchanges()
+        .summaries()
+        .get(app.selected_exchange)
+        .and_then(|exchange| exchange.response_timestamp)
         .is_some();
     if has_response && clicked == Some(ClickedDetail::Line(2)) {
         return tab_action(area, column, detail_gutter_width(content.len()))
@@ -537,7 +567,8 @@ enum ClickedDetail {
 #[derive(Debug, Clone, Copy)]
 enum DetailRow<'a> {
     Line(usize),
-    Annotation(&'a LineAnnotation),
+    Annotation(&'a LineAnnotation, usize),
+    Editor,
 }
 
 fn truncate_to_width(value: &str, max_width: usize) -> String {
@@ -564,18 +595,23 @@ fn detail_rows<'a>(
     content_len: usize,
     annotations: &'a [&'a LineAnnotation],
 ) -> Vec<DetailRow<'a>> {
-    let mut rows = Vec::with_capacity(content_len + annotations.len() * ANNOTATION_CARD_HEIGHT);
-    for source_index in 0..content_len {
-        rows.push(DetailRow::Line(source_index));
-        for annotation in annotations
-            .iter()
-            .copied()
-            .filter(|annotation| annotation.end_line == source_index + 1)
+    let mut by_line = vec![Vec::new(); content_len];
+    for annotation in annotations {
+        if let Some(notes) = annotation
+            .end_line
+            .checked_sub(1)
+            .and_then(|index| by_line.get_mut(index))
         {
-            rows.extend(std::iter::repeat_n(
-                DetailRow::Annotation(annotation),
-                ANNOTATION_CARD_HEIGHT,
-            ));
+            notes.push(*annotation);
+        }
+    }
+    let mut rows = Vec::with_capacity(content_len + annotations.len() * ANNOTATION_CARD_HEIGHT);
+    for (source_index, notes) in by_line.into_iter().enumerate() {
+        rows.push(DetailRow::Line(source_index));
+        for annotation in notes {
+            rows.extend(
+                (0..ANNOTATION_CARD_HEIGHT).map(|row| DetailRow::Annotation(annotation, row)),
+            );
         }
     }
     rows
@@ -604,9 +640,10 @@ fn clicked_detail_row(
         if visible_row < height {
             return Some(match detail_row {
                 DetailRow::Line(index) => ClickedDetail::Line(index + 1),
-                DetailRow::Annotation(annotation) => {
+                DetailRow::Annotation(annotation, _) => {
                     ClickedDetail::Annotation(annotation.id.clone())
                 }
+                DetailRow::Editor => return None,
             });
         }
         visible_row -= height;
@@ -618,7 +655,7 @@ fn clicked_detail_row(
 fn detail_row_width(detail_row: DetailRow<'_>, content: &[Line<'_>], gutter_width: usize) -> usize {
     let line_width = match detail_row {
         DetailRow::Line(index) => content[index].width(),
-        DetailRow::Annotation(_) => 1,
+        DetailRow::Annotation(_, _) | DetailRow::Editor => 1,
     };
     line_width + gutter_width
 }
@@ -759,13 +796,64 @@ fn tab_action(area: Rect, column: u16, gutter_width: usize) -> Option<usize> {
     }
 }
 
+#[derive(serde::Serialize)]
+struct RequestBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a serde_json::Value>,
+    jsonrpc: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<&'a serde_json::Value>,
+}
+
+#[derive(serde::Serialize)]
+struct ResponseBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a serde_json::Value>,
+    jsonrpc: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'a serde_json::Value>,
+}
+
+#[derive(Default)]
+struct DetailJsonWriter {
+    bytes: Vec<u8>,
+    newlines: usize,
+    truncated: bool,
+}
+
+impl std::io::Write for DetailJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for (index, byte) in bytes.iter().enumerate() {
+            self.newlines += usize::from(*byte == b'\n');
+            if self.newlines == 1001 {
+                self.bytes.extend_from_slice(&bytes[..=index]);
+                self.truncated = true;
+                return Err(std::io::Error::other("detail line limit reached"));
+            }
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // Helper function to format JSON with syntax highlighting and 2-space indentation
-fn format_json_with_highlighting(json_value: &serde_json::Value) -> Vec<Line<'static>> {
-    // Use the standard pretty formatter
-    let json_str = match serde_json::to_string_pretty(json_value) {
-        Ok(s) => s,
-        Err(_) => return vec![Line::from("Failed to format JSON")],
-    };
+fn format_json_with_highlighting(json_value: &impl serde::Serialize) -> Vec<Line<'static>> {
+    let mut writer = DetailJsonWriter::default();
+    if serde_json::to_writer_pretty(&mut writer, json_value).is_err() && !writer.truncated {
+        return vec![Line::from("Failed to format JSON")];
+    }
+    if writer.truncated {
+        writer.bytes.extend_from_slice(b"...");
+    }
+    let json_str = String::from_utf8(writer.bytes).expect("JSON output is UTF-8");
 
     let mut lines = Vec::new();
 
@@ -945,7 +1033,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, chunks[0], app);
 
-    if app.panel_fullscreen {
+    if app.is_panel_fullscreen() {
         draw_fullscreen_panel(f, chunks[1], app);
     } else {
         match app.app_mode {
@@ -1418,7 +1506,7 @@ fn draw_fullscreen_panel(f: &mut Frame, area: Rect, app: &App) {
         (AppMode::Paused | AppMode::Intercepting, _) => {
             draw_intercept_request_details(f, area, app)
         }
-        (_, Focus::StatusHeader) => draw_status_header(f, area, app),
+        (_, Focus::StatusHeader) => draw_main_content(f, area, app),
     }
 }
 
@@ -1448,11 +1536,12 @@ fn draw_sidebar_chrome(f: &mut Frame, area: Rect, title: String, focused: bool) 
     )
 }
 
-fn exchange_duration(exchange: &JsonRpcExchange) -> (String, Color) {
-    let (Some(request), Some(response)) = (&exchange.request, &exchange.response) else {
+fn exchange_duration(exchange: &ExchangeSummary) -> (String, Color) {
+    let (Some(request), Some(response)) = (exchange.request_timestamp, exchange.response_timestamp)
+    else {
         return ("-".to_string(), THEME_MUTED);
     };
-    let Ok(duration) = response.timestamp.duration_since(request.timestamp) else {
+    let Ok(duration) = response.duration_since(request) else {
         return ("-".to_string(), THEME_MUTED);
     };
 
@@ -1470,11 +1559,20 @@ fn exchange_duration(exchange: &JsonRpcExchange) -> (String, Color) {
 }
 
 fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
-    let filtered: Vec<(usize, &JsonRpcExchange)> = app
-        .filtered_exchange_indices()
-        .into_iter()
-        .map(|index| (index, &app.exchanges()[index]))
-        .collect();
+    let mut search_counts = std::collections::HashMap::new();
+    if app.search_active() {
+        for hit in &app.search_hits {
+            *search_counts.entry(hit.exchange_index).or_insert(0usize) += 1;
+        }
+    }
+    let marker_count = |index: usize| {
+        if app.search_active() {
+            search_counts.get(&index).copied().unwrap_or(0)
+        } else {
+            app.annotation_count(index)
+        }
+    };
+    let filtered = app.filtered_exchanges();
 
     let body = draw_sidebar_chrome(
         f,
@@ -1504,10 +1602,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let selected_position = filtered
-        .iter()
-        .position(|(index, _)| *index == app.selected_exchange)
-        .unwrap_or(0);
+    let selected_position = filtered.binary_search(&app.selected_exchange).unwrap_or(0);
     let visible_rows = body.height.saturating_sub(1) as usize;
     let offset = app.history_scroll_offset(visible_rows);
     let compact = body.width <= COMPACT_REQUEST_LIST_WIDTH;
@@ -1554,7 +1649,8 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .skip(offset)
         .take(visible_rows)
-        .map(|(index, exchange)| {
+        .map(|index| {
+            let exchange = &app.exchanges().summaries()[*index];
             let transport_symbol = exchange.transport.label();
 
             let method = exchange.method.as_deref().unwrap_or("unknown");
@@ -1570,21 +1666,17 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
 
             let (status, status_mark, status_color) = if exchange.is_notification() {
                 ("Notify", "N", THEME_BLUE)
-            } else if exchange.response.is_none() {
+            } else if exchange.response_timestamp.is_none() {
                 ("Pending", "P", Color::Rgb(218, 170, 94))
-            } else if let Some(response) = &exchange.response {
-                if response.error.is_some() {
-                    ("Error", "E", Color::Rgb(202, 96, 103))
-                } else {
-                    ("Success", "S", THEME_FOCUS)
-                }
+            } else if exchange.has_error {
+                ("Error", "E", Color::Rgb(202, 96, 103))
             } else {
-                ("Unknown", "?", THEME_MUTED)
+                ("Success", "S", THEME_FOCUS)
             };
 
             let (duration_text, duration_color) = exchange_duration(exchange);
 
-            let match_count = exchange_marker_count(app, *index);
+            let match_count = marker_count(*index);
             let matches = if match_count > 0 {
                 format!("◆{match_count}")
             } else {
@@ -1659,13 +1751,16 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
 
         draw_vertical_scrollbar(f, rail, offset, filtered.len(), visible_rows);
 
-        let match_positions = filtered
-            .iter()
-            .enumerate()
-            .filter_map(|(position, (index, _))| {
-                (exchange_marker_count(app, *index) > 0).then_some(position)
-            })
-            .collect::<Vec<_>>();
+        let match_positions = if app.search_active() {
+            search_counts
+                .keys()
+                .filter_map(|index| filtered.binary_search(index).ok())
+                .collect::<Vec<_>>()
+        } else {
+            app.annotated_exchange_indices()
+                .filter_map(|index| filtered.binary_search(&index).ok())
+                .collect::<Vec<_>>()
+        };
         draw_scrollbar_markers(
             f,
             rail,
@@ -1675,11 +1770,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub fn detail_line_count(app: &App, panel: Focus) -> Option<usize> {
-    match panel {
-        Focus::RequestSection => Some(request_detail_lines(app).len()),
-        Focus::ResponseSection => Some(response_detail_lines(app).len()),
-        Focus::MessageList | Focus::StatusHeader => None,
-    }
+    with_detail_lines(app, panel, <[Line<'static>]>::len)
 }
 
 pub fn detail_lines_text(app: &App, panel: Focus) -> Option<Vec<String>> {
@@ -1697,9 +1788,11 @@ pub fn detail_lines_text_at(
     panel: Focus,
     exchange_index: usize,
     tab: crate::app::DetailTab,
-) -> Option<Vec<String>> {
-    let exchange = app.exchanges().get(exchange_index)?;
-    detail_lines_text_for(exchange, panel, tab)
+) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(exchange) = app.exchanges().get(exchange_index)? else {
+        return Ok(None);
+    };
+    Ok(detail_lines_text_for(&exchange, panel, tab))
 }
 
 pub fn detail_lines_text_for(
@@ -1773,22 +1866,82 @@ fn annotate_detail_lines(lines: Vec<Line<'static>>, app: &App, panel: Focus) -> 
         return lines;
     }
 
+    let mut coverage = vec![0i64; lines.len() + 1];
+    for annotation in annotations {
+        let start = annotation.start_line.saturating_sub(1).min(lines.len());
+        let end = annotation.end_line.min(lines.len());
+        if start < end {
+            coverage[start] += 1;
+            coverage[end] -= 1;
+        }
+    }
     let range_style = Style::default().bg(Color::Rgb(44, 34, 14));
+    let mut active = 0;
     lines
         .into_iter()
         .enumerate()
         .map(|(index, line)| {
-            let line_number = index + 1;
-            if !annotations.iter().any(|annotation| {
-                (annotation.start_line..=annotation.end_line).contains(&line_number)
-            }) {
-                return line;
+            active += coverage[index];
+            if active > 0 {
+                line.patch_style(range_style)
+            } else {
+                line
             }
-            line.patch_style(range_style)
         })
         .collect()
 }
 
+fn visible_detail_lines(
+    lines: Vec<Line<'static>>,
+    app: &App,
+    panel: Focus,
+    width: usize,
+    scroll: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, usize, usize) {
+    let annotations = detail_annotations(app, panel);
+    let mut rows = detail_rows(lines.len(), &annotations);
+    if let Some(position) = annotation_editor_position(app, panel) {
+        let position = position.min(rows.len());
+        rows.splice(
+            position..position,
+            std::iter::repeat_n(DetailRow::Editor, ANNOTATION_EDITOR_HEIGHT),
+        );
+    }
+    let total = rows.len();
+    let start = detail_view_scroll(scroll, total);
+    let gutter = detail_gutter_width(lines.len());
+    let mut card = None;
+    let visible = rows
+        .into_iter()
+        .skip(start)
+        .take(height)
+        .map(|row| match row {
+            DetailRow::Line(index) => lines[index].clone(),
+            DetailRow::Editor => Line::from(""),
+            DetailRow::Annotation(annotation, row) => {
+                if card
+                    .as_ref()
+                    .is_none_or(|(id, _)| *id != annotation.id.as_str())
+                {
+                    card = Some((
+                        annotation.id.as_str(),
+                        annotation_card_lines(annotation, gutter, width),
+                    ));
+                }
+                let line = card.as_ref().unwrap().1[row].clone();
+                if app.active_annotation_id.as_deref() == Some(annotation.id.as_str()) {
+                    line.patch_style(Style::default().add_modifier(Modifier::BOLD))
+                } else {
+                    line
+                }
+            }
+        })
+        .collect();
+    (visible, total, start)
+}
+
+#[cfg(test)]
 fn insert_annotation_lines(
     lines: Vec<Line<'static>>,
     app: &App,
@@ -1998,12 +2151,35 @@ fn detail_title(title: &str, app: &App, panel: Focus) -> String {
     )
 }
 
+fn with_detail_lines<T>(
+    app: &App,
+    panel: Focus,
+    read: impl FnOnce(&[Line<'static>]) -> T,
+) -> Option<T> {
+    let (cache, tab) = match panel {
+        Focus::RequestSection => (&app.request_detail_cache, app.request_tab),
+        Focus::ResponseSection => (&app.response_detail_cache, app.response_tab),
+        Focus::MessageList | Focus::StatusHeader => return None,
+    };
+    let focused = app.focus == panel;
+    let mut cache = cache.borrow_mut();
+    Some(read(cache.lines(
+        (app.selected_exchange, tab, focused),
+        || match app.get_selected_exchange() {
+            Ok(exchange) => {
+                if panel == Focus::RequestSection {
+                    request_detail_lines_for(exchange.as_deref(), tab, focused)
+                } else {
+                    response_detail_lines_for(exchange.as_deref(), tab, focused)
+                }
+            }
+            Err(error) => vec![Line::from(format!("Error: {error:#}"))],
+        },
+    )))
+}
+
 pub fn request_detail_lines(app: &App) -> Vec<Line<'static>> {
-    request_detail_lines_for(
-        app.get_selected_exchange(),
-        app.request_tab,
-        matches!(app.focus, Focus::RequestSection),
-    )
+    with_detail_lines(app, Focus::RequestSection, <[Line<'static>]>::to_vec).unwrap()
 }
 
 fn request_detail_lines_for(
@@ -2069,30 +2245,12 @@ fn request_detail_lines_for(
             } else {
                 // Show body regardless of focus state
                 lines.push(Line::from(""));
-                let mut request_json = serde_json::Map::new();
-                request_json.insert(
-                    "jsonrpc".to_string(),
-                    serde_json::Value::String("2.0".to_string()),
-                );
-
-                if let Some(id) = &request.id {
-                    request_json.insert("id".to_string(), id.clone());
-                }
-                if let Some(method) = &request.method {
-                    request_json.insert(
-                        "method".to_string(),
-                        serde_json::Value::String(method.clone()),
-                    );
-                }
-                if let Some(params) = &request.params {
-                    request_json.insert("params".to_string(), params.clone());
-                }
-
-                let request_json_value = serde_json::Value::Object(request_json);
-                let request_json_lines = format_json_with_highlighting(&request_json_value);
-                for line in request_json_lines {
-                    lines.push(line);
-                }
+                lines.extend(format_json_with_highlighting(&RequestBody {
+                    id: request.id.as_ref(),
+                    jsonrpc: "2.0",
+                    method: request.method.as_deref(),
+                    params: request.params.as_ref(),
+                }));
             }
         } else {
             lines.push(Line::from(""));
@@ -2182,27 +2340,17 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
     let content = highlight_selected_lines(content, app, Focus::RequestSection);
     let content = number_detail_lines(content, cursor_line);
     let source_lines = content.len();
-    let content = insert_annotation_lines(
+    let visible_lines = inner_area.height as usize;
+    let (visible_content, total_lines, start_line) = visible_detail_lines(
         content,
         app,
         Focus::RequestSection,
         usize::from(inner_area.width),
+        app.request_details_scroll,
+        visible_lines,
     );
-
-    // Calculate visible area for scrolling
-    let visible_lines = inner_area.height as usize;
-    let total_lines = content.len();
-
-    // Apply scrolling offset
     let max_scroll = total_lines.saturating_sub(visible_lines);
     let marker_lines = detail_marker_lines(app, Focus::RequestSection);
-    let start_line = detail_view_scroll(app.request_details_scroll, total_lines);
-    let end_line = std::cmp::min(start_line + visible_lines, total_lines);
-    let visible_content = if start_line < total_lines {
-        content[start_line..end_line].to_vec()
-    } else {
-        vec![]
-    };
 
     let tab = if app.request_tab == 0 {
         "Headers"
@@ -2241,11 +2389,7 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub fn response_detail_lines(app: &App) -> Vec<Line<'static>> {
-    response_detail_lines_for(
-        app.get_selected_exchange(),
-        app.response_tab,
-        matches!(app.focus, Focus::ResponseSection),
-    )
+    with_detail_lines(app, Focus::ResponseSection, <[Line<'static>]>::to_vec).unwrap()
 }
 
 fn response_detail_lines_for(
@@ -2290,27 +2434,12 @@ fn response_detail_lines_for(
             } else {
                 // Show body regardless of focus state
                 lines.push(Line::from(""));
-                let mut response_json = serde_json::Map::new();
-                response_json.insert(
-                    "jsonrpc".to_string(),
-                    serde_json::Value::String("2.0".to_string()),
-                );
-
-                if let Some(id) = &response.id {
-                    response_json.insert("id".to_string(), id.clone());
-                }
-                if let Some(result) = &response.result {
-                    response_json.insert("result".to_string(), result.clone());
-                }
-                if let Some(error) = &response.error {
-                    response_json.insert("error".to_string(), error.clone());
-                }
-
-                let response_json_value = serde_json::Value::Object(response_json);
-                let response_json_lines = format_json_with_highlighting(&response_json_value);
-                for line in response_json_lines {
-                    lines.push(line);
-                }
+                lines.extend(format_json_with_highlighting(&ResponseBody {
+                    error: response.error.as_ref(),
+                    id: response.id.as_ref(),
+                    jsonrpc: "2.0",
+                    result: response.result.as_ref(),
+                }));
             }
         } else {
             lines.push(Line::from(""));
@@ -2345,27 +2474,17 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
     let content = highlight_selected_lines(content, app, Focus::ResponseSection);
     let content = number_detail_lines(content, cursor_line);
     let source_lines = content.len();
-    let content = insert_annotation_lines(
+    let visible_lines = inner_area.height as usize;
+    let (visible_content, total_lines, start_line) = visible_detail_lines(
         content,
         app,
         Focus::ResponseSection,
         usize::from(inner_area.width),
+        app.response_details_scroll,
+        visible_lines,
     );
-
-    // Calculate visible area for scrolling
-    let visible_lines = inner_area.height as usize;
-    let total_lines = content.len();
-
-    // Apply scrolling offset
     let max_scroll = total_lines.saturating_sub(visible_lines);
     let marker_lines = detail_marker_lines(app, Focus::ResponseSection);
-    let start_line = detail_view_scroll(app.response_details_scroll, total_lines);
-    let end_line = std::cmp::min(start_line + visible_lines, total_lines);
-    let visible_content = if start_line < total_lines {
-        content[start_line..end_line].to_vec()
-    } else {
-        vec![]
-    };
 
     let tab = if app.response_tab == 0 {
         "Headers"
@@ -2434,6 +2553,7 @@ fn draw_annotation_button(f: &mut Frame, button: Option<Rect>) {
     );
 }
 
+#[cfg(test)]
 fn exchange_marker_count(app: &App, exchange_index: usize) -> usize {
     if app.search_active() {
         return app
@@ -2442,10 +2562,7 @@ fn exchange_marker_count(app: &App, exchange_index: usize) -> usize {
             .filter(|hit| hit.exchange_index == exchange_index)
             .count();
     }
-    app.annotations
-        .iter()
-        .filter(|note| note.exchange_index == exchange_index)
-        .count()
+    app.annotation_count(exchange_index)
 }
 
 fn detail_marker_lines(app: &App, panel: Focus) -> Vec<usize> {
@@ -2597,7 +2714,7 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
                 ),
                 KeybindInfo::new(
                     "z",
-                    if app.panel_fullscreen {
+                    if app.is_panel_fullscreen() {
                         "restore panels"
                     } else {
                         "fullscreen panel"
@@ -2631,7 +2748,7 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
             ),
             KeybindInfo::new(
                 "z",
-                if app.panel_fullscreen {
+                if app.is_panel_fullscreen() {
                     "restore panels"
                 } else {
                     "fullscreen panel"
@@ -2980,7 +3097,7 @@ fn detail_panel_area(main_area: Rect, app: &App, panel: Focus) -> Option<Rect> {
     if app.app_mode != AppMode::Normal {
         return None;
     }
-    if app.panel_fullscreen {
+    if app.is_panel_fullscreen() {
         return (app.focus == panel).then_some(main_area);
     }
 
@@ -3337,7 +3454,12 @@ mod tests {
 
     #[test]
     fn request_durations_use_green_yellow_and_red_thresholds() {
-        let mut exchange = app_with_request().exchanges()[0].clone();
+        let mut exchange = app_with_request()
+            .exchanges()
+            .get(0)
+            .unwrap()
+            .unwrap()
+            .into_owned();
         let started = std::time::UNIX_EPOCH;
         exchange.request.as_mut().unwrap().timestamp = started;
 
@@ -3356,7 +3478,7 @@ mod tests {
         ] {
             exchange.response.as_mut().unwrap().timestamp = started + duration;
             assert_eq!(
-                exchange_duration(&exchange),
+                exchange_duration(&ExchangeSummary::from(&exchange)),
                 (expected_text.to_string(), expected_color)
             );
         }
@@ -3874,7 +3996,7 @@ mod tests {
     #[test]
     fn annotation_editor_scrolls_below_the_last_wrapped_source_row() {
         let mut app = app_with_request();
-        let mut exchange = app.exchanges()[0].clone();
+        let mut exchange = app.exchanges().get(0).unwrap().unwrap().into_owned();
         exchange.request.as_mut().unwrap().params = Some(serde_json::json!({
             "long": "x".repeat(120),
             "after": true
@@ -4005,7 +4127,7 @@ mod tests {
         let numbered = number_detail_lines(annotated.clone(), Some(4));
         let displayed = insert_annotation_lines(numbered, &app, Focus::RequestSection, 120);
 
-        assert_eq!(app.annotations.len(), 2);
+        assert_eq!(app.annotations().len(), 2);
         assert_eq!(app.active_annotation_id, None);
         assert_eq!(
             displayed.len(),
@@ -4817,5 +4939,149 @@ mod tests {
         assert_eq!(detail_marker_lines(&app, Focus::ResponseSection), vec![4]);
         app.request_tab = 0;
         assert!(detail_marker_lines(&app, Focus::RequestSection).is_empty());
+    }
+    #[test]
+    fn detail_cache_refreshes_after_unrendered_navigation_and_replacement() {
+        let mut app = app_with_request();
+        let mut replacement = app.exchanges().get(0).unwrap().unwrap().into_owned();
+        let before = request_detail_lines(&app);
+        app.selected_exchange = 1;
+        replacement.request.as_mut().unwrap().params = Some(serde_json::json!({"fresh": true}));
+        app.replace_exchange(0, replacement);
+        app.selected_exchange = 0;
+        let after = request_detail_lines(&app);
+        assert_ne!(before, after);
+        assert!(after
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .contains("fresh"));
+        assert_eq!(after, request_detail_lines(&app));
+        app.request_tab = 0;
+        assert_ne!(after, request_detail_lines(&app));
+    }
+
+    #[test]
+    fn bounded_json_formatting_matches_the_existing_line_limit() {
+        for count in [997, 998, 999, 1000, 10_000] {
+            let value = serde_json::json!((0..count).collect::<Vec<_>>());
+            let pretty = serde_json::to_string_pretty(&value).unwrap();
+            let mut expected = pretty
+                .lines()
+                .take(1001)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if pretty.lines().count() > 1001 {
+                expected.push("... (content truncated)".to_string());
+            }
+            let actual = format_json_with_highlighting(&value)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+    #[test]
+    fn viewport_matches_complete_rendering_across_card_and_editor_boundaries() {
+        let mut app = app_with_request();
+        app.add_annotation(annotation(
+            "wide",
+            Focus::RequestSection,
+            1,
+            3,
+            "Wide range",
+            vec![],
+        ));
+        app.add_annotation(annotation(
+            "selected",
+            Focus::RequestSection,
+            2,
+            3,
+            "Selected 日本語 note",
+            vec![],
+        ));
+        app.add_annotation(annotation(
+            "later",
+            Focus::RequestSection,
+            4,
+            4,
+            "Later note",
+            vec![],
+        ));
+        app.focus_annotation("selected");
+        app.clear_line_selection();
+        for editing in [false, true] {
+            if editing {
+                assert!(app.start_editing_annotation("selected"));
+            }
+            for width in [24, 80] {
+                let lines = number_detail_lines(request_detail_lines(&app), Some(3));
+                let complete =
+                    insert_annotation_lines(lines.clone(), &app, Focus::RequestSection, width);
+                for scroll in 0..complete.len() + 2 {
+                    let (visible, total, start) = visible_detail_lines(
+                        lines.clone(),
+                        &app,
+                        Focus::RequestSection,
+                        width,
+                        scroll,
+                        7,
+                    );
+                    assert_eq!(total, complete.len());
+                    assert_eq!(start, scroll.min(total.saturating_sub(1)));
+                    assert_eq!(visible, complete[start..(start + 7).min(total)]);
+                }
+            }
+        }
+    }
+    #[test]
+    fn filter_cache_tracks_appends_replacements_and_session_resets() {
+        let mut app = app_with_request();
+        let mut replacement = app.exchanges().get(0).unwrap().unwrap().into_owned();
+        app.filter_text = "needle".into();
+        assert!(app.filtered_exchange_indices().is_empty());
+        replacement.method = Some("needle".into());
+        app.push_exchange(replacement.clone());
+        assert_eq!(app.filtered_exchange_indices(), [1]);
+        app.replace_exchange(0, replacement.clone());
+        assert_eq!(app.filtered_exchange_indices(), [0, 1]);
+        replacement.method = Some("other".into());
+        replacement.id = Some(serde_json::json!("needle-id"));
+        app.replace_exchange(1, replacement.clone());
+        assert_eq!(app.filtered_exchange_indices(), [0, 1]);
+        replacement.id = Some(serde_json::json!(99));
+        app.replace_exchange(1, replacement.clone());
+        assert_eq!(app.filtered_exchange_indices(), [0]);
+        app.filter_text = "99".into();
+        assert_eq!(app.filtered_exchange_indices(), [1]);
+        app.activate_session(
+            crate::app::SessionSummary {
+                id: "new".into(),
+                name: "new".into(),
+                target: "test".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                exchange_count: 1,
+            },
+            vec![replacement],
+            vec![],
+        );
+        app.filter_text = "99".into();
+        assert_eq!(app.filtered_exchange_indices(), [0]);
+        app.filter_text.clear();
+        assert_eq!(app.filtered_exchange_indices(), [0]);
+    }
+    #[test]
+    fn status_header_never_renders_fullscreen_even_with_a_stale_flag() {
+        let mut app = app_with_request();
+        app.set_focus(Focus::StatusHeader);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let normal = terminal.backend().buffer().clone();
+        app.panel_fullscreen = true;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert_eq!(terminal.backend().buffer(), &normal);
+        assert_eq!(crate::control::state(&app)["fullscreen"], false);
     }
 }

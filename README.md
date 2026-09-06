@@ -88,7 +88,9 @@ jsonrpc-debugger call --transport=http http://127.0.0.1:8081 \
 
 The complete API lives in [`openrpc.json`](openrpc.json).
 
-`debugger.getUpdates` returns an initial snapshot, then only new exchanges and responses that complete older requests. Pass the previous session ID, `nextIndex`, and outstanding `pendingIndices` on subsequent calls. Attach uses this method, so update the wrapper and attached TUI together.
+`debugger.getUpdates` returns an initial snapshot, then only new exchanges and responses that complete older requests. Pass the previous session ID, `nextIndex`, and outstanding `pendingIndices` on subsequent calls. Pass the previous `annotationRevision` to receive annotations only when they change; preserve your local notes when `annotations` is absent. Session resets always include notes. Older clients that omit the revision still receive the full list. `debugger.getState` accepts `includeAnnotations: false` for lightweight polling.
+
+The TUI keeps lightweight request rows in memory and uses an estimated 8 MiB budget for resident message payloads. Older bodies spill to a temporary SQLite file and load when viewed, searched, or requested through the API. The temporary cache closes with the session; durable history remains in the history database. This budget excludes request metadata, annotations, the selected formatted panels, and transient API/export responses.
 
 ## Develop
 

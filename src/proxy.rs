@@ -724,6 +724,6 @@ mod tests {
         assert!(app
             .exchanges()
             .iter()
-            .all(|exchange| exchange.response.is_some()));
+            .all(|exchange| exchange.unwrap().response.is_some()));
     }
 }

@@ -2,7 +2,7 @@
   "openrpc": "1.3.2",
   "info": {
     "title": "jsonrpc-debugger control plane",
-    "version": "0.7.0"
+    "version": "0.8.0"
   },
   "servers": [
     {
@@ -20,25 +20,29 @@
     {
       "name": "debugger.getState",
       "summary": "Read debugger and GUI state",
-      "params": [],
+      "params": [
+        { "name": "includeAnnotations", "required": false, "schema": { "type": "boolean", "default": true } }
+      ],
       "result": { "name": "result", "schema": { "type": "object" } }
     },
     {
       "name": "debugger.getUpdates",
       "summary": "Read new exchanges and completed outstanding requests in one consistent snapshot",
-      "description": "Omit sessionId for a full initial snapshot. Otherwise pass the previous state.session.id, nextIndex, and the indexes of requests still awaiting responses. Changed sessions or cursors beyond current history return reset=true and full history. Other updates contain completed pending exchanges followed by new exchanges, ordered by index. Apply replacements by index and append new entries. State, the full annotation list, and pending interception requests come from the same snapshot. Replace local annotations on every update to apply replies, edits, and deletions.",
+      "description": "Omit sessionId for a full initial snapshot. Otherwise pass the previous state.session.id, nextIndex, and the indexes of requests still awaiting responses. Changed sessions or cursors beyond current history return reset=true and full history. Other updates contain completed pending exchanges followed by new exchanges, ordered by index. Apply replacements by index and append new entries. Pass the previous annotationRevision to omit unchanged annotations. When annotations is present, replace the local list to apply additions, edits, and deletions; when absent, preserve it. Reset responses always contain annotations. Omitting annotationRevision retains the full annotation list and state.annotations for older clients. Revision-aware responses omit state.annotations. State, annotations, and pending interception requests come from the same snapshot.",
       "params": [
         { "name": "sessionId", "required": false, "schema": { "type": "string" } },
         { "name": "nextIndex", "required": false, "schema": { "type": "integer", "minimum": 0 } },
-        { "name": "pendingIndices", "required": false, "schema": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }
+        { "name": "pendingIndices", "required": false, "schema": { "type": "array", "items": { "type": "integer", "minimum": 0 } } },
+        { "name": "annotationRevision", "required": false, "schema": { "type": "integer", "minimum": 0 } }
       ],
       "result": {
         "name": "result",
         "schema": {
           "type": "object",
-          "required": ["state", "reset", "nextIndex", "exchanges", "annotations", "pending"],
+          "required": ["state", "reset", "nextIndex", "exchanges", "annotationRevision", "pending"],
           "properties": {
             "state": { "type": "object" },
+            "annotationRevision": { "type": "integer", "minimum": 0 },
             "reset": { "type": "boolean" },
             "nextIndex": { "type": "integer", "minimum": 0 },
             "exchanges": { "type": "array", "items": { "type": "object", "required": ["index", "transport"], "properties": { "index": { "type": "integer", "minimum": 0 }, "transport": { "type": "string" }, "request": { "type": "object" }, "response": { "type": "object" } } } },
@@ -47,7 +51,7 @@
           }
         }
       },
-      "examples": [{ "name": "Initial snapshot", "params": [], "result": { "name": "result", "value": { "state": {}, "reset": true, "nextIndex": 0, "exchanges": [], "annotations": [], "pending": [] } } }]
+      "examples": [{ "name": "Initial snapshot", "params": [], "result": { "name": "result", "value": { "state": {}, "annotationRevision": 0, "reset": true, "nextIndex": 0, "exchanges": [], "annotations": [], "pending": [] } } }]
     },
     {
       "name": "debugger.waitForChange",
@@ -172,6 +176,7 @@
     {
       "name": "debugger.setFullscreen",
       "summary": "Expand or restore the focused TUI panel",
+      "description": "Expands the focused request list or details panel. The status header cannot be expanded; focusing it exits fullscreen.",
       "params": [
         { "name": "fullscreen", "required": true, "schema": { "type": "boolean" } }
       ],
