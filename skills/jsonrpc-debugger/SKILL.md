@@ -263,3 +263,17 @@ Session changes fail while intercepted requests are pending.
 - Preserve user-created selections and annotations.
 - Preserve history unless the user explicitly requests deletion.
 - Report the final session, mode, pending count, selected exchange, and target-side JSON-RPC errors.
+
+## Annotation threads
+
+Use `debugger.getAnnotations` to read the active session's complete thread list. Each note includes `id`, nullable `parentId`, `author` (`agent`, `user`, or legacy `unknown`), and `createdAtMs`, alongside its source reference and message.
+
+```bash
+rpc debugger.getAnnotations
+rpc debugger.replyAnnotation '{"annotationId":"NOTE_ID","message":"Added a regression test for that path."}'
+rpc debugger.updateAnnotation '{"annotationId":"NOTE_ID","message":"Updated observation."}'
+```
+
+`debugger.annotateLines` creates a root; `debugger.replyAnnotation` inherits the parent's exact source reference. Both default to author `agent`; the TUI sends `user`. Messages contain 1–160 characters on one line. Edits preserve author, creation time, and parent. Deleting a note reparents its replies without deleting them. Annotation creation and replies preserve the user's viewport.
+
+In either TUI, click a card or navigate with `[` / `]`, then press `e` to edit. Notes, including existing replies, render as a flat list without inline action labels. Enter saves and Esc cancels. `Ctrl-B a` annotates a visual selection; `Ctrl-B d` deletes the selected note. `debugger.getUpdates` always includes the complete annotation list; replace local notes on every snapshot to synchronize replies, edits, and deletions.

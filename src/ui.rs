@@ -11,12 +11,12 @@ use ratatui::{
 
 use crate::app::{
     request_matches_filter, App, AppMode, DetailHover, EditorMode, Focus, InputMode,
-    JsonRpcExchange, LineAnnotation, Overlay, SearchHit,
+    JsonRpcExchange, LineAnnotation, Overlay,
 };
 
 const ANNOTATION_AMBER: Color = Color::Rgb(245, 166, 35);
 const ANNOTATION_EDITOR_HEIGHT: usize = 5;
-pub(crate) const ANNOTATION_CARD_HEIGHT: usize = 3;
+pub(crate) const ANNOTATION_CARD_HEIGHT: usize = 5;
 const THEME_BACKGROUND: Color = Color::Rgb(12, 16, 18);
 const THEME_SURFACE: Color = Color::Rgb(22, 28, 31);
 const THEME_BORDER: Color = Color::Rgb(58, 70, 74);
@@ -154,26 +154,14 @@ pub fn panel_visible_lines(area: Rect, app: &App, focus: Focus) -> usize {
     }
 }
 
-pub fn detail_max_source_scroll(
+pub fn detail_max_scroll(
     app: &App,
     panel: Focus,
     total_lines: usize,
     visible_lines: usize,
 ) -> usize {
     let annotations = detail_annotations(app, panel);
-    let max_display_scroll =
-        (total_lines + annotations.len() * ANNOTATION_CARD_HEIGHT).saturating_sub(visible_lines);
-    let source_scroll = (0..total_lines)
-        .take_while(|source| detail_display_scroll(*source, &annotations) <= max_display_scroll)
-        .last()
-        .unwrap_or(0);
-    if source_scroll == total_lines.saturating_sub(1)
-        && detail_display_scroll(source_scroll, &annotations) < max_display_scroll
-    {
-        max_display_scroll
-    } else {
-        source_scroll
-    }
+    (total_lines + annotations.len() * ANNOTATION_CARD_HEIGHT).saturating_sub(visible_lines)
 }
 
 pub fn mouse_action(area: Rect, app: &App, column: u16, row: u16) -> Option<MouseAction> {
@@ -609,13 +597,7 @@ fn clicked_detail_row(
     let gutter_width = detail_gutter_width(content.len());
     let mut visible_row = usize::from(row.saturating_sub(area.y + 1));
     let rows = detail_rows(content.len(), annotations);
-    let display_scroll = detail_view_scroll(
-        scroll,
-        annotations,
-        content.len(),
-        rows.len(),
-        usize::from(area.height.saturating_sub(2)),
-    );
+    let display_scroll = detail_view_scroll(scroll, rows.len());
     for detail_row in rows.into_iter().skip(display_scroll) {
         let rendered_width = detail_row_width(detail_row, content, gutter_width);
         let height = rendered_width.max(1).div_ceil(width);
@@ -664,13 +646,7 @@ fn detail_line_screen_rows(
     let mut visible_row: usize = 0;
 
     let rows = detail_rows(content.len(), annotations);
-    let display_scroll = detail_view_scroll(
-        scroll,
-        annotations,
-        content.len(),
-        rows.len(),
-        visible_height,
-    );
+    let display_scroll = detail_view_scroll(scroll, rows.len());
     for detail_row in rows.into_iter().skip(display_scroll) {
         let height = detail_row_width(detail_row, content, gutter_width)
             .max(1)
@@ -709,16 +685,26 @@ pub fn annotation_editor_scroll(area: Rect, app: &App) -> Option<(Focus, usize)>
         Focus::ResponseSection => app.response_details_scroll,
         Focus::MessageList | Focus::StatusHeader => return None,
     };
-    let last_scroll = selection.end_line.saturating_sub(1);
-    let last_source_row = panel
-        .bottom()
-        .saturating_sub(ANNOTATION_EDITOR_HEIGHT as u16 + 2);
-    let scroll = (current.min(last_scroll)..=last_scroll)
-        .find(|scroll| {
-            detail_line_screen_rows(panel, *scroll, &content, &annotations, selection.end_line)
-                .is_some_and(|(_, last)| last <= last_source_row)
+    let target = annotation_editor_position(app, selection.panel)?;
+    let rows = detail_rows(content.len(), &annotations);
+    let width = usize::from(panel.width.saturating_sub(3)).max(1);
+    let gutter = detail_gutter_width(content.len());
+    let available =
+        usize::from(panel.height.saturating_sub(2)).saturating_sub(ANNOTATION_EDITOR_HEIGHT);
+    let scroll = (current.min(target)..=target)
+        .find(|start| {
+            rows.iter()
+                .skip(*start)
+                .take(target - start)
+                .map(|row| {
+                    detail_row_width(*row, &content, gutter)
+                        .max(1)
+                        .div_ceil(width)
+                })
+                .sum::<usize>()
+                <= available
         })
-        .unwrap_or(last_scroll);
+        .unwrap_or(target);
     Some((selection.panel, scroll))
 }
 
@@ -759,28 +745,8 @@ fn detail_annotations(app: &App, panel: Focus) -> Vec<&LineAnnotation> {
         .collect()
 }
 
-fn detail_display_scroll(source_scroll: usize, annotations: &[&LineAnnotation]) -> usize {
-    source_scroll
-        + annotations
-            .iter()
-            .filter(|annotation| annotation.end_line <= source_scroll)
-            .count()
-            * ANNOTATION_CARD_HEIGHT
-}
-
-fn detail_view_scroll(
-    source_scroll: usize,
-    annotations: &[&LineAnnotation],
-    source_lines: usize,
-    display_lines: usize,
-    visible_lines: usize,
-) -> usize {
-    let display_scroll = detail_display_scroll(source_scroll, annotations);
-    if source_scroll < source_lines {
-        display_scroll
-    } else {
-        display_scroll.min(display_lines.saturating_sub(visible_lines))
-    }
+fn detail_view_scroll(scroll: usize, display_lines: usize) -> usize {
+    scroll.min(display_lines.saturating_sub(1))
 }
 
 fn tab_action(area: Rect, column: u16, gutter_width: usize) -> Option<usize> {
@@ -1026,6 +992,7 @@ fn draw_keybind_help(f: &mut Frame, app: &App) {
             Line::from(Span::styled("Navigation", Style::default().fg(THEME_BLUE))),
             Line::from("↑/↓ or j/k navigate   Tab focus   h/l tabs   / search"),
             Line::from("d/u page   g/G top/bottom   [/] matches or annotations"),
+            Line::from("e edit selected note   Ctrl-B d delete note"),
             Line::from(",/. previous/next request"),
             Line::from("Requests: Enter response   Details: Enter copy Markdown"),
             Line::from("Paused calls can be allowed, edited, completed, or blocked."),
@@ -1057,6 +1024,7 @@ fn draw_keybind_help(f: &mut Frame, app: &App) {
             Line::from(Span::styled("Navigation", Style::default().fg(THEME_BLUE))),
             Line::from("↑/↓ or j/k navigate   Tab focus   h/l tabs   / search"),
             Line::from("d/u page   g/G top/bottom   [/] matches or annotations"),
+            Line::from("e edit selected note   Ctrl-B d delete note"),
             Line::from(",/. previous/next request"),
             Line::from("Requests: Enter response   Details: Enter copy Markdown"),
             Line::from("Details: v visual select   j/k extend   Esc clear"),
@@ -1568,7 +1536,11 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
             Cell::from("Method"),
             Cell::from("ID"),
             Cell::from("Duration"),
-            Cell::from("Matches"),
+            Cell::from(if app.search_active() {
+                "Matches"
+            } else {
+                "Notes"
+            }),
         ])
     }
     .style(
@@ -1612,11 +1584,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
 
             let (duration_text, duration_color) = exchange_duration(exchange);
 
-            let match_count = app
-                .search_hits
-                .iter()
-                .filter(|hit| hit.exchange_index == *index)
-                .count();
+            let match_count = exchange_marker_count(app, *index);
             let matches = if match_count > 0 {
                 format!("◆{match_count}")
             } else {
@@ -1695,10 +1663,7 @@ fn draw_message_list(f: &mut Frame, area: Rect, app: &App) {
             .iter()
             .enumerate()
             .filter_map(|(position, (index, _))| {
-                app.search_hits
-                    .iter()
-                    .any(|hit| hit.exchange_index == *index)
-                    .then_some(position)
+                (exchange_marker_count(app, *index) > 0).then_some(position)
             })
             .collect::<Vec<_>>();
         draw_scrollbar_markers(
@@ -1843,83 +1808,131 @@ fn insert_annotation_lines(
     );
     for (source_index, line) in lines.into_iter().enumerate() {
         displayed.push(line);
-        if editor_line == Some(source_index + 1) {
-            displayed
-                .extend(std::iter::repeat_with(|| Line::from("")).take(ANNOTATION_EDITOR_HEIGHT));
-        }
         let notes = annotations
             .iter()
             .copied()
             .filter(|annotation| annotation.end_line == source_index + 1)
             .collect::<Vec<_>>();
-        let note_count = notes.len();
-        for (index, annotation) in notes.into_iter().enumerate() {
-            displayed.extend(annotation_card_lines(
-                annotation,
-                index + 1 == note_count,
-                gutter_width,
-                width,
-            ));
+        for annotation in notes {
+            let card = annotation_card_lines(annotation, gutter_width, width);
+            let selected = app.active_annotation_id.as_deref() == Some(annotation.id.as_str());
+            displayed.extend(card.map(|line| {
+                if selected {
+                    line.patch_style(Style::default().add_modifier(Modifier::BOLD))
+                } else {
+                    line
+                }
+            }));
         }
+    }
+    if let Some(position) = annotation_editor_position(app, panel) {
+        let position = position.min(displayed.len());
+        displayed.splice(
+            position..position,
+            std::iter::repeat_with(|| Line::from("")).take(ANNOTATION_EDITOR_HEIGHT),
+        );
     }
     displayed
 }
 
 fn annotation_card_lines(
     annotation: &LineAnnotation,
-    last: bool,
     gutter_width: usize,
     width: usize,
 ) -> [Line<'static>; ANNOTATION_CARD_HEIGHT] {
-    let indent_width = gutter_width.saturating_sub(2);
+    let indent_width = gutter_width.min(width.saturating_sub(12));
     let indent = " ".repeat(indent_width);
-    let branch = if last { "╰─" } else { "├─" };
-    let rail = if last { "  " } else { "│ " };
-    let card_width = width.saturating_sub(indent_width + 2);
-    if card_width < 4 {
+    let card_width = width.saturating_sub(indent_width);
+    if card_width < 5 {
         let message = truncate_to_width(&annotation.message.replace('\n', " "), width);
         return [
-            Line::from(Span::styled(message, Style::default().fg(ANNOTATION_AMBER))),
+            Line::from(message),
+            Line::from(""),
+            Line::from(""),
             Line::from(""),
             Line::from(""),
         ];
     }
-
-    let label = if annotation.start_line == annotation.end_line {
-        format!("Note · R{}", annotation.start_line)
-    } else {
-        format!("Note · R{}–R{}", annotation.start_line, annotation.end_line)
+    let author = match annotation.author {
+        crate::app::AnnotationAuthor::User => "You",
+        crate::app::AnnotationAuthor::Agent => "Agent",
+        crate::app::AnnotationAuthor::Unknown => "",
     };
-    let label = truncate_to_width(&label, card_width.saturating_sub(5));
-    let top_left = format!("╭─ {label} ");
-    let top_fill = "─".repeat(card_width.saturating_sub(Line::from(top_left.as_str()).width() + 1));
-
+    let age = annotation_age(annotation.created_at_ms);
+    let metadata = [author, age.as_str()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let label_width = card_width.saturating_sub(5);
+    let label = truncate_to_width(&metadata, label_width);
+    let top_fill = "─".repeat(label_width.saturating_sub(Line::from(label.as_str()).width()));
     let body_width = card_width.saturating_sub(4);
     let message = truncate_to_width(&annotation.message.replace('\n', " ↵ "), body_width);
     let body_fill = " ".repeat(body_width.saturating_sub(Line::from(message.as_str()).width()));
+    let border = Style::default().fg(ANNOTATION_AMBER).bg(THEME_SURFACE);
+    let rail = " ".repeat(indent_width);
+    let empty = Line::from(vec![
+        Span::raw(rail.clone()),
+        Span::styled(format!("│{}│", " ".repeat(card_width - 2)), border),
+    ]);
     let bottom = format!("╰{}╯", "─".repeat(card_width.saturating_sub(2)));
-    let border = Style::default().fg(ANNOTATION_AMBER);
-
     [
         Line::from(vec![
-            Span::raw(indent.clone()),
-            Span::styled(format!("{branch}{top_left}"), border),
-            Span::styled(top_fill, border),
-            Span::styled("╮", border),
-        ]),
-        Line::from(vec![
-            Span::raw(indent.clone()),
-            Span::styled(format!("{rail}│ "), border),
-            Span::styled(message, Style::default().fg(THEME_TEXT)),
-            Span::raw(body_fill),
-            Span::styled(" │", border),
-        ]),
-        Line::from(vec![
             Span::raw(indent),
-            Span::styled(rail, border),
-            Span::styled(bottom, border),
+            Span::styled("╭─ ", border),
+            Span::styled(label, Style::default().fg(THEME_TEXT).bg(THEME_SURFACE)),
+            Span::styled(format!(" {top_fill}╮"), border),
         ]),
+        empty.clone(),
+        Line::from(vec![
+            Span::raw(rail.clone()),
+            Span::styled("│ ", border),
+            Span::styled(message, Style::default().fg(THEME_TEXT).bg(THEME_SURFACE)),
+            Span::styled(format!("{body_fill} │"), border),
+        ]),
+        empty,
+        Line::from(vec![Span::raw(rail), Span::styled(bottom, border)]),
     ]
+}
+
+fn annotation_age(created_at_ms: u64) -> String {
+    if created_at_ms == 0 {
+        return String::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let minutes = now.saturating_sub(u128::from(created_at_ms)) / 60_000;
+    match minutes {
+        0 => "now".to_string(),
+        1..60 => format!("{minutes}m ago"),
+        60..1440 => format!("{}h ago", minutes / 60),
+        _ => format!("{}d ago", minutes / 1440),
+    }
+}
+
+// Position in the flat list before inserting the editor.
+fn annotation_editor_position(app: &App, panel: Focus) -> Option<usize> {
+    let line = annotation_editor_line(app, panel)?;
+    let notes = app.visible_annotations(panel).collect::<Vec<_>>();
+    let before = notes.iter().filter(|note| note.end_line < line).count();
+    let same_line = notes
+        .iter()
+        .filter(|note| note.end_line == line)
+        .collect::<Vec<_>>();
+    let preceding = if let Some(id) = &app.annotation_edit_id {
+        same_line
+            .iter()
+            .position(|note| &note.id == id)
+            .unwrap_or(0)
+    } else if app.annotation_reply_id.is_some() {
+        same_line.len()
+    } else {
+        0
+    };
+    Some(line + (before + preceding) * ANNOTATION_CARD_HEIGHT)
 }
 
 fn annotation_editor_line(app: &App, panel: Focus) -> Option<usize> {
@@ -2182,9 +2195,8 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
 
     // Apply scrolling offset
     let max_scroll = total_lines.saturating_sub(visible_lines);
-    let search_hits = detail_search_hits(app, Focus::RequestSection);
-    let start_line =
-        detail_display_scroll(app.request_details_scroll, &annotations).min(max_scroll);
+    let marker_lines = detail_marker_lines(app, Focus::RequestSection);
+    let start_line = detail_view_scroll(app.request_details_scroll, total_lines);
     let end_line = std::cmp::min(start_line + visible_lines, total_lines);
     let visible_content = if start_line < total_lines {
         content[start_line..end_line].to_vec()
@@ -2203,12 +2215,12 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
         Focus::RequestSection,
     );
     let progress = (total_lines > visible_lines)
-        .then(|| ((start_line as f32 / max_scroll as f32) * 100.0) as u8);
+        .then(|| ((start_line.min(max_scroll) as f32 / max_scroll as f32) * 100.0) as u8);
     draw_detail_chrome(
         f,
         area,
         title,
-        search_hits.len(),
+        marker_lines.len(),
         progress,
         matches!(app.focus, Focus::RequestSection),
         true,
@@ -2223,7 +2235,7 @@ fn draw_request_details(f: &mut Frame, area: Rect, app: &App) {
             horizontal: 0,
         });
         draw_vertical_scrollbar(f, rail, start_line, total_lines, visible_lines);
-        draw_search_scrollbar_markers(f, area, &search_hits, source_lines);
+        draw_detail_scrollbar_markers(f, area, &marker_lines, source_lines);
     }
     draw_annotation_button(f, annotation_button);
 }
@@ -2346,9 +2358,8 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
 
     // Apply scrolling offset
     let max_scroll = total_lines.saturating_sub(visible_lines);
-    let search_hits = detail_search_hits(app, Focus::ResponseSection);
-    let start_line =
-        detail_display_scroll(app.response_details_scroll, &annotations).min(max_scroll);
+    let marker_lines = detail_marker_lines(app, Focus::ResponseSection);
+    let start_line = detail_view_scroll(app.response_details_scroll, total_lines);
     let end_line = std::cmp::min(start_line + visible_lines, total_lines);
     let visible_content = if start_line < total_lines {
         content[start_line..end_line].to_vec()
@@ -2367,12 +2378,12 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
         Focus::ResponseSection,
     );
     let progress = (total_lines > visible_lines)
-        .then(|| ((start_line as f32 / max_scroll as f32) * 100.0) as u8);
+        .then(|| ((start_line.min(max_scroll) as f32 / max_scroll as f32) * 100.0) as u8);
     draw_detail_chrome(
         f,
         area,
         title,
-        search_hits.len(),
+        marker_lines.len(),
         progress,
         matches!(app.focus, Focus::ResponseSection),
         false,
@@ -2387,7 +2398,7 @@ fn draw_response_details(f: &mut Frame, area: Rect, app: &App) {
             horizontal: 0,
         });
         draw_vertical_scrollbar(f, rail, start_line, total_lines, visible_lines);
-        draw_search_scrollbar_markers(f, area, &search_hits, source_lines);
+        draw_detail_scrollbar_markers(f, area, &marker_lines, source_lines);
     }
     draw_annotation_button(f, annotation_button);
 }
@@ -2423,24 +2434,39 @@ fn draw_annotation_button(f: &mut Frame, button: Option<Rect>) {
     );
 }
 
-fn detail_search_hits(app: &App, panel: Focus) -> Vec<&SearchHit> {
-    let Some(tab) = app.detail_tab(panel) else {
-        return Vec::new();
-    };
-    app.search_hits
+fn exchange_marker_count(app: &App, exchange_index: usize) -> usize {
+    if app.search_active() {
+        return app
+            .search_hits
+            .iter()
+            .filter(|hit| hit.exchange_index == exchange_index)
+            .count();
+    }
+    app.annotations
         .iter()
-        .filter(|hit| {
-            hit.exchange_index == app.selected_exchange && hit.panel == panel && hit.tab == tab
-        })
+        .filter(|note| note.exchange_index == exchange_index)
+        .count()
+}
+
+fn detail_marker_lines(app: &App, panel: Focus) -> Vec<usize> {
+    if app.search_active() {
+        return app
+            .search_hits
+            .iter()
+            .filter(|hit| {
+                hit.exchange_index == app.selected_exchange
+                    && hit.panel == panel
+                    && Some(hit.tab) == app.detail_tab(panel)
+            })
+            .map(|hit| hit.start_line)
+            .collect();
+    }
+    app.visible_annotations(panel)
+        .map(|note| note.start_line)
         .collect()
 }
 
-fn draw_search_scrollbar_markers(
-    f: &mut Frame,
-    area: Rect,
-    hits: &[&SearchHit],
-    total_lines: usize,
-) {
+fn draw_detail_scrollbar_markers(f: &mut Frame, area: Rect, lines: &[usize], total_lines: usize) {
     let rail = area.inner(&Margin {
         vertical: 1,
         horizontal: 0,
@@ -2448,7 +2474,7 @@ fn draw_search_scrollbar_markers(
     draw_scrollbar_markers(
         f,
         rail,
-        search_scrollbar_rows(rail.height, hits, total_lines),
+        detail_scrollbar_rows(rail.height, lines, total_lines),
     );
 }
 
@@ -2472,14 +2498,14 @@ fn draw_scrollbar_markers(f: &mut Frame, rail: Rect, rows: Vec<u16>) {
     }
 }
 
-fn search_scrollbar_rows(rail_height: u16, hits: &[&SearchHit], total_lines: usize) -> Vec<u16> {
+fn detail_scrollbar_rows(rail_height: u16, lines: &[usize], total_lines: usize) -> Vec<u16> {
     if rail_height == 0 || total_lines == 0 {
         return Vec::new();
     }
 
-    let positions = hits
+    let positions = lines
         .iter()
-        .map(|hit| hit.start_line.clamp(1, total_lines) - 1)
+        .map(|line| (*line).clamp(1, total_lines) - 1)
         .collect::<Vec<_>>();
     scrollbar_rows(rail_height, &positions, total_lines)
 }
@@ -2539,10 +2565,24 @@ impl KeybindInfo {
     }
 }
 
+fn add_annotation_keybinds(app: &App, keybinds: &mut Vec<KeybindInfo>) {
+    if app.annotation_to_delete().is_some() {
+        keybinds.insert(1, KeybindInfo::new("d", "delete annotation", 1));
+    }
+    if app.visual_selection_active && app.line_selection.is_some() {
+        let description = if app.selection_overlaps_annotation() {
+            "add another annotation"
+        } else {
+            "add annotation"
+        };
+        keybinds.insert(1, KeybindInfo::new("a", description, 1));
+    }
+}
+
 fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
     if app.overlay == Overlay::Prefix {
         if app.proxy_config.transparent {
-            return vec![
+            let mut keybinds = vec![
                 KeybindInfo::new("?", "keybinds", 1),
                 KeybindInfo::new("y", "copy markdown", 1),
                 KeybindInfo::new("p", "pause", 1),
@@ -2567,6 +2607,8 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
                 KeybindInfo::new("q", "quit", 1),
                 KeybindInfo::new("Esc", "cancel", 1),
             ];
+            add_annotation_keybinds(app, &mut keybinds);
+            return keybinds;
         }
         let mut keybinds = vec![
             KeybindInfo::new("?", "keybinds", 1),
@@ -2599,21 +2641,17 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
             KeybindInfo::new("q", "quit", 1),
             KeybindInfo::new("Esc", "cancel", 1),
         ];
-        if app.annotation_to_delete().is_some() {
-            keybinds.insert(1, KeybindInfo::new("d", "delete annotation", 1));
-        }
-        if app.visual_selection_active && app.line_selection.is_some() {
-            let description = if app.selection_overlaps_annotation() {
-                "add another annotation"
-            } else {
-                "add annotation"
-            };
-            keybinds.insert(1, KeybindInfo::new("a", description, 1));
-        }
+        add_annotation_keybinds(app, &mut keybinds);
         return keybinds;
     }
     if matches!(app.overlay, Overlay::Help | Overlay::Sessions) {
         return vec![KeybindInfo::new("Esc", "close", 1)];
+    }
+    if app.input_mode == InputMode::AnnotatingSelection {
+        return vec![
+            KeybindInfo::new("Enter", "save note", 1),
+            KeybindInfo::new("Esc", "cancel", 1),
+        ];
     }
     if app.input_mode == InputMode::Searching {
         return vec![
@@ -2640,6 +2678,9 @@ fn get_keybinds_for_mode(app: &App) -> Vec<KeybindInfo> {
     ];
 
     if app.app_mode == AppMode::Normal {
+        if app.annotation_to_delete().is_some() {
+            keybinds.extend([KeybindInfo::new("e", "edit note", 1)]);
+        }
         keybinds.push(if app.search_active() {
             KeybindInfo::new("[/]", "matches", 1)
         } else {
@@ -2885,8 +2926,27 @@ fn annotation_dialog_area(main_area: Rect, app: &App) -> Option<Rect> {
         Focus::ResponseSection => app.response_details_scroll,
         Focus::MessageList | Focus::StatusHeader => return None,
     };
-    let (_, source_row) =
-        detail_line_screen_rows(panel, scroll, &content, &annotations, selection.end_line)?;
+    let position = annotation_editor_position(app, selection.panel)?;
+    if position < scroll {
+        return None;
+    }
+    let width = usize::from(panel.width.saturating_sub(3)).max(1);
+    let gutter = detail_gutter_width(content.len());
+    let rows = detail_rows(content.len(), &annotations);
+    let offset = rows
+        .iter()
+        .skip(scroll)
+        .take(position - scroll)
+        .map(|row| {
+            detail_row_width(*row, &content, gutter)
+                .max(1)
+                .div_ceil(width)
+        })
+        .sum::<usize>();
+    let editor_row = panel
+        .y
+        .saturating_add(1)
+        .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
     let height = (ANNOTATION_EDITOR_HEIGHT as u16).min(panel.height.saturating_sub(2));
     if height < 4 {
         return None;
@@ -2894,7 +2954,9 @@ fn annotation_dialog_area(main_area: Rect, app: &App) -> Option<Rect> {
 
     let inner_left = panel.x.saturating_add(1);
     let inner_right = panel.right().saturating_sub(1);
-    let aligned_left = inner_left.saturating_add(detail_gutter_width(content.len()) as u16);
+    let aligned_left = inner_left.saturating_add(
+        detail_gutter_width(content.len()).min(usize::from(panel.width) / 2) as u16,
+    );
     let x = if inner_right.saturating_sub(aligned_left) >= 20 {
         aligned_left
     } else {
@@ -2910,7 +2972,7 @@ fn annotation_dialog_area(main_area: Rect, app: &App) -> Option<Rect> {
         .saturating_sub(1)
         .saturating_sub(height)
         .max(min_y);
-    let y = source_row.saturating_add(1).min(max_y).max(min_y);
+    let y = editor_row.min(max_y).max(min_y);
     Some(Rect::new(x, y, width, height))
 }
 
@@ -2946,6 +3008,8 @@ fn annotation_dialog_title(app: &App) -> String {
     };
     let action = if app.annotation_edit_id.is_some() {
         "Edit note"
+    } else if app.annotation_reply_id.is_some() {
+        "Reply"
     } else {
         "New note"
     };
@@ -3239,7 +3303,9 @@ fn draw_intercept_request_details(f: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{DetailTab, JsonRpcMessage, MessageDirection, SessionSummary, TransportType};
+    use crate::app::{
+        DetailTab, JsonRpcMessage, MessageDirection, SearchHit, SessionSummary, TransportType,
+    };
     use ratatui::{backend::TestBackend, Terminal};
 
     fn app_with_request() -> App {
@@ -3462,6 +3528,9 @@ mod tests {
         text: Vec<String>,
     ) -> LineAnnotation {
         LineAnnotation {
+            parent_id: None,
+            author: crate::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: id.to_string(),
             exchange_index: 0,
             panel,
@@ -3896,8 +3965,8 @@ mod tests {
             "ID: 1"
         );
         assert_eq!(line_text(&annotated[2]), "ID: 1");
-        assert!(line_text(&displayed[3]).contains("Note · R2–R3"));
-        assert!(line_text(&displayed[4]).contains("Method and id must agree"));
+        assert!(!line_text(&displayed[3]).contains("R2"));
+        assert!(line_text(&displayed[5]).contains("Method and id must agree"));
         assert_eq!(displayed.len(), annotated.len() + ANNOTATION_CARD_HEIGHT);
         assert_eq!(annotated[1].style.bg, Some(Color::Rgb(44, 34, 14)));
         assert_eq!(annotated[2].style.bg, Some(Color::Rgb(44, 34, 14)));
@@ -3975,10 +4044,10 @@ mod tests {
             displayed.len(),
             request_detail_lines(&app).len() + 2 * ANNOTATION_CARD_HEIGHT
         );
-        assert!(line_text(&displayed[2]).contains("├─╭─ Note · R2"));
-        assert!(line_text(&displayed[3]).contains("Check the method"));
-        assert!(line_text(&displayed[5]).contains("╰─╭─ Note · R2"));
-        assert!(line_text(&displayed[6]).contains("Compare the name"));
+        assert!(line_text(&displayed[2]).contains("╭─ "));
+        assert!(line_text(&displayed[4]).contains("Check the method"));
+        assert!(line_text(&displayed[7]).contains("╭─ "));
+        assert!(line_text(&displayed[9]).contains("Compare the name"));
     }
 
     #[test]
@@ -4003,12 +4072,13 @@ mod tests {
         let top = (area.x..area.right())
             .map(|column| terminal.backend().buffer().get(column, 3).symbol())
             .collect::<String>();
-        assert!(top.contains("Note · R2"));
+        assert!(!top.contains("R2"));
+        assert!(!top.contains("Request"));
         let border_x = (area.x..area.right())
-            .find(|column| terminal.backend().buffer().get(*column, 3).symbol() == "╰")
+            .find(|column| terminal.backend().buffer().get(*column, 3).symbol() == "╭")
             .unwrap();
         let border = terminal.backend().buffer().get(border_x, 3);
-        assert_eq!(border.symbol(), "╰");
+        assert_eq!(border.symbol(), "╭");
         assert_eq!(border.fg, ANNOTATION_AMBER);
     }
 
@@ -4022,10 +4092,10 @@ mod tests {
             "Long annotation",
             vec!["Method: eth_call".to_string()],
         );
-        let card = annotation_card_lines(&note, true, 5, 20);
+        let card = annotation_card_lines(&note, 5, 20);
 
         assert_eq!(card.len(), ANNOTATION_CARD_HEIGHT);
-        assert!(line_text(&card[1]).contains("Long annot…"));
+        assert!(line_text(&card[2]).contains("Long annot…"));
         assert_eq!(card.iter().map(Line::width).max(), Some(20));
     }
 
@@ -4037,7 +4107,16 @@ mod tests {
         let bottom = search_hit(0, Focus::RequestSection, DetailTab::Body, 101);
 
         assert_eq!(
-            search_scrollbar_rows(11, &[&top, &middle, &same_row, &bottom], 101),
+            detail_scrollbar_rows(
+                11,
+                &[
+                    top.start_line,
+                    middle.start_line,
+                    same_row.start_line,
+                    bottom.start_line
+                ],
+                101
+            ),
             vec![0, 5, 10]
         );
     }
@@ -4066,7 +4145,7 @@ mod tests {
             )],
         );
         let area = Rect::new(0, 0, 40, 6);
-        let row = search_scrollbar_rows(4, &[&app.search_hits[0]], total_lines)[0];
+        let row = detail_scrollbar_rows(4, &[app.search_hits[0].start_line], total_lines)[0];
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
 
         terminal
@@ -4079,7 +4158,7 @@ mod tests {
     }
 
     #[test]
-    fn annotations_do_not_leave_search_markers() {
+    fn annotations_supply_default_list_title_and_scrollbar_markers() {
         let mut app = app_with_request();
         let total_lines = request_detail_lines(&app).len();
         app.add_annotation(annotation(
@@ -4098,7 +4177,7 @@ mod tests {
         let request_row = (list_area.x..list_area.right())
             .map(|column| list.backend().buffer().get(column, 2).symbol())
             .collect::<String>();
-        assert!(!request_row.contains('◆'));
+        assert!(request_row.contains('◆'));
 
         let detail_area = Rect::new(0, 0, 40, 6);
         let mut detail =
@@ -4109,12 +4188,12 @@ mod tests {
         let title = (detail_area.x..detail_area.right())
             .map(|column| detail.backend().buffer().get(column, 0).symbol())
             .collect::<String>();
-        assert!(!title.contains('◆'));
-        assert_ne!(
+        assert!(title.contains('◆'));
+        assert_eq!(
             detail
                 .backend()
                 .buffer()
-                .get(detail_area.right() - 2, detail_area.y + 1)
+                .get(detail_area.right() - 2, detail_area.bottom() - 2)
                 .symbol(),
             "▐"
         );
@@ -4230,6 +4309,13 @@ mod tests {
             Some("add another annotation")
         );
 
+        app.proxy_config.transparent = true;
+        assert!(get_keybinds_for_mode(&app)
+            .iter()
+            .any(|keybind| keybind.key == "a"));
+        assert!(get_keybinds_for_mode(&app)
+            .iter()
+            .any(|keybind| keybind.key == "d"));
         app.finish_visual_selection();
         assert!(!get_keybinds_for_mode(&app)
             .iter()
@@ -4276,11 +4362,11 @@ mod tests {
             Some(ClickedDetail::Annotation("annotation-1".to_string()))
         );
         assert_eq!(
-            clicked_detail_row(area, 1, 6, 0, &content, &annotations),
+            clicked_detail_row(area, 1, 8, 0, &content, &annotations),
             Some(ClickedDetail::Line(3))
         );
         assert_eq!(
-            clicked_detail_row(area, 1, 1, 2, &content, &annotations),
+            clicked_detail_row(area, 1, 1, 7, &content, &annotations),
             Some(ClickedDetail::Line(3))
         );
     }
@@ -4321,10 +4407,7 @@ mod tests {
             vec!["three".to_string(), "four".to_string()],
         ));
 
-        assert_eq!(
-            detail_max_source_scroll(&app, Focus::RequestSection, 4, 2),
-            5
-        );
+        assert_eq!(detail_max_scroll(&app, Focus::RequestSection, 4, 2), 7);
     }
 
     #[test]
@@ -4530,5 +4613,209 @@ mod tests {
         let scrolled_header_x = header_x(&app);
 
         assert_eq!(selected_header_x, scrolled_header_x);
+    }
+
+    #[test]
+    fn existing_replies_render_as_a_flat_chronological_list_without_inline_actions() {
+        let mut app = app_with_request();
+        let root = annotation(
+            "root",
+            Focus::RequestSection,
+            2,
+            2,
+            "What if every task is queued?",
+            vec![],
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        app.add_annotation(LineAnnotation {
+            author: crate::app::AnnotationAuthor::Agent,
+            created_at_ms: now,
+            ..root.clone()
+        });
+        app.add_annotation(LineAnnotation {
+            id: "other".to_string(),
+            created_at_ms: now + 1,
+            ..root.clone()
+        });
+        app.add_annotation(LineAnnotation {
+            id: "reply".to_string(),
+            parent_id: Some("root".to_string()),
+            author: crate::app::AnnotationAuthor::User,
+            created_at_ms: now + 2,
+            message: "Added a regression test for that path.".to_string(),
+            ..root.clone()
+        });
+        app.add_annotation(LineAnnotation {
+            id: "nested".to_string(),
+            parent_id: Some("reply".to_string()),
+            created_at_ms: now + 3,
+            ..root
+        });
+        let lines = insert_annotation_lines(
+            number_detail_lines(request_detail_lines(&app), None),
+            &app,
+            Focus::RequestSection,
+            100,
+        );
+        let titles = [2, 7, 12, 17].map(|index| line_text(&lines[index]));
+        assert!(titles[0].contains("Agent · now"));
+        assert!(!titles[0].contains("╰─"));
+        assert!(titles[2].contains("You · now"));
+        let left = titles[0].find('╭').unwrap();
+        assert!(titles.iter().all(|title| title.find('╭') == Some(left)));
+        assert!(titles.iter().all(|title| !title.contains("╰─")));
+        assert!(line_text(&lines[14]).contains("Added a regression test for that path."));
+        assert!(lines.iter().all(
+            |line| !line_text(line).contains("Reply ·") && !line_text(line).contains("e Edit")
+        ));
+    }
+
+    #[test]
+    fn long_thread_rows_remain_visible_and_clickable_while_scrolling() {
+        let mut app = app_with_request();
+        let root = annotation("note-0", Focus::RequestSection, 2, 2, "root", vec![]);
+        app.add_annotation(root.clone());
+        for index in 1..12 {
+            app.add_annotation(LineAnnotation {
+                id: format!("note-{index}"),
+                parent_id: Some("note-0".to_string()),
+                created_at_ms: index,
+                message: format!("Reply number {index}"),
+                ..root.clone()
+            });
+        }
+        let area = Rect::new(0, 0, 80, 8);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        for index in 1..12 {
+            app.request_details_scroll = 2 + index * ANNOTATION_CARD_HEIGHT;
+            terminal
+                .draw(|frame| draw_request_details(frame, area, &app))
+                .unwrap();
+            let message = (0..area.width)
+                .map(|x| terminal.backend().buffer().get(x, 3).symbol())
+                .collect::<String>();
+            assert!(
+                message.contains(&format!("Reply number {index}")),
+                "{message}"
+            );
+            assert_eq!(
+                clicked_detail_row(
+                    area,
+                    10,
+                    3,
+                    app.request_details_scroll,
+                    &request_detail_lines(&app),
+                    &detail_annotations(&app, Focus::RequestSection)
+                ),
+                Some(ClickedDetail::Annotation(format!("note-{index}")))
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_reply_editor_follows_flat_list_and_edit_stays_in_place() {
+        let mut app = app_with_request();
+        let root = annotation("root", Focus::RequestSection, 2, 2, "root", vec![]);
+        app.add_annotation(root.clone());
+        for index in 1..10 {
+            app.add_annotation(LineAnnotation {
+                id: format!("reply-{index}"),
+                parent_id: Some("root".to_string()),
+                created_at_ms: index,
+                ..root.clone()
+            });
+        }
+        app.start_replying_to_annotation("root");
+        let position = 2 + 10 * ANNOTATION_CARD_HEIGHT;
+        assert_eq!(
+            annotation_editor_position(&app, Focus::RequestSection),
+            Some(position)
+        );
+        let area = Rect::new(0, 0, 120, 30);
+        app.request_details_scroll = annotation_editor_scroll(area, &app).unwrap().1;
+        assert!(app.request_details_scroll > 2);
+        let popup = annotation_dialog_area(screen_chunks(area, &app)[1], &app).unwrap();
+        let (_, request, _) = normal_panels(area, &app);
+        assert!(popup.y > request.y && popup.bottom() < request.bottom());
+        let lines = insert_annotation_lines(
+            number_detail_lines(request_detail_lines(&app), None),
+            &app,
+            Focus::RequestSection,
+            80,
+        );
+        assert!(lines[position..position + ANNOTATION_EDITOR_HEIGHT]
+            .iter()
+            .all(|line| line_text(line).is_empty()));
+        app.cancel_editing();
+        app.start_editing_annotation("reply-5");
+        assert_eq!(
+            annotation_editor_position(&app, Focus::RequestSection),
+            Some(2 + 5 * ANNOTATION_CARD_HEIGHT)
+        );
+        app.remove_annotation("reply-5");
+        app.request_details_scroll = annotation_editor_scroll(area, &app).unwrap().1;
+        assert!(annotation_dialog_area(screen_chunks(area, &app)[1], &app).is_some());
+        assert_eq!(app.annotation_edit_id.as_deref(), Some("reply-5"));
+    }
+
+    #[test]
+    fn deep_unicode_cards_fit_even_tiny_panels() {
+        let note = annotation(
+            "root",
+            Focus::RequestSection,
+            2,
+            2,
+            "界界界界 αβγδ long note",
+            vec![],
+        );
+        for width in 0..80 {
+            let card = annotation_card_lines(&note, 5, width);
+            assert!(
+                card.iter().all(|line| line.width() <= width),
+                "width {width}"
+            );
+        }
+    }
+    #[test]
+    fn searches_reuse_annotation_indicators_and_clearing_restores_notes() {
+        let mut app = app_with_request();
+        app.add_annotation(annotation(
+            "note",
+            Focus::RequestSection,
+            2,
+            2,
+            "Note",
+            vec![],
+        ));
+        app.add_annotation(annotation(
+            "response-note",
+            Focus::ResponseSection,
+            4,
+            4,
+            "Response note",
+            vec![],
+        ));
+        assert_eq!(exchange_marker_count(&app, 0), 2);
+        assert_eq!(detail_marker_lines(&app, Focus::RequestSection), vec![2]);
+        assert_eq!(detail_marker_lines(&app, Focus::ResponseSection), vec![4]);
+        app.set_search_results(
+            "query".to_string(),
+            vec![search_hit(0, Focus::RequestSection, DetailTab::Body, 8)],
+        );
+        assert_eq!(exchange_marker_count(&app, 0), 1);
+        assert_eq!(detail_marker_lines(&app, Focus::RequestSection), vec![8]);
+        assert!(detail_marker_lines(&app, Focus::ResponseSection).is_empty());
+        app.set_search_results("no matches".to_string(), vec![]);
+        assert_eq!(exchange_marker_count(&app, 0), 0);
+        assert!(detail_marker_lines(&app, Focus::RequestSection).is_empty());
+        app.clear_search();
+        assert_eq!(exchange_marker_count(&app, 0), 2);
+        assert_eq!(detail_marker_lines(&app, Focus::RequestSection), vec![2]);
+        assert_eq!(detail_marker_lines(&app, Focus::ResponseSection), vec![4]);
+        app.request_tab = 0;
+        assert!(detail_marker_lines(&app, Focus::RequestSection).is_empty());
     }
 }

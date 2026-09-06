@@ -27,8 +27,8 @@ mod stdio;
 mod ui;
 
 use app::{
-    App, AppMode, EditorMode, EditorMotion, EditorOperator, EditorTarget, LineAnnotation, Overlay,
-    SearchHit, TextEditor,
+    AnnotationAuthor, App, AppMode, EditorMode, EditorMotion, EditorOperator, EditorTarget,
+    LineAnnotation, Overlay, SearchHit, TextEditor,
 };
 use control::{ControlAction, ControlCommand, ControlError, PendingDecision};
 use history::HistoryStore;
@@ -603,6 +603,7 @@ async fn handle_control_command(
             }
         }
         ControlAction::AnnotateLines {
+            author,
             focus,
             exchange_index,
             tab,
@@ -618,7 +619,8 @@ async fn handle_control_command(
             end_line,
             &message,
         ) {
-            Ok(annotation) => {
+            Ok(mut annotation) => {
+                annotation.author = author;
                 let value = control::annotation(&annotation);
                 match persist_annotation(app, history, annotation) {
                     Ok(()) => Ok(serde_json::json!({
@@ -630,6 +632,19 @@ async fn handle_control_command(
             }
             Err(error) => Err(error),
         },
+        ControlAction::GetAnnotations => Ok(control::annotations(app)),
+        ControlAction::ReplyAnnotation {
+            id,
+            message,
+            author,
+        } => build_reply(app, &id, &message, author).and_then(|annotation| {
+            let value = control::annotation(&annotation);
+            persist_annotation(app, history, annotation)?;
+            Ok(serde_json::json!({"annotation": value, "state": control::state(app)}))
+        }),
+        ControlAction::UpdateAnnotation { id, message } => {
+            update_annotation(app, history, &id, &message).map(|_| control::state(app))
+        }
         ControlAction::ClearLineSelection => {
             app.clear_line_selection();
             Ok(control::state(app))
@@ -647,7 +662,8 @@ async fn handle_control_command(
                     "request and response scrolling requires normal mode",
                 ))
             } else {
-                let total_lines = ui::detail_line_count(app, focus).unwrap_or(0);
+                let total_lines = ui::detail_line_count(app, focus).unwrap_or(0)
+                    + app.visible_annotations(focus).count() * ui::ANNOTATION_CARD_HEIGHT;
                 app.scroll_panel_lines(focus, lines, total_lines);
                 Ok(control::state(app))
             }
@@ -754,32 +770,24 @@ fn center_detail_range(
         })
         .unwrap_or(source_range_end);
     let display_total = total_lines + annotations.len() * ui::ANNOTATION_CARD_HEIGHT;
-    let range_center = range_start + range_end.saturating_sub(range_start) / 2;
+    let range_center = if annotation_id.is_some() {
+        range_end
+    } else {
+        range_start + range_end.saturating_sub(range_start) / 2
+    };
     let viewport_center = visible_lines.saturating_sub(1) / 2;
     let display_scroll = range_center
         .saturating_sub(viewport_center)
         .min(display_total.saturating_sub(visible_lines));
-    let source_scroll = (0..total_lines)
-        .take_while(|source| {
-            *source
-                + annotations
-                    .iter()
-                    .filter(|annotation| annotation.end_line <= *source)
-                    .count()
-                    * ui::ANNOTATION_CARD_HEIGHT
-                <= display_scroll
-        })
-        .last()
-        .unwrap_or(0);
     let scroll = match panel {
         app::Focus::RequestSection => &mut app.request_details_scroll,
         app::Focus::ResponseSection => &mut app.response_details_scroll,
         app::Focus::MessageList | app::Focus::StatusHeader => return,
     };
-    if *scroll == source_scroll {
+    if *scroll == display_scroll {
         return;
     }
-    *scroll = source_scroll;
+    *scroll = display_scroll;
     app.mark_changed();
 }
 
@@ -823,6 +831,9 @@ fn build_annotation(
         })?;
 
     Ok(LineAnnotation {
+        parent_id: None,
+        author: AnnotationAuthor::Agent,
+        created_at_ms: annotation_timestamp_ms(),
         id: Uuid::new_v4().to_string(),
         exchange_index,
         panel,
@@ -998,7 +1009,7 @@ fn annotate_visual_selection(
         .filter(|_| app.visual_selection_active)
         .cloned()
         .ok_or_else(|| ControlError::invalid_params("No visual selection"))?;
-    let annotation = build_annotation(
+    let mut annotation = build_annotation(
         app,
         selection.panel,
         Some(app.selected_exchange),
@@ -1007,10 +1018,74 @@ fn annotate_visual_selection(
         selection.end_line,
         message,
     )?;
+    annotation.author = AnnotationAuthor::User;
     persist_annotation(app, history, annotation)?;
     app.visual_selection_active = false;
     app.mark_changed();
     Ok(())
+}
+
+fn save_annotation_draft(
+    app: &mut App,
+    history: &HistoryStore,
+    area: ratatui::layout::Rect,
+) -> Result<(), ControlError> {
+    let message = app.input_buffer.clone();
+    let target = if let Some(id) = app.annotation_edit_id.clone() {
+        update_annotation(app, history, &id, &message)?;
+        Some(id)
+    } else if let Some(parent) = app.annotation_reply_id.clone() {
+        let note = build_reply(app, &parent, &message, AnnotationAuthor::User)?;
+        let id = note.id.clone();
+        persist_annotation(app, history, note)?;
+        Some(id)
+    } else {
+        annotate_visual_selection(app, history, area, &message)?;
+        None
+    };
+    app.cancel_editing();
+    if let Some(id) = target {
+        app.focus_annotation(&id);
+        center_active_annotation(app, area);
+    }
+    app.set_notice("Annotation saved");
+    Ok(())
+}
+
+fn annotation_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn build_reply(
+    app: &App,
+    id: &str,
+    message: &str,
+    author: AnnotationAuthor,
+) -> Result<LineAnnotation, ControlError> {
+    let message = annotation_message(message)?;
+    if app.app_mode != AppMode::Normal {
+        return Err(ControlError::invalid_params(
+            "line annotations require normal mode",
+        ));
+    }
+    let parent = app
+        .annotations
+        .iter()
+        .find(|note| note.id == id)
+        .ok_or_else(|| ControlError::invalid_params(format!("Annotation not found: {id}")))?;
+    Ok(LineAnnotation {
+        id: Uuid::new_v4().to_string(),
+        parent_id: Some(parent.id.clone()),
+        author,
+        created_at_ms: annotation_timestamp_ms(),
+        message: message.to_string(),
+        ..parent.clone()
+    })
 }
 
 fn persist_annotation(
@@ -1542,6 +1617,54 @@ async fn run_attached_tui(control_url: &str) -> Result<()> {
     result
 }
 
+fn handle_attached_mouse(app: &mut App, mouse: MouseEvent, area: ratatui::layout::Rect) {
+    if app.overlay != Overlay::None || app.input_mode != app::InputMode::Normal {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::Moved => {
+            app.set_annotation_hover(ui::annotation_hover(area, app, mouse.column, mouse.row));
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if let Some(focus) = ui::panel_focus(area, app, mouse.column, mouse.row) {
+                app.set_focus(focus);
+                scroll_panel(
+                    app,
+                    focus,
+                    mouse.kind == MouseEventKind::ScrollDown,
+                    ui::panel_visible_lines(area, app, focus),
+                );
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            match ui::mouse_action(area, app, mouse.column, mouse.row) {
+                Some(ui::MouseAction::SelectAnnotation { id }) => {
+                    app.focus_annotation(&id);
+                    center_active_annotation(app, area);
+                }
+                Some(ui::MouseAction::AddAnnotation { panel, line }) => {
+                    start_line_annotation(app, panel, line, area)
+                }
+                Some(ui::MouseAction::SelectLine { panel, line }) => {
+                    app.finish_visual_selection();
+                    let (anchor, start, end) = app.line_selection_range(
+                        panel,
+                        line,
+                        mouse.modifiers.contains(KeyModifiers::SHIFT),
+                    );
+                    if let Some(text) = ui::detail_line_text(app, panel, start, end) {
+                        app.select_lines_from_anchor(panel, anchor, start, end, text);
+                    }
+                }
+                Some(ui::MouseAction::SelectExchange(index)) => app.select_exchange(index),
+                Some(ui::MouseAction::Focus(focus)) => app.set_focus(focus),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn run_attached_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     client: &attach::ControlClient,
@@ -1579,6 +1702,7 @@ async fn run_attached_app(
         should_draw |= app.clear_expired_notice();
         should_draw |= app.revision() != last_drawn_revision;
         if should_draw {
+            position_annotation_editor(app, terminal.size()?);
             terminal.draw(|frame| ui::draw(frame, app))?;
             last_drawn_revision = app.revision();
             should_draw = false;
@@ -1589,6 +1713,11 @@ async fn run_attached_app(
         let input = event::read()?;
         if matches!(input, Event::Resize(..)) {
             should_draw = true;
+        }
+        if let Event::Mouse(mouse) = input {
+            handle_attached_mouse(app, mouse, terminal.size()?);
+            should_draw = true;
+            continue;
         }
         let Event::Key(key) = input else {
             continue;
@@ -1608,6 +1737,27 @@ async fn run_attached_app(
         if app.overlay == Overlay::Prefix {
             match key.code {
                 KeyCode::Char('?') => app.show_help(),
+                KeyCode::Char('a')
+                    if app.visual_selection_active && app.line_selection.is_some() =>
+                {
+                    app.close_overlay();
+                    app.start_annotating_selection();
+                    position_annotation_editor(app, terminal.size()?);
+                }
+                KeyCode::Char('d') => {
+                    app.close_overlay();
+                    if let Some(id) = app.annotation_to_delete().map(|note| note.id.clone()) {
+                        match client.remove_annotation(&id).await {
+                            Ok(()) => {
+                                app.remove_annotation(&id);
+                                app.set_notice("Annotation deleted");
+                            }
+                            Err(error) => app.set_notice(format!("Error: {error}")),
+                        }
+                    } else {
+                        app.set_notice("No annotation under cursor");
+                    }
+                }
                 KeyCode::Char('z') => app.set_panel_fullscreen(!app.panel_fullscreen),
                 KeyCode::Char('y') => copy_focused_panel(terminal, app)?,
                 KeyCode::Char('p') => {
@@ -1660,6 +1810,36 @@ async fn run_attached_app(
             }
             continue;
         }
+        if app.input_mode == app::InputMode::AnnotatingSelection {
+            match key.code {
+                KeyCode::Enter => match client.save_annotation(app).await {
+                    Ok(id) => {
+                        app.cancel_editing();
+                        app.visual_selection_active = false;
+                        match client
+                            .snapshot(app)
+                            .await
+                            .and_then(|snapshot| snapshot.apply(app))
+                        {
+                            Ok(next_revision) => {
+                                *revision = next_revision;
+                                app.focus_annotation(&id);
+                                center_active_annotation(app, terminal.size()?);
+                            }
+                            Err(error) => {
+                                app.set_notice(format!("Saved, but refresh failed: {error}"))
+                            }
+                        }
+                    }
+                    Err(error) => app.set_notice(format!("Error: {error}")),
+                },
+                KeyCode::Esc => app.cancel_editing(),
+                KeyCode::Backspace => app.handle_backspace(),
+                KeyCode::Char(character) => app.handle_input_char(character),
+                _ => {}
+            }
+            continue;
+        }
         if app.input_mode == app::InputMode::Searching {
             match key.code {
                 KeyCode::Enter => apply_search(app, terminal.size()?),
@@ -1676,6 +1856,9 @@ async fn run_attached_app(
         }
 
         match key.code {
+            KeyCode::Char('e') if app.app_mode == AppMode::Normal => {
+                start_annotation_action(app, false, terminal.size()?);
+            }
             KeyCode::Esc => {
                 if app.search_active() {
                     app.clear_search();
@@ -1771,11 +1954,13 @@ async fn run_attached_app(
             KeyCode::Char('[') if app.app_mode == AppMode::Normal => {
                 if !navigate_search(app, terminal.size()?, false) {
                     app.focus_previous_annotation();
+                    center_active_annotation(app, terminal.size()?);
                 }
             }
             KeyCode::Char(']') if app.app_mode == AppMode::Normal => {
                 if !navigate_search(app, terminal.size()?, true) {
                     app.focus_next_annotation();
+                    center_active_annotation(app, terminal.size()?);
                 }
             }
             KeyCode::Char('/') => app.start_searching(),
@@ -1979,6 +2164,7 @@ async fn run_app(
             || received_request_result
             || received_control_command
         {
+            position_annotation_editor(&mut app, terminal.size()?);
             terminal.draw(|f| ui::draw(f, &app))?;
             should_draw = false;
         }
@@ -2112,31 +2298,12 @@ async fn run_app(
                     app::InputMode::AnnotatingSelection => {
                         match key.code {
                             KeyCode::Enter => {
-                                let message = app.input_buffer.clone();
-                                let annotation_id = app.annotation_edit_id.clone();
-                                let result = match annotation_id.as_deref() {
-                                    Some(id) => {
-                                        update_annotation(&mut app, &runtime.history, id, &message)
-                                    }
-                                    None => annotate_visual_selection(
-                                        &mut app,
-                                        &runtime.history,
-                                        terminal.size()?,
-                                        &message,
-                                    ),
-                                };
-                                match result {
-                                    Ok(()) => {
-                                        app.cancel_editing();
-                                        app.set_notice(if annotation_id.is_some() {
-                                            "Annotation updated".to_string()
-                                        } else {
-                                            "Annotation added".to_string()
-                                        });
-                                    }
-                                    Err(error) => {
-                                        app.set_notice(format!("Error: {}", error.message));
-                                    }
+                                if let Err(error) = save_annotation_draft(
+                                    &mut app,
+                                    &runtime.history,
+                                    terminal.size()?,
+                                ) {
+                                    app.set_notice(format!("Error: {}", error.message));
                                 }
                             }
                             KeyCode::Esc => app.cancel_editing(),
@@ -2257,6 +2424,9 @@ async fn run_app(
                 }
 
                 match key.code {
+                    KeyCode::Char('e') if app.app_mode == AppMode::Normal => {
+                        start_annotation_action(&mut app, false, terminal.size()?);
+                    }
                     KeyCode::Esc => {
                         if app.search_active() {
                             app.clear_search();
@@ -2413,11 +2583,13 @@ async fn run_app(
                     KeyCode::Char('[') if app.app_mode == AppMode::Normal => {
                         if !navigate_search(&mut app, terminal.size()?, false) {
                             app.focus_previous_annotation();
+                            center_active_annotation(&mut app, terminal.size()?);
                         }
                     }
                     KeyCode::Char(']') if app.app_mode == AppMode::Normal => {
                         if !navigate_search(&mut app, terminal.size()?, true) {
                             app.focus_next_annotation();
+                            center_active_annotation(&mut app, terminal.size()?);
                         }
                     }
                     KeyCode::Char('/') => {
@@ -2938,15 +3110,49 @@ async fn handle_mouse_event(
             app.select_lines_from_anchor(panel, anchor, start_line, end_line, text);
         }
         ui::MouseAction::SelectAnnotation { id } => {
-            if app.start_editing_annotation(&id) {
-                position_annotation_editor(app, area);
-            }
+            app.focus_annotation(&id);
+            center_active_annotation(app, area);
         }
         ui::MouseAction::SelectSession(_) | ui::MouseAction::CloseOverlay => {}
         ui::MouseAction::Focus(focus) => app.set_focus(focus),
     }
 
     Ok(())
+}
+
+fn center_active_annotation(app: &mut App, area: ratatui::layout::Rect) {
+    let Some(note) = app
+        .active_annotation_id
+        .as_ref()
+        .and_then(|id| app.annotations.iter().find(|note| &note.id == id))
+        .cloned()
+    else {
+        return;
+    };
+    let total = ui::detail_line_count(app, note.panel).unwrap_or(0);
+    center_detail_range(
+        app,
+        area,
+        note.panel,
+        note.start_line,
+        note.end_line,
+        total,
+        Some(&note.id),
+    );
+}
+
+fn start_annotation_action(app: &mut App, reply: bool, area: ratatui::layout::Rect) {
+    let Some(id) = app.annotation_to_delete().map(|note| note.id.clone()) else {
+        return;
+    };
+    let started = if reply {
+        app.start_replying_to_annotation(&id)
+    } else {
+        app.start_editing_annotation(&id)
+    };
+    if started {
+        position_annotation_editor(app, area);
+    }
 }
 
 fn start_line_annotation(
@@ -2980,6 +3186,21 @@ fn position_annotation_editor(app: &mut App, area: ratatui::layout::Rect) {
     app.mark_changed();
 }
 
+fn detail_source_offset(app: &App, panel: app::Focus, mut display_row: usize) -> usize {
+    let mut notes = app.visible_annotations(panel).collect::<Vec<_>>();
+    notes.sort_by_key(|note| note.end_line);
+    for note in notes {
+        if display_row < note.end_line {
+            return display_row;
+        }
+        if display_row < note.end_line + ui::ANNOTATION_CARD_HEIGHT {
+            return note.end_line.saturating_sub(1);
+        }
+        display_row -= ui::ANNOTATION_CARD_HEIGHT;
+    }
+    display_row
+}
+
 fn scroll_panel(app: &mut App, focus: app::Focus, down: bool, visible_lines: usize) {
     const LINES_PER_TICK: usize = 3;
 
@@ -3007,13 +3228,13 @@ fn scroll_panel(app: &mut App, focus: app::Focus, down: bool, visible_lines: usi
     }
 
     let max_scroll = match (app.app_mode, focus) {
-        (AppMode::Normal, app::Focus::RequestSection) => ui::detail_max_source_scroll(
+        (AppMode::Normal, app::Focus::RequestSection) => ui::detail_max_scroll(
             app,
             focus,
             app.get_request_details_content_lines(),
             visible_lines,
         ),
-        (AppMode::Normal, app::Focus::ResponseSection) => ui::detail_max_source_scroll(
+        (AppMode::Normal, app::Focus::ResponseSection) => ui::detail_max_scroll(
             app,
             focus,
             app.get_response_details_content_lines(),
@@ -3043,7 +3264,8 @@ fn scroll_panel(app: &mut App, focus: app::Focus, down: bool, visible_lines: usi
         (previous_scroll, *scroll)
     };
     if previous_scroll != current_scroll {
-        let moved = current_scroll.abs_diff(previous_scroll);
+        let moved = detail_source_offset(app, focus, current_scroll)
+            .abs_diff(detail_source_offset(app, focus, previous_scroll));
         match (app.app_mode, focus, down) {
             (AppMode::Normal, app::Focus::RequestSection, true) => {
                 app.request_details_cursor_line = app
@@ -3080,7 +3302,32 @@ fn move_focused_detail_cursor(app: &mut App, lines: i64, area: ratatui::layout::
         return;
     };
     let visible_lines = ui::panel_visible_lines(area, app, panel);
+    let previous_scroll = match panel {
+        app::Focus::RequestSection => app.request_details_scroll,
+        _ => app.response_details_scroll,
+    };
     app.move_detail_cursor(panel, lines, total_lines, visible_lines);
+    let annotations = app.visible_annotations(panel).collect::<Vec<_>>();
+    if !annotations.is_empty() {
+        let cursor = app.detail_cursor_line(panel).unwrap_or(1).saturating_sub(1);
+        let display_row = cursor
+            + annotations
+                .iter()
+                .filter(|note| note.end_line <= cursor)
+                .count()
+                * ui::ANNOTATION_CARD_HEIGHT;
+        let scroll = if display_row < previous_scroll {
+            display_row
+        } else if display_row >= previous_scroll + visible_lines {
+            display_row.saturating_sub(visible_lines.saturating_sub(1))
+        } else {
+            previous_scroll
+        };
+        match panel {
+            app::Focus::RequestSection => app.request_details_scroll = scroll,
+            _ => app.response_details_scroll = scroll,
+        }
+    }
     extend_visual_selection(app, panel);
 }
 
@@ -3316,6 +3563,9 @@ mod tests {
         response.result = Some(serde_json::json!({"receipt": "needle-result"}));
         app.add_message(response);
         app.add_annotation(LineAnnotation {
+            parent_id: None,
+            author: crate::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: "note".to_string(),
             exchange_index: 0,
             panel: app::Focus::ResponseSection,
@@ -3757,6 +4007,9 @@ mod tests {
         let text = ui::detail_line_text(&app, app::Focus::RequestSection, 2, 3).unwrap();
         app.reveal_lines(app::Focus::RequestSection, 2, 3, text.clone());
         app.add_annotation(LineAnnotation {
+            parent_id: None,
+            author: crate::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: "annotation-1".to_string(),
             exchange_index: 0,
             panel: app::Focus::RequestSection,
@@ -3781,11 +4034,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_line_reference_is_centered_in_the_panel() {
+    fn selected_annotation_is_centered_in_the_panel() {
         let mut app = App::new();
         let area = ratatui::layout::Rect::new(0, 0, 120, 50);
         let visible_lines = ui::panel_visible_lines(area, &app, app::Focus::ResponseSection);
         app.add_annotation(LineAnnotation {
+            parent_id: None,
+            author: crate::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: "annotation-1".to_string(),
             exchange_index: 0,
             panel: app::Focus::ResponseSection,
@@ -3808,7 +4064,7 @@ mod tests {
 
         let display_scroll = app.response_details_scroll;
         let viewport_center = display_scroll + visible_lines.saturating_sub(1) / 2;
-        assert_eq!(viewport_center, 19);
+        assert_eq!(viewport_center, 21 + ui::ANNOTATION_CARD_HEIGHT / 2);
     }
 
     #[tokio::test]
@@ -3959,6 +4215,7 @@ mod tests {
                     start_line: 2,
                     end_line: 2,
                     message: "Inspect this method".to_string(),
+                    author: AnnotationAuthor::Agent,
                 },
                 reply,
             },
@@ -4070,5 +4327,111 @@ mod tests {
         assert_eq!(state["selectedExchange"], 0);
         assert_eq!(state["tabs"]["request"], "headers");
         assert_eq!(state["lineSelection"]["text"], "Method: method_9");
+    }
+
+    #[test]
+    fn reply_and_edit_drafts_persist_without_losing_thread_metadata() {
+        let mut history = HistoryStore::in_memory().unwrap();
+        let mut app = App::new();
+        app.session = Some(
+            history
+                .create_session(Some("thread"), "http://node")
+                .unwrap(),
+        );
+        app.add_message(rpc_message(1, app::MessageDirection::Request));
+        let root = build_annotation(
+            &app,
+            app::Focus::RequestSection,
+            None,
+            None,
+            2,
+            2,
+            "Check this method",
+        )
+        .unwrap();
+        let root_id = root.id.clone();
+        persist_annotation(&mut app, &history, root).unwrap();
+        app.focus_annotation(&root_id);
+        let area = ratatui::layout::Rect::new(0, 0, 120, 30);
+        start_annotation_action(&mut app, true, area);
+        assert_eq!(app.annotation_reply_id.as_ref(), Some(&root_id));
+        app.input_buffer = "Added a regression test.".to_string();
+        save_annotation_draft(&mut app, &history, area).unwrap();
+        let reply = app.annotations[1].clone();
+        assert_eq!(reply.author, AnnotationAuthor::User);
+        assert_eq!(reply.parent_id.as_ref(), Some(&root_id));
+        assert_eq!((reply.start_line, reply.end_line), (2, 2));
+        assert!(reply.created_at_ms > 0);
+        assert_eq!(app.active_annotation_id.as_ref(), Some(&reply.id));
+        assert_eq!(app.input_mode, app::InputMode::Normal);
+        start_annotation_action(&mut app, false, area);
+        app.input_buffer = "Updated regression test.".to_string();
+        save_annotation_draft(&mut app, &history, area).unwrap();
+        assert_eq!(
+            app.annotations[1],
+            LineAnnotation {
+                message: "Updated regression test.".to_string(),
+                ..reply.clone()
+            }
+        );
+        assert_eq!(
+            history
+                .annotations(&app.session.as_ref().unwrap().id)
+                .unwrap()
+                .len(),
+            2
+        );
+        app.start_replying_to_annotation(&reply.id);
+        app.input_buffer = "Keep this draft".to_string();
+        remove_annotation(&mut app, &history, &reply.id).unwrap();
+        assert!(save_annotation_draft(&mut app, &history, area).is_err());
+        assert_eq!(app.input_buffer, "Keep this draft");
+        assert_eq!(app.annotation_reply_id.as_ref(), Some(&reply.id));
+    }
+
+    #[test]
+    fn agent_replies_inherit_references_without_moving_the_viewport() {
+        let mut history = HistoryStore::in_memory().unwrap();
+        let mut app = App::new();
+        app.session = Some(
+            history
+                .create_session(Some("thread"), "http://node")
+                .unwrap(),
+        );
+        app.add_message(rpc_message(1, app::MessageDirection::Request));
+        let root = build_annotation(
+            &app,
+            app::Focus::RequestSection,
+            None,
+            None,
+            2,
+            3,
+            "Check this range",
+        )
+        .unwrap();
+        persist_annotation(&mut app, &history, root.clone()).unwrap();
+        app.request_details_scroll = 4;
+        let before = control::state(&app);
+        let reply = build_reply(&app, &root.id, "I checked it.", AnnotationAuthor::Agent).unwrap();
+        assert_eq!(reply.text, root.text);
+        assert_eq!(reply.tab, root.tab);
+        persist_annotation(&mut app, &history, reply).unwrap();
+        let after = control::state(&app);
+        for key in [
+            "focus",
+            "scroll",
+            "selectedExchange",
+            "tabs",
+            "lineSelection",
+            "activeAnnotationId",
+        ] {
+            assert_eq!(before[key], after[key]);
+        }
+        for invalid in ["", "  ", "line\nbreak"] {
+            assert!(build_reply(&app, &root.id, invalid, AnnotationAuthor::Agent).is_err());
+        }
+        assert!(build_reply(&app, "missing", "Valid", AnnotationAuthor::Agent).is_err());
+        app.app_mode = AppMode::Paused;
+        assert!(build_reply(&app, &root.id, "Valid", AnnotationAuthor::Agent).is_err());
     }
 }

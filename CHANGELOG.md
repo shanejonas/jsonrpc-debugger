@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-06
+
+### Fixed
+
+- Restore annotation diamonds and scrollbar markers in the request list and detail panels. Active searches reuse those indicators for matches; clearing search restores annotation markers.
+
+### Added
+
+- Persistent annotations displayed as a flat list, with author and age headers and editing in driver and attached TUIs.
+- `debugger.getAnnotations`, `debugger.replyAnnotation`, and `debugger.updateAnnotation`; annotation creation accepts an optional author (default `agent`).
+
+### Changed
+
+- History schema version 4 stores annotation parent IDs and authors; existing notes retain their original timestamps and receive author `unknown`. Older binaries reject version 4 databases.
+- Deleting a note preserves its replies by reparenting them. Attached snapshots include the full annotation list so edits and deletions synchronize.
+- Detail panels scroll through individual card rows, including long threads. Click a card to select it, then use `e` to edit. Cards omit inline action labels and nested indentation.
+
 ## [0.6.0] - 2026-09-05
 
 ### Added

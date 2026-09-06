@@ -2,7 +2,7 @@
   "openrpc": "1.3.2",
   "info": {
     "title": "jsonrpc-debugger control plane",
-    "version": "0.6.0"
+    "version": "0.7.0"
   },
   "servers": [
     {
@@ -26,7 +26,7 @@
     {
       "name": "debugger.getUpdates",
       "summary": "Read new exchanges and completed outstanding requests in one consistent snapshot",
-      "description": "Omit sessionId for a full initial snapshot. Otherwise pass the previous state.session.id, nextIndex, and the indexes of requests still awaiting responses. Changed sessions or cursors beyond current history return reset=true and full history. Other updates contain completed pending exchanges followed by new exchanges, ordered by index. Apply replacements by index and append new entries. State and pending interception requests come from the same snapshot.",
+      "description": "Omit sessionId for a full initial snapshot. Otherwise pass the previous state.session.id, nextIndex, and the indexes of requests still awaiting responses. Changed sessions or cursors beyond current history return reset=true and full history. Other updates contain completed pending exchanges followed by new exchanges, ordered by index. Apply replacements by index and append new entries. State, the full annotation list, and pending interception requests come from the same snapshot. Replace local annotations on every update to apply replies, edits, and deletions.",
       "params": [
         { "name": "sessionId", "required": false, "schema": { "type": "string" } },
         { "name": "nextIndex", "required": false, "schema": { "type": "integer", "minimum": 0 } },
@@ -36,17 +36,18 @@
         "name": "result",
         "schema": {
           "type": "object",
-          "required": ["state", "reset", "nextIndex", "exchanges", "pending"],
+          "required": ["state", "reset", "nextIndex", "exchanges", "annotations", "pending"],
           "properties": {
             "state": { "type": "object" },
             "reset": { "type": "boolean" },
             "nextIndex": { "type": "integer", "minimum": 0 },
             "exchanges": { "type": "array", "items": { "type": "object", "required": ["index", "transport"], "properties": { "index": { "type": "integer", "minimum": 0 }, "transport": { "type": "string" }, "request": { "type": "object" }, "response": { "type": "object" } } } },
+            "annotations": { "type": "array", "items": { "$ref": "#/components/schemas/Annotation" } },
             "pending": { "type": "array", "items": { "type": "object" } }
           }
         }
       },
-      "examples": [{ "name": "Initial snapshot", "params": [], "result": { "name": "result", "value": { "state": {}, "reset": true, "nextIndex": 0, "exchanges": [], "pending": [] } } }]
+      "examples": [{ "name": "Initial snapshot", "params": [], "result": { "name": "result", "value": { "state": {}, "reset": true, "nextIndex": 0, "exchanges": [], "annotations": [], "pending": [] } } }]
     },
     {
       "name": "debugger.waitForChange",
@@ -205,13 +206,40 @@
         { "name": "endLine", "required": false, "schema": { "type": "integer", "minimum": 1 } },
         { "name": "message", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 160 } },
         { "name": "exchangeIndex", "required": false, "schema": { "type": "integer", "minimum": 0 } },
-        { "name": "tab", "required": false, "schema": { "type": "string", "enum": ["headers", "body"] } }
+        { "name": "tab", "required": false, "schema": { "type": "string", "enum": ["headers", "body"] } },
+        { "name": "author", "required": false, "schema": { "type": "string", "enum": ["agent", "user"], "default": "agent" } }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "#/components/schemas/AnnotationResult" } }
+    },
+    {
+      "name": "debugger.getAnnotations",
+      "summary": "Read all annotations in the active session, ordered by thread",
+      "params": [],
+      "result": { "name": "result", "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Annotation" } } }
+    },
+    {
+      "name": "debugger.replyAnnotation",
+      "summary": "Persist a reply inheriting its parent annotation's source reference",
+      "description": "Preserves the visible TUI state. Author defaults to agent. Requires normal mode and an existing parent in the active session.",
+      "params": [
+        { "name": "annotationId", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "message", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 160 } },
+        { "name": "author", "required": false, "schema": { "type": "string", "enum": ["agent", "user"], "default": "agent" } }
+      ],
+      "result": { "name": "result", "schema": { "$ref": "#/components/schemas/AnnotationResult" } }
+    },
+    {
+      "name": "debugger.updateAnnotation",
+      "summary": "Edit an annotation's message while preserving its author, time, and thread",
+      "params": [
+        { "name": "annotationId", "required": true, "schema": { "type": "string", "minLength": 1 } },
+        { "name": "message", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 160 } }
       ],
       "result": { "name": "result", "schema": { "type": "object" } }
     },
     {
       "name": "debugger.removeAnnotation",
-      "summary": "Delete one annotation by ID",
+      "summary": "Delete one annotation by ID, reparenting its replies to its parent or the thread root",
       "params": [
         { "name": "annotationId", "required": true, "schema": { "type": "string", "minLength": 1 } }
       ],
@@ -271,6 +299,27 @@
   ],
   "components": {
     "schemas": {
+      "Annotation": {
+        "type": "object",
+        "required": ["id", "parentId", "author", "createdAtMs", "exchangeIndex", "panel", "tab", "startLine", "endLine", "message", "text"],
+        "properties": {
+          "id": { "type": "string" },
+          "parentId": { "type": ["string", "null"] },
+          "author": { "type": "string", "enum": ["user", "agent", "unknown"] },
+          "createdAtMs": { "type": "integer", "minimum": 0 },
+          "exchangeIndex": { "type": "integer", "minimum": 0 },
+          "panel": { "type": "string", "enum": ["request", "response"] },
+          "tab": { "type": "string", "enum": ["headers", "body"] },
+          "startLine": { "type": "integer", "minimum": 1 },
+          "endLine": { "type": "integer", "minimum": 1 },
+          "message": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      },
+      "AnnotationResult": {
+        "type": "object", "required": ["annotation", "state"],
+        "properties": { "annotation": { "$ref": "#/components/schemas/Annotation" }, "state": { "type": "object" } }
+      },
       "SessionSummary": {
         "type": "object",
         "additionalProperties": false,

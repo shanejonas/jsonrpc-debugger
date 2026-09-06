@@ -65,6 +65,8 @@ Stdio requests time out after 120 seconds. Change the limit with `--request-time
 
 The TUI combines request history, request and response details, interception, inline editing, search, and durable annotations. Press `Ctrl-B ?` for commands and keybindings.
 
+Annotations appear as a flat chronological list beneath their source lines, including existing replies. Headers show author and age. Click a note or use `[` / `]` to select it, then `e` to edit or `Ctrl-B d` to delete it. Use visual selection and `Ctrl-B a` to add a note. These controls also work in attached TUIs. Existing reply relationships remain stored for API compatibility.
+
 Sessions survive restarts in `~/.config/jsonrpc-debugger/sqlite.db`. Set `XDG_CONFIG_HOME` or `JSONRPC_DEBUGGER_CONFIG_DIR` to move the database.
 
 ## Agent control

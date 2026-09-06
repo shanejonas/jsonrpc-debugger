@@ -1,7 +1,7 @@
 use crate::{
     app::{
-        DetailTab, Focus, JsonRpcExchange, JsonRpcMessage, LineAnnotation, MessageDirection,
-        SessionSummary,
+        AnnotationAuthor, DetailTab, Focus, JsonRpcExchange, JsonRpcMessage, LineAnnotation,
+        MessageDirection, SessionSummary,
     },
     control::{
         FindResults, FoundAnnotation, FoundExchange, Session, SessionExchange, SessionMessage,
@@ -16,7 +16,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct HistoryStore {
     connection: Connection,
@@ -53,7 +53,8 @@ impl HistoryStore {
             bail!("history database version {version} is newer than this debugger supports");
         }
 
-        connection.execute_batch(
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -89,9 +90,19 @@ impl HistoryStore {
             );
             CREATE INDEX IF NOT EXISTS annotations_session_exchange
                 ON annotations(session_id, exchange_index, created_at_ms);
-            PRAGMA user_version = 3;
             ",
         )?;
+
+        if version < 4 {
+            transaction.execute_batch(
+                "ALTER TABLE annotations ADD COLUMN parent_id TEXT REFERENCES annotations(id);
+                 ALTER TABLE annotations ADD COLUMN author TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (author IN ('user', 'agent', 'unknown'));
+                 CREATE INDEX annotations_parent ON annotations(parent_id);",
+            )?;
+        }
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
 
         Ok(Self { connection })
     }
@@ -170,7 +181,8 @@ impl HistoryStore {
 
     pub fn annotations(&self, session_id: &str) -> Result<Vec<LineAnnotation>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, exchange_index, panel, tab, start_line, end_line, message, text_json
+            "SELECT id, exchange_index, panel, tab, start_line, end_line, message, text_json,
+                    parent_id, author, created_at_ms
              FROM annotations
              WHERE session_id = ?1
              ORDER BY created_at_ms, id",
@@ -182,11 +194,31 @@ impl HistoryStore {
 
     pub fn add_annotation(&self, session_id: &str, annotation: &LineAnnotation) -> Result<()> {
         let panel = annotation_panel(annotation.panel)?;
+        if let Some(parent_id) = &annotation.parent_id {
+            let valid_parent: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM annotations WHERE id = ?1 AND session_id = ?2
+                 AND exchange_index = ?3 AND panel = ?4 AND tab = ?5
+                 AND start_line = ?6 AND end_line = ?7)",
+                params![
+                    parent_id,
+                    session_id,
+                    sqlite_index(annotation.exchange_index),
+                    panel,
+                    annotation_tab(annotation.tab),
+                    sqlite_index(annotation.start_line),
+                    sqlite_index(annotation.end_line)
+                ],
+                |row| row.get(0),
+            )?;
+            if !valid_parent {
+                bail!("reply parent must exist in the same session and line reference");
+            }
+        }
         self.connection.execute(
             "INSERT INTO annotations (
                  id, session_id, exchange_index, panel, tab, start_line, end_line,
-                 message, text_json, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 message, text_json, created_at_ms, parent_id, author
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 annotation.id,
                 session_id,
@@ -197,7 +229,10 @@ impl HistoryStore {
                 sqlite_index(annotation.end_line),
                 annotation.message,
                 serde_json::to_string(&annotation.text)?,
-                database_timestamp_ms(SystemTime::now()),
+                i64::try_from(annotation.created_at_ms)
+                    .context("annotation timestamp exceeds SQLite range")?,
+                annotation.parent_id,
+                annotation.author.name(),
             ],
         )?;
         self.touch_session(session_id)?;
@@ -216,13 +251,24 @@ impl HistoryStore {
     }
 
     pub fn remove_annotation(&self, session_id: &str, id: &str) -> Result<bool> {
-        let removed = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE annotations SET parent_id =
+                (SELECT parent_id FROM annotations WHERE session_id = ?1 AND id = ?2)
+             WHERE session_id = ?1 AND parent_id = ?2",
+            params![session_id, id],
+        )?;
+        let removed = transaction.execute(
             "DELETE FROM annotations WHERE session_id = ?1 AND id = ?2",
             params![session_id, id],
         )?;
         if removed > 0 {
-            self.touch_session(session_id)?;
+            transaction.execute(
+                "UPDATE sessions SET updated_at_ms = ?2 WHERE id = ?1",
+                params![session_id, database_timestamp_ms(SystemTime::now())],
+            )?;
         }
+        transaction.commit()?;
         Ok(removed > 0)
     }
 
@@ -355,7 +401,7 @@ impl HistoryStore {
                     (SELECT COUNT(*) FROM exchanges count
                      WHERE count.session_id = s.id),
                     a.id, a.exchange_index, a.panel, a.tab, a.start_line, a.end_line,
-                    a.message, a.text_json
+                    a.message, a.text_json, a.parent_id, a.author, a.created_at_ms
              FROM annotations a
              JOIN sessions s ON s.id = a.session_id
              WHERE (?2 IS NULL OR s.id = ?2)
@@ -530,6 +576,14 @@ fn line_annotation(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<L
         )
     })?;
     Ok(LineAnnotation {
+        parent_id: row.get(offset + 8)?,
+        author: match row.get::<_, String>(offset + 9)?.as_str() {
+            "user" => AnnotationAuthor::User,
+            "agent" => AnnotationAuthor::Agent,
+            "unknown" => AnnotationAuthor::Unknown,
+            value => return Err(invalid_annotation_column(offset + 9, value)),
+        },
+        created_at_ms: row.get::<_, i64>(offset + 10)?.max(0) as u64,
         id: row.get(offset)?,
         exchange_index: row.get::<_, i64>(offset + 1)?.max(0) as usize,
         panel,
@@ -779,6 +833,9 @@ mod tests {
 
     fn annotation(id: &str, exchange_index: usize) -> LineAnnotation {
         LineAnnotation {
+            parent_id: None,
+            author: crate::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: id.to_string(),
             exchange_index,
             panel: Focus::ResponseSection,
@@ -1052,7 +1109,8 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "CREATE INDEX exchanges_session_sequence ON exchanges(session_id, sequence);
+                "DROP TABLE annotations;
+             CREATE INDEX exchanges_session_sequence ON exchanges(session_id, sequence);
              PRAGMA user_version = 2;",
             )
             .unwrap();
@@ -1124,5 +1182,110 @@ mod tests {
         assert_eq!(store.annotations("existing").unwrap().len(), 1);
         drop(store);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn migrates_legacy_notes_with_their_original_times_and_text() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store.create_session(Some("legacy"), "http://node").unwrap();
+        let mut note = annotation("legacy-note", 0);
+        note.created_at_ms = 1_700_000_123_456;
+        store.add_annotation(&session.id, &note).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX annotations_parent;
+             ALTER TABLE annotations DROP COLUMN parent_id;
+             ALTER TABLE annotations DROP COLUMN author;
+             PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        let store = HistoryStore::from_connection(store.connection).unwrap();
+        assert_eq!(store.annotations(&session.id).unwrap(), vec![note.clone()]);
+        let mut reply = annotation("reply", 0);
+        reply.parent_id = Some(note.id.clone());
+        reply.author = AnnotationAuthor::User;
+        reply.created_at_ms = note.created_at_ms + 1;
+        store.add_annotation(&session.id, &reply).unwrap();
+        // Opening an already-migrated database must be idempotent.
+        let store = HistoryStore::from_connection(store.connection).unwrap();
+        assert_eq!(store.annotations(&session.id).unwrap(), vec![note, reply]);
+    }
+
+    #[test]
+    fn replies_require_the_same_session_and_source_reference() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store.create_session(Some("one"), "http://node").unwrap();
+        let other = store.create_session(Some("two"), "http://node").unwrap();
+        store
+            .add_annotation(&session.id, &annotation("root", 0))
+            .unwrap();
+        let mut reply = annotation("reply", 0);
+        reply.parent_id = Some("missing".to_string());
+        assert!(store.add_annotation(&session.id, &reply).is_err());
+        reply.parent_id = Some("root".to_string());
+        assert!(store.add_annotation(&other.id, &reply).is_err());
+        for mismatched in [
+            LineAnnotation {
+                exchange_index: 1,
+                ..reply.clone()
+            },
+            LineAnnotation {
+                panel: Focus::RequestSection,
+                ..reply.clone()
+            },
+            LineAnnotation {
+                tab: DetailTab::Headers,
+                ..reply.clone()
+            },
+            LineAnnotation {
+                start_line: 1,
+                ..reply.clone()
+            },
+            LineAnnotation {
+                end_line: 4,
+                ..reply.clone()
+            },
+        ] {
+            assert!(store.add_annotation(&session.id, &mismatched).is_err());
+        }
+        assert_eq!(store.annotations(&session.id).unwrap().len(), 1);
+        store.add_annotation(&session.id, &reply).unwrap();
+        assert_eq!(store.annotations(&session.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_note_reparents_children_and_keeps_descendants_after_reopening() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store.create_session(Some("thread"), "http://node").unwrap();
+        for (id, parent, time) in [
+            ("root", None, 1),
+            ("reply", Some("root"), 2),
+            ("nested", Some("reply"), 3),
+        ] {
+            let mut note = annotation(id, 0);
+            note.parent_id = parent.map(str::to_string);
+            note.created_at_ms = time;
+            note.author = AnnotationAuthor::Agent;
+            store.add_annotation(&session.id, &note).unwrap();
+        }
+        assert!(store.remove_annotation(&session.id, "reply").unwrap());
+        let notes = store.annotations(&session.id).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[1].parent_id.as_deref(), Some("root"));
+        let original = notes[1].clone();
+        assert!(store
+            .update_annotation(&session.id, "nested", "Edited")
+            .unwrap());
+        assert!(store.remove_annotation(&session.id, "root").unwrap());
+        let store = HistoryStore::from_connection(store.connection).unwrap();
+        assert_eq!(
+            store.annotations(&session.id).unwrap(),
+            vec![LineAnnotation {
+                parent_id: None,
+                message: "Edited".to_string(),
+                ..original
+            }]
+        );
     }
 }

@@ -129,6 +129,8 @@ mod unix {
             Some("example/run")
         );
 
+        verify_annotation_threads(&control_url, &client, &mut attached).await;
+
         stdin.shutdown().await.unwrap();
         drop(stdin);
         let status = tokio::time::timeout(Duration::from_secs(2), wrapper.wait())
@@ -137,6 +139,127 @@ mod unix {
             .unwrap();
         assert!(status.success());
         std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    async fn verify_annotation_threads(url: &str, client: &ControlClient, attached: &mut App) {
+        use jsonrpc_debugger::app::{AnnotationAuthor, Focus};
+        let before = control(url, "debugger.getState").await;
+        let created = control_with_params(
+            url,
+            "debugger.annotateLines",
+            json!({
+                "panel": "request", "startLine": 2, "message": "What if every task is queued?"
+            }),
+        )
+        .await;
+        assert!(created.get("error").is_none(), "{created}");
+        let root = &created["result"]["annotation"];
+        let root_id = root["id"].as_str().unwrap();
+        assert_eq!(root["author"], "agent");
+        assert_eq!(root["parentId"], Value::Null);
+        assert!(root["createdAtMs"].as_u64().unwrap() > 0);
+        client
+            .snapshot(attached)
+            .await
+            .unwrap()
+            .apply(attached)
+            .unwrap();
+        assert!(attached.start_replying_to_annotation(root_id));
+        attached.input_buffer = "Added a regression test for that path.".to_string();
+        let reply_id = client.save_annotation(attached).await.unwrap();
+        attached.cancel_editing();
+        client
+            .snapshot(attached)
+            .await
+            .unwrap()
+            .apply(attached)
+            .unwrap();
+        let reply = attached
+            .annotations
+            .iter()
+            .find(|note| note.id == reply_id)
+            .unwrap()
+            .clone();
+        assert_eq!(reply.parent_id.as_deref(), Some(root_id));
+        assert_eq!(reply.author, AnnotationAuthor::User);
+        assert_eq!(reply.text, attached.annotations[0].text);
+        attached.start_editing_annotation(&reply_id);
+        attached.input_buffer = "The regression test passes.".to_string();
+        assert_eq!(client.save_annotation(attached).await.unwrap(), reply_id);
+        attached.cancel_editing();
+        let nested = control_with_params(
+            url,
+            "debugger.replyAnnotation",
+            json!({
+                "annotationId": reply_id, "message": "Confirmed."
+            }),
+        )
+        .await;
+        assert_eq!(nested["result"]["annotation"]["parentId"], reply_id);
+        assert_eq!(nested["result"]["annotation"]["author"], "agent");
+        let notes = control(url, "debugger.getAnnotations").await;
+        assert_eq!(notes["result"].as_array().unwrap().len(), 3);
+        assert_eq!(notes["result"][0]["id"], root_id);
+        assert_eq!(notes["result"][1]["id"], reply_id);
+        assert_eq!(notes["result"][1]["message"], "The regression test passes.");
+        assert_eq!(notes["result"][1]["createdAtMs"], reply.created_at_ms);
+        let after = control(url, "debugger.getState").await;
+        for key in [
+            "focus",
+            "scroll",
+            "selectedExchange",
+            "tabs",
+            "lineSelection",
+        ] {
+            assert_eq!(before["result"][key], after["result"][key]);
+        }
+        client.remove_annotation(root_id).await.unwrap();
+        client
+            .snapshot(attached)
+            .await
+            .unwrap()
+            .apply(attached)
+            .unwrap();
+        assert_eq!(attached.annotations.len(), 2);
+        assert_eq!(attached.annotations[0].parent_id, None);
+        assert_eq!(
+            attached.annotations[1].parent_id.as_deref(),
+            Some(reply_id.as_str())
+        );
+        let missing = control_with_params(
+            url,
+            "debugger.replyAnnotation",
+            json!({"annotationId": root_id, "message": "Late reply"}),
+        )
+        .await;
+        assert_eq!(missing["error"]["code"], -32602);
+        let invalid_author = control_with_params(
+            url,
+            "debugger.replyAnnotation",
+            json!({"annotationId": reply_id, "message": "Invalid author", "author": "unknown"}),
+        )
+        .await;
+        assert_eq!(invalid_author["error"]["code"], -32602);
+        // New root notes written by the attached UI are also attributed to the user.
+        attached.select_lines(Focus::RequestSection, 2, 2, reply.text);
+        attached.start_visual_selection();
+        attached.start_annotating_selection();
+        attached.input_buffer = "Another observation.".to_string();
+        let user_root = client.save_annotation(attached).await.unwrap();
+        attached.cancel_editing();
+        client
+            .snapshot(attached)
+            .await
+            .unwrap()
+            .apply(attached)
+            .unwrap();
+        let note = attached
+            .annotations
+            .iter()
+            .find(|note| note.id == user_root)
+            .unwrap();
+        assert_eq!(note.author, AnnotationAuthor::User);
+        assert_eq!(note.parent_id, None);
     }
 
     #[tokio::test]

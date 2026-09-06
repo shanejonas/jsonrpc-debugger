@@ -135,3 +135,56 @@ fn malformed_updates_leave_the_attached_state_intact() {
     assert_eq!(attached.session.as_ref().unwrap().exchange_count, 1);
     assert!(control::updates(&source, Some("one"), 1, vec![1]).is_err());
 }
+
+#[test]
+fn attached_annotations_sync_replies_edits_deletions_and_preserve_drafts() {
+    use jsonrpc_debugger::app::{AnnotationAuthor, DetailTab, Focus, LineAnnotation};
+    let mut source = source();
+    source.add_message(message(1, MessageDirection::Request));
+    let root = LineAnnotation {
+        id: "root".to_string(),
+        parent_id: None,
+        author: AnnotationAuthor::Agent,
+        created_at_ms: 123,
+        exchange_index: 0,
+        panel: Focus::RequestSection,
+        tab: DetailTab::Body,
+        start_line: 2,
+        end_line: 2,
+        message: "Check this".to_string(),
+        text: vec!["Method: example/run".to_string()],
+    };
+    source.add_annotation(root.clone());
+    let mut attached = App::new();
+    apply(updates(&source, &attached), &mut attached);
+    assert_eq!(attached.annotations, vec![root.clone()]);
+    source.add_annotation(LineAnnotation {
+        id: "reply".to_string(),
+        parent_id: Some(root.id.clone()),
+        author: AnnotationAuthor::User,
+        created_at_ms: 124,
+        ..root
+    });
+    attached.request_details_scroll = 4;
+    apply(updates(&source, &attached), &mut attached);
+    assert_eq!(attached.annotations, source.annotations);
+    assert_eq!(attached.request_details_scroll, 4);
+    attached.start_editing_annotation("reply");
+    attached.input_buffer = "Unsaved local draft".to_string();
+    source.update_annotation("reply", "Remote edit".to_string());
+    apply(updates(&source, &attached), &mut attached);
+    assert_eq!(attached.annotations[1].message, "Remote edit");
+    assert_eq!(attached.input_buffer, "Unsaved local draft");
+    assert_eq!(attached.annotation_edit_id.as_deref(), Some("reply"));
+    source.remove_annotation("root");
+    apply(updates(&source, &attached), &mut attached);
+    assert_eq!(attached.annotations.len(), 1);
+    assert_eq!(attached.annotations[0].parent_id, None);
+    assert_eq!(attached.annotations[0].author, AnnotationAuthor::User);
+    source.remove_annotation("reply");
+    apply(updates(&source, &attached), &mut attached);
+    assert!(attached.annotations.is_empty());
+    assert_eq!(attached.active_annotation_id, None);
+    assert_eq!(attached.annotation_edit_id.as_deref(), Some("reply"));
+    assert_eq!(attached.input_buffer, "Unsaved local draft");
+}

@@ -665,6 +665,9 @@ fn editing_an_annotation_prefills_the_shared_prompt() {
     let mut app = App::new();
     app.focus = Focus::RequestSection;
     app.add_annotation(LineAnnotation {
+        parent_id: None,
+        author: jsonrpc_debugger::app::AnnotationAuthor::Unknown,
+        created_at_ms: 0,
         id: "note".to_string(),
         exchange_index: 0,
         panel: Focus::RequestSection,
@@ -706,6 +709,9 @@ fn adding_an_annotation_preserves_the_viewport() {
 
     let selection = app.line_selection.clone();
     app.add_annotation(LineAnnotation {
+        parent_id: None,
+        author: jsonrpc_debugger::app::AnnotationAuthor::Unknown,
+        created_at_ms: 0,
         id: "new".to_string(),
         exchange_index: 12,
         panel: Focus::ResponseSection,
@@ -731,6 +737,9 @@ fn adding_an_annotation_preserves_the_viewport() {
 #[test]
 fn annotation_navigation_is_global_and_selects_the_target_tab() {
     let annotation = |id: &str, panel: Focus, tab: DetailTab, exchange, line| LineAnnotation {
+        parent_id: None,
+        author: jsonrpc_debugger::app::AnnotationAuthor::Unknown,
+        created_at_ms: 0,
         id: id.to_string(),
         exchange_index: exchange,
         panel,
@@ -823,6 +832,9 @@ fn annotation_navigation_starts_from_the_selected_exchange_outside_details() {
     }
     app.annotations = vec![
         LineAnnotation {
+            parent_id: None,
+            author: jsonrpc_debugger::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: "request".to_string(),
             exchange_index: 0,
             panel: Focus::RequestSection,
@@ -833,6 +845,9 @@ fn annotation_navigation_starts_from_the_selected_exchange_outside_details() {
             text: vec!["request".to_string()],
         },
         LineAnnotation {
+            parent_id: None,
+            author: jsonrpc_debugger::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: "response".to_string(),
             exchange_index: 0,
             panel: Focus::ResponseSection,
@@ -843,6 +858,9 @@ fn annotation_navigation_starts_from_the_selected_exchange_outside_details() {
             text: vec!["response".to_string()],
         },
         LineAnnotation {
+            parent_id: None,
+            author: jsonrpc_debugger::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: "next-exchange".to_string(),
             exchange_index: 1,
             panel: Focus::RequestSection,
@@ -1002,4 +1020,80 @@ fn response_index_survives_import_and_session_changes() {
     assert!(app.exchanges()[2].is_notification());
     assert!(app.exchanges()[2].response.is_none());
     assert!(app.exchanges()[3].request.is_none());
+}
+
+#[test]
+fn persisted_threads_remain_intact_while_navigation_follows_the_flat_list() {
+    let mut app = App::new();
+    app.add_message(JsonRpcMessage {
+        id: Some(1.into()),
+        method: Some("example/run".to_string()),
+        params: None,
+        result: None,
+        error: None,
+        timestamp: std::time::SystemTime::now(),
+        direction: MessageDirection::Request,
+        transport: TransportType::Http,
+        headers: None,
+    });
+    let root = LineAnnotation {
+        id: "root".to_string(),
+        parent_id: None,
+        author: AnnotationAuthor::Agent,
+        created_at_ms: 1,
+        exchange_index: 0,
+        panel: Focus::RequestSection,
+        tab: DetailTab::Body,
+        start_line: 2,
+        end_line: 2,
+        message: "Check this".to_string(),
+        text: vec![],
+    };
+    // Replies arrive after a second root but remain beneath their own parent.
+    for (id, parent, time) in [
+        ("other", None, 2),
+        ("sibling", Some("root"), 5),
+        ("root", None, 1),
+        ("nested", Some("reply"), 4),
+        ("reply", Some("root"), 3),
+    ] {
+        app.add_annotation(LineAnnotation {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            created_at_ms: time,
+            ..root.clone()
+        });
+    }
+    let order = app
+        .annotation_threads()
+        .into_iter()
+        .map(|(note, depth)| (note.id.as_str(), depth))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        [
+            ("root", 0),
+            ("reply", 1),
+            ("nested", 2),
+            ("sibling", 1),
+            ("other", 0)
+        ]
+    );
+    app.focus_annotation("root");
+    for id in ["other", "reply", "nested", "sibling", "root"] {
+        assert!(app.focus_next_annotation());
+        assert_eq!(app.active_annotation_id.as_deref(), Some(id));
+    }
+    app.remove_annotation("reply");
+    assert_eq!(
+        app.annotations
+            .iter()
+            .find(|note| note.id == "nested")
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some("root")
+    );
+    app.remove_annotation("root");
+    assert!(app.annotations.iter().all(|note| note.parent_id.is_none()));
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     time::{Duration, Instant},
 };
@@ -166,15 +166,20 @@ pub enum InputMode {
     RenamingSession,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 pub enum Focus {
+    #[serde(rename = "history")]
     MessageList,
+    #[serde(rename = "request")]
     RequestSection,
+    #[serde(rename = "response")]
     ResponseSection,
+    #[serde(rename = "status")]
     StatusHeader,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DetailTab {
     Headers,
     Body,
@@ -223,8 +228,30 @@ pub struct DetailHover {
     pub line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnnotationAuthor {
+    User,
+    Agent,
+    Unknown,
+}
+
+impl AnnotationAuthor {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LineAnnotation {
+    pub parent_id: Option<String>,
+    pub author: AnnotationAuthor,
+    pub created_at_ms: u64,
     pub id: String,
     pub exchange_index: usize,
     pub panel: Focus,
@@ -232,7 +259,15 @@ pub struct LineAnnotation {
     pub start_line: usize,
     pub end_line: usize,
     pub message: String,
+    #[serde(deserialize_with = "annotation_text")]
     pub text: Vec<String>,
+}
+
+fn annotation_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(text.split('\n').map(str::to_string).collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -879,6 +914,7 @@ pub struct App {
     pub visual_selection_active: bool,
     pub annotation_hover: Option<DetailHover>,
     pub annotation_edit_id: Option<String>,
+    pub annotation_reply_id: Option<String>,
     pub annotations: Vec<LineAnnotation>,
     pub active_annotation_id: Option<String>,
     pub editor: Option<TextEditor>,
@@ -1081,6 +1117,7 @@ impl App {
             visual_selection_active: false,
             annotation_hover: None,
             annotation_edit_id: None,
+            annotation_reply_id: None,
             annotations: Vec::new(),
             active_annotation_id: None,
             editor: None,
@@ -1151,6 +1188,7 @@ impl App {
         self.visual_selection_active = false;
         self.annotation_hover = None;
         self.annotation_edit_id = None;
+        self.annotation_reply_id = None;
         self.annotations = annotations;
         self.active_annotation_id = None;
         self.reset_details_scroll();
@@ -1370,6 +1408,7 @@ impl App {
         self.visual_selection_active = false;
         self.annotation_hover = None;
         self.annotation_edit_id = None;
+        self.annotation_reply_id = None;
         self.active_annotation_id = None;
         self.mark_changed();
     }
@@ -1560,7 +1599,7 @@ impl App {
                     tab_order(annotation.tab),
                 )
             };
-            let mut annotations = self.annotations.iter().collect::<Vec<_>>();
+            let mut annotations = self.annotation_list().into_iter().collect::<Vec<_>>();
             annotations.sort_by_key(|annotation| {
                 (
                     position(annotation),
@@ -1631,19 +1670,67 @@ impl App {
     }
 
     pub fn remove_annotation(&mut self, id: &str) -> bool {
-        let before = self.annotations.len();
-        self.annotations.retain(|annotation| annotation.id != id);
-        if self.annotations.len() == before {
+        let Some(note) = self.annotations.iter().find(|note| note.id == id) else {
             return false;
+        };
+        let parent_id = note.parent_id.clone();
+        for reply in &mut self.annotations {
+            if reply.parent_id.as_deref() == Some(id) {
+                reply.parent_id = parent_id.clone();
+            }
         }
+        self.annotations.retain(|note| note.id != id);
         if self.active_annotation_id.as_deref() == Some(id) {
             self.active_annotation_id = None;
         }
-        if self.annotation_edit_id.as_deref() == Some(id) {
-            self.annotation_edit_id = None;
-        }
+        // Keep an open draft's target so saving reports the deletion without changing its intent.
         self.mark_changed();
         true
+    }
+
+    pub fn annotation_list(&self) -> Vec<&LineAnnotation> {
+        let mut notes = self.annotations.iter().collect::<Vec<_>>();
+        notes.sort_by_key(|note| {
+            (
+                note.exchange_index,
+                usize::from(note.panel == Focus::ResponseSection),
+                usize::from(note.tab == DetailTab::Body),
+                note.start_line,
+                note.end_line,
+                note.created_at_ms,
+                note.id.as_str(),
+            )
+        });
+        notes
+    }
+
+    pub fn annotation_threads(&self) -> Vec<(&LineAnnotation, usize)> {
+        let ids: HashSet<&str> = self
+            .annotations
+            .iter()
+            .map(|note| note.id.as_str())
+            .collect();
+        let notes = self.annotation_list();
+        let mut children: HashMap<Option<&str>, Vec<&LineAnnotation>> = HashMap::new();
+        for note in notes {
+            let parent = note.parent_id.as_deref().filter(|id| ids.contains(id));
+            children.entry(parent).or_default().push(note);
+        }
+        let mut stack = children
+            .remove(&None)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .map(|note| (note, 0))
+            .collect::<Vec<_>>();
+        let mut ordered = Vec::with_capacity(self.annotations.len());
+        while let Some((note, depth)) = stack.pop() {
+            ordered.push((note, depth));
+            if let Some(replies) = children.remove(&Some(note.id.as_str())) {
+                stack.extend(replies.into_iter().rev().map(|reply| (reply, depth + 1)));
+            }
+        }
+        ordered
     }
 
     pub fn detail_tab(&self, panel: Focus) -> Option<DetailTab> {
@@ -1667,11 +1754,13 @@ impl App {
         panel: Focus,
     ) -> impl DoubleEndedIterator<Item = &LineAnnotation> {
         let tab = self.detail_tab(panel);
-        self.annotations.iter().filter(move |annotation| {
-            annotation.exchange_index == self.selected_exchange
-                && annotation.panel == panel
-                && Some(annotation.tab) == tab
-        })
+        self.annotation_list()
+            .into_iter()
+            .filter(move |annotation| {
+                annotation.exchange_index == self.selected_exchange
+                    && annotation.panel == panel
+                    && Some(annotation.tab) == tab
+            })
     }
 
     pub fn selection_overlaps_annotation(&self) -> bool {
@@ -2209,6 +2298,7 @@ impl App {
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.annotation_edit_id = None;
+        self.annotation_reply_id = None;
     }
 
     pub fn start_naming_session(&mut self) {
@@ -2223,6 +2313,20 @@ impl App {
         self.input_mode = InputMode::AnnotatingSelection;
         self.input_buffer.clear();
         self.annotation_edit_id = None;
+        self.annotation_reply_id = None;
+    }
+
+    pub fn start_replying_to_annotation(&mut self, id: &str) -> bool {
+        if self.app_mode != AppMode::Normal || !self.annotations.iter().any(|note| note.id == id) {
+            return false;
+        }
+        self.focus_annotation(id);
+        self.input_mode = InputMode::AnnotatingSelection;
+        self.input_buffer.clear();
+        self.annotation_edit_id = None;
+        self.annotation_reply_id = Some(id.to_string());
+        self.visual_selection_active = false;
+        true
     }
 
     pub fn start_editing_annotation(&mut self, id: &str) -> bool {
@@ -2238,6 +2342,7 @@ impl App {
         self.input_mode = InputMode::AnnotatingSelection;
         self.input_buffer = message;
         self.annotation_edit_id = Some(id.to_string());
+        self.annotation_reply_id = None;
         true
     }
 

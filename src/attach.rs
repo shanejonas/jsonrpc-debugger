@@ -1,7 +1,7 @@
 use crate::{
     app::{
-        App, AppMode, Framing, JsonRpcMessage, MessageDirection, PendingRequest, ProxyConfig,
-        SessionSummary, TransportType,
+        App, AppMode, Framing, JsonRpcMessage, LineAnnotation, MessageDirection, PendingRequest,
+        ProxyConfig, SessionSummary, TransportType,
     },
     control::SessionExchange,
 };
@@ -37,6 +37,7 @@ pub struct Snapshot {
     reset: bool,
     next_index: usize,
     exchanges: Vec<RemoteExchange>,
+    annotations: Vec<LineAnnotation>,
     pending: Vec<RemotePending>,
 }
 
@@ -79,6 +80,55 @@ impl ControlClient {
         }
         serde_json::from_value(self.call("debugger.getUpdates", params).await?)
             .map_err(|error| error.to_string())
+    }
+
+    pub async fn save_annotation(&self, app: &App) -> Result<String, String> {
+        if let Some(id) = &app.annotation_edit_id {
+            self.call(
+                "debugger.updateAnnotation",
+                json!({"annotationId": id, "message": app.input_buffer}),
+            )
+            .await?;
+            return Ok(id.clone());
+        }
+        let result = if let Some(id) = &app.annotation_reply_id {
+            self.call(
+                "debugger.replyAnnotation",
+                json!({"annotationId": id, "message": app.input_buffer, "author": "user"}),
+            )
+            .await?
+        } else {
+            let selection = app
+                .line_selection
+                .as_ref()
+                .filter(|_| app.visual_selection_active)
+                .ok_or_else(|| "No visual selection".to_string())?;
+            let panel = match selection.panel {
+                crate::app::Focus::RequestSection => "request",
+                crate::app::Focus::ResponseSection => "response",
+                _ => return Err("Select request or response lines".to_string()),
+            };
+            let params = json!({
+                "panel": panel,
+                "exchangeIndex": app.selected_exchange,
+                "tab": app.detail_tab(selection.panel),
+                "startLine": selection.start_line,
+                "endLine": selection.end_line,
+                "message": app.input_buffer,
+                "author": "user",
+            });
+            self.call("debugger.annotateLines", params).await?
+        };
+        result["annotation"]["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "annotation response is missing id".to_string())
+    }
+
+    pub async fn remove_annotation(&self, id: &str) -> Result<(), String> {
+        self.call("debugger.removeAnnotation", json!({"annotationId": id}))
+            .await?;
+        Ok(())
     }
 
     pub async fn set_paused(&self, paused: bool) -> Result<(), String> {
@@ -190,7 +240,7 @@ impl Snapshot {
                     .into_iter()
                     .map(|(_, exchange)| exchange)
                     .collect(),
-                Vec::new(),
+                self.annotations,
             );
         } else {
             for (index, exchange) in exchanges {
@@ -199,6 +249,14 @@ impl Snapshot {
                 } else {
                     app.push_exchange(exchange);
                 }
+            }
+            app.annotations = self.annotations;
+            if app
+                .active_annotation_id
+                .as_ref()
+                .is_some_and(|id| !app.annotations.iter().any(|note| &note.id == id))
+            {
+                app.active_annotation_id = None;
             }
             app.session = Some(self.state.session);
             app.mark_changed();

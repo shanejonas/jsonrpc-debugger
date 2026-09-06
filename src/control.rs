@@ -1,6 +1,6 @@
 use crate::app::{
-    App, AppMode, DetailTab, Focus, JsonRpcExchange, JsonRpcMessage, LineAnnotation,
-    MessageDirection, Overlay, SessionSummary, TransportType,
+    AnnotationAuthor, App, AppMode, DetailTab, Focus, JsonRpcExchange, JsonRpcMessage,
+    LineAnnotation, MessageDirection, Overlay, SessionSummary, TransportType,
 };
 use crate::ui;
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,18 @@ pub enum ControlAction {
         exchange_index: Option<usize>,
         tab: Option<DetailTab>,
     },
+    GetAnnotations,
+    ReplyAnnotation {
+        id: String,
+        message: String,
+        author: AnnotationAuthor,
+    },
+    UpdateAnnotation {
+        id: String,
+        message: String,
+    },
     AnnotateLines {
+        author: AnnotationAuthor,
         focus: Focus,
         exchange_index: Option<usize>,
         tab: Option<DetailTab>,
@@ -386,6 +397,7 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
         "debugger.annotateLines" => {
             let start_line = required_usize(params, 1, "startLine")?;
             Ok(ControlAction::AnnotateLines {
+                author: parse_annotation_author(params, 6)?,
                 focus: parse_detail_focus(required_string(params, 0, "panel")?)?,
                 exchange_index: optional_usize(params, 4, "exchangeIndex")?,
                 tab: optional_string(params, 5, "tab")?
@@ -396,6 +408,16 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
                 message: required_string(params, 3, "message")?.to_string(),
             })
         }
+        "debugger.getAnnotations" => Ok(ControlAction::GetAnnotations),
+        "debugger.replyAnnotation" => Ok(ControlAction::ReplyAnnotation {
+            id: required_string(params, 0, "annotationId")?.to_string(),
+            message: required_string(params, 1, "message")?.to_string(),
+            author: parse_annotation_author(params, 2)?,
+        }),
+        "debugger.updateAnnotation" => Ok(ControlAction::UpdateAnnotation {
+            id: required_string(params, 0, "annotationId")?.to_string(),
+            message: required_string(params, 1, "message")?.to_string(),
+        }),
         "debugger.clearLineSelection" => Ok(ControlAction::ClearLineSelection),
         "debugger.removeAnnotation" => Ok(ControlAction::RemoveAnnotation {
             id: required_string(params, 0, "annotationId")?.to_string(),
@@ -441,6 +463,14 @@ fn parse_pending_decision(params: &Value) -> Result<ControlAction, ControlError>
     };
 
     Ok(ControlAction::ResolvePending { id, decision })
+}
+
+fn parse_annotation_author(params: &Value, index: usize) -> Result<AnnotationAuthor, ControlError> {
+    match optional_string(params, index, "author")?.unwrap_or("agent") {
+        "agent" => Ok(AnnotationAuthor::Agent),
+        "user" => Ok(AnnotationAuthor::User),
+        _ => Err(ControlError::invalid_params("author must be agent or user")),
+    }
 }
 
 fn parameter<'a>(params: &'a Value, index: usize, name: &str) -> Option<&'a Value> {
@@ -700,6 +730,7 @@ pub fn updates(
         "nextIndex": app.exchanges().len(),
         "exchanges": exchanges,
         "pending": pending(app),
+        "annotations": annotations(app),
     }))
 }
 
@@ -1100,6 +1131,9 @@ fn focus_name(focus: Focus) -> &'static str {
 fn annotation_value(annotation: &LineAnnotation) -> Value {
     json!({
         "id": annotation.id,
+        "parentId": annotation.parent_id,
+        "author": annotation.author,
+        "createdAtMs": annotation.created_at_ms,
         "exchangeIndex": annotation.exchange_index,
         "panel": focus_name(annotation.panel),
         "tab": detail_tab_name(annotation.tab),
@@ -1115,6 +1149,15 @@ fn detail_tab_name(tab: DetailTab) -> &'static str {
         DetailTab::Headers => "headers",
         DetailTab::Body => "body",
     }
+}
+
+pub fn annotations(app: &App) -> Value {
+    Value::Array(
+        app.annotation_threads()
+            .into_iter()
+            .map(|(note, _)| annotation_value(note))
+            .collect(),
+    )
 }
 
 pub fn annotation(annotation: &LineAnnotation) -> Value {
@@ -1194,7 +1237,7 @@ mod tests {
         assert_eq!(document["openrpc"], "1.3.2");
         assert_eq!(document["servers"][0]["url"], "http://127.0.0.1:8081");
         assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(document["methods"].as_array().unwrap().len(), 27);
+        assert_eq!(document["methods"].as_array().unwrap().len(), 30);
         assert!(document["methods"]
             .as_array()
             .unwrap()
@@ -1320,6 +1363,7 @@ mod tests {
                 start_line: 10,
                 end_line: 14,
                 message,
+                author: AnnotationAuthor::Agent,
             }) if message == "This fee is unusually high"
         ));
         assert!(matches!(
@@ -1424,6 +1468,9 @@ mod tests {
     fn annotation_and_shared_line_reference_are_independent() {
         let mut app = App::new();
         app.add_annotation(LineAnnotation {
+            parent_id: None,
+            author: crate::app::AnnotationAuthor::Unknown,
+            created_at_ms: 0,
             id: "annotation-1".to_string(),
             exchange_index: 0,
             panel: Focus::ResponseSection,
