@@ -65,6 +65,20 @@ mod unix {
         assert_eq!(state["result"]["proxyPort"], Value::Null);
         assert_eq!(state["result"]["transport"], "stdio-json-lines");
 
+        let output = Command::new(env!("CARGO_BIN_EXE_jsonrpc-debugger"))
+            .args([
+                "call",
+                "--transport=http",
+                &control_url,
+                r#"{"jsonrpc":"2.0","id":1,"method":"debugger.getState","params":{}}"#,
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["dataPlane"], "stdio");
+
         let history = wait_for_history(&control_url).await;
         assert_eq!(history["method"], "example/run");
         assert_eq!(history["status"], "success");
@@ -101,17 +115,19 @@ mod unix {
             .contains("example/run"));
 
         let client = ControlClient::new(control_url.clone());
-        let state = client.state().await.unwrap();
         let mut attached = App::new();
         client
-            .snapshot(state)
+            .snapshot(&attached)
             .await
             .unwrap()
             .apply(&mut attached)
             .unwrap();
         assert!(attached.proxy_config.transparent);
-        assert_eq!(attached.exchanges.len(), 1);
-        assert_eq!(attached.exchanges[0].method.as_deref(), Some("example/run"));
+        assert_eq!(attached.exchanges().len(), 1);
+        assert_eq!(
+            attached.exchanges()[0].method.as_deref(),
+            Some("example/run")
+        );
 
         stdin.shutdown().await.unwrap();
         drop(stdin);
@@ -170,10 +186,9 @@ mod unix {
         let pending = wait_for_pending(&control_url).await;
         assert_eq!(pending["request"]["id"], "pause-1");
         let client = ControlClient::new(control_url.clone());
-        let state = client.state().await.unwrap();
         let mut attached = App::new();
         client
-            .snapshot(state)
+            .snapshot(&attached)
             .await
             .unwrap()
             .apply(&mut attached)

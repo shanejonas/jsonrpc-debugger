@@ -2,7 +2,7 @@
   "openrpc": "1.3.2",
   "info": {
     "title": "jsonrpc-debugger control plane",
-    "version": "0.2.0"
+    "version": "0.6.0"
   },
   "servers": [
     {
@@ -22,6 +22,31 @@
       "summary": "Read debugger and GUI state",
       "params": [],
       "result": { "name": "result", "schema": { "type": "object" } }
+    },
+    {
+      "name": "debugger.getUpdates",
+      "summary": "Read new exchanges and completed outstanding requests in one consistent snapshot",
+      "description": "Omit sessionId for a full initial snapshot. Otherwise pass the previous state.session.id, nextIndex, and the indexes of requests still awaiting responses. Changed sessions or cursors beyond current history return reset=true and full history. Other updates contain completed pending exchanges followed by new exchanges, ordered by index. Apply replacements by index and append new entries. State and pending interception requests come from the same snapshot.",
+      "params": [
+        { "name": "sessionId", "required": false, "schema": { "type": "string" } },
+        { "name": "nextIndex", "required": false, "schema": { "type": "integer", "minimum": 0 } },
+        { "name": "pendingIndices", "required": false, "schema": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "type": "object",
+          "required": ["state", "reset", "nextIndex", "exchanges", "pending"],
+          "properties": {
+            "state": { "type": "object" },
+            "reset": { "type": "boolean" },
+            "nextIndex": { "type": "integer", "minimum": 0 },
+            "exchanges": { "type": "array", "items": { "type": "object", "required": ["index", "transport"], "properties": { "index": { "type": "integer", "minimum": 0 }, "transport": { "type": "string" }, "request": { "type": "object" }, "response": { "type": "object" } } } },
+            "pending": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      },
+      "examples": [{ "name": "Initial snapshot", "params": [], "result": { "name": "result", "value": { "state": {}, "reset": true, "nextIndex": 0, "exchanges": [], "pending": [] } } }]
     },
     {
       "name": "debugger.waitForChange",

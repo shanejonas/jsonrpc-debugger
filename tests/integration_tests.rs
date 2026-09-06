@@ -20,13 +20,25 @@ fn skill_flag_prints_the_bundled_agent_skill() {
     assert!(stdout.contains("2026-07-28"));
     assert!(stdout.contains("server/discover"));
     assert!(stdout.contains("Mcp-Method"));
+    assert!(stdout.contains("jsonrpc-debugger call --transport=http"));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn call_rejects_invalid_json() {
+    let output = Command::new(env!("CARGO_BIN_EXE_jsonrpc-debugger"))
+        .args(["call", "http://127.0.0.1:8081", "not-json"])
+        .output()
+        .expect("jsonrpc-debugger should run");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid request JSON"));
 }
 
 #[test]
 fn test_full_exchange_flow() {
     let mut app = App::new();
-    let initial_count = app.exchanges.len();
+    let initial_count = app.exchanges().len();
 
     // Add a request message
     let request = JsonRpcMessage {
@@ -68,10 +80,10 @@ fn test_full_exchange_flow() {
     app.add_message(response);
 
     // Should have 1 exchange (request-response pair)
-    assert_eq!(app.exchanges.len(), initial_count + 1);
+    assert_eq!(app.exchanges().len(), initial_count + 1);
 
     // Navigate to the exchange
-    app.selected_exchange = app.exchanges.len() - 1;
+    app.selected_exchange = app.exchanges().len() - 1;
     let selected_exchange = app.get_selected_exchange().unwrap();
 
     // Verify the exchange has both request and response
@@ -134,10 +146,10 @@ fn test_websocket_vs_http_exchanges() {
     app.add_message(ws_request);
 
     // Should have 2 exchanges
-    assert_eq!(app.exchanges.len(), 2);
+    assert_eq!(app.exchanges().len(), 2);
 
-    let http_exchange = &app.exchanges[0];
-    let ws_exchange = &app.exchanges[1];
+    let http_exchange = &app.exchanges()[0];
+    let ws_exchange = &app.exchanges()[1];
 
     // HTTP exchange should have headers in request
     assert!(http_exchange.request.as_ref().unwrap().headers.is_some());
@@ -187,8 +199,8 @@ fn test_error_handling() {
     app.add_message(error_response);
 
     // Should have 1 exchange with error response
-    assert_eq!(app.exchanges.len(), 1);
-    let exchange = app.exchanges.last().unwrap();
+    assert_eq!(app.exchanges().len(), 1);
+    let exchange = app.exchanges().last().unwrap();
 
     assert!(exchange.request.is_some());
     assert!(exchange.response.is_some());
@@ -242,5 +254,5 @@ fn test_proxy_state_management() {
     assert!(!app.is_running);
 
     // Exchanges should still be there
-    assert!(!app.exchanges.is_empty());
+    assert!(!app.exchanges().is_empty());
 }

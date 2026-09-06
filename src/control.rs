@@ -18,6 +18,11 @@ use warp::{http::StatusCode, Filter, Reply};
 pub enum ControlAction {
     Discover,
     GetState,
+    GetUpdates {
+        session_id: Option<String>,
+        next_index: usize,
+        pending_indices: Vec<usize>,
+    },
     WaitForChange {
         after_revision: u64,
         timeout_ms: u64,
@@ -297,6 +302,19 @@ fn parse_request(request: &Value) -> Result<ControlAction, ControlError> {
     match method {
         "rpc.discover" => Ok(ControlAction::Discover),
         "debugger.getState" => Ok(ControlAction::GetState),
+        "debugger.getUpdates" => Ok(ControlAction::GetUpdates {
+            session_id: optional_string(params, 0, "sessionId")?.map(str::to_string),
+            next_index: optional_usize(params, 1, "nextIndex")?.unwrap_or(0),
+            pending_indices: optional(params, 2, "pendingIndices")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()
+                .map_err(|_| {
+                    ControlError::invalid_params(
+                        "pendingIndices must be an array of nonnegative integers",
+                    )
+                })?
+                .unwrap_or_default(),
+        }),
         "debugger.waitForChange" => Ok(ControlAction::WaitForChange {
             after_revision: required_u64(params, 0, "afterRevision")?,
             timeout_ms: optional_u64(params, 1, "timeoutMs")?
@@ -633,11 +651,56 @@ pub fn state(app: &App) -> Value {
             "response": if app.response_tab == 0 { "headers" } else { "body" },
         },
         "selectedExchange": app.selected_exchange,
-        "exchangeCount": app.exchanges.len(),
+        "exchangeCount": app.exchanges().len(),
         "pendingCount": app.pending_requests.len(),
         "overlay": overlay_name(app.overlay),
         "session": app.session,
     })
+}
+
+/// Read a consistent snapshot of new exchanges and completed outstanding requests.
+/// A changed session resets the cursor, including after a wrapper restart.
+pub fn updates(
+    app: &App,
+    session_id: Option<&str>,
+    next_index: usize,
+    mut pending_indices: Vec<usize>,
+) -> ControlResult {
+    let session = app
+        .session
+        .as_ref()
+        .ok_or_else(|| ControlError::runtime("No active session"))?;
+    let reset = session_id != Some(session.id.as_str()) || next_index > app.exchanges().len();
+    let start = if reset { 0 } else { next_index };
+    if reset {
+        pending_indices.clear();
+    }
+    if pending_indices.iter().any(|index| *index >= start) {
+        return Err(ControlError::invalid_params(
+            "pendingIndices must precede nextIndex",
+        ));
+    }
+    pending_indices.sort_unstable();
+    pending_indices.dedup();
+    let completed = pending_indices
+        .into_iter()
+        .filter(|index| app.exchanges()[*index].response.is_some());
+    let exchanges = completed
+        .chain(start..app.exchanges().len())
+        .map(|index| {
+            let mut exchange = serde_json::to_value(SessionExchange::from(&app.exchanges()[index]))
+                .expect("session exchanges are serializable");
+            exchange["index"] = json!(index);
+            exchange
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "state": state(app),
+        "reset": reset,
+        "nextIndex": app.exchanges().len(),
+        "exchanges": exchanges,
+        "pending": pending(app),
+    }))
 }
 
 pub fn change(app: &App, changed: bool) -> Value {
@@ -779,7 +842,7 @@ pub fn export_session(app: &App) -> Session {
         schema_version: 1,
         exported_at_ms: timestamp_ms(SystemTime::now()),
         target: app.proxy_config.target_url.clone(),
-        exchanges: app.exchanges.iter().map(SessionExchange::from).collect(),
+        exchanges: app.exchanges().iter().map(SessionExchange::from).collect(),
     }
 }
 
@@ -956,7 +1019,7 @@ fn exchange_value(index: usize, exchange: &JsonRpcExchange) -> Value {
         "index": index,
         "id": exchange.id,
         "method": exchange.method,
-        "transport": transport_name(&exchange.transport),
+        "transport": exchange.transport.name(),
         "status": if exchange.is_notification() {
             "notification"
         } else if exchange.response.as_ref().is_some_and(|response| response.error.is_some()) {
@@ -1058,10 +1121,6 @@ pub fn annotation(annotation: &LineAnnotation) -> Value {
     annotation_value(annotation)
 }
 
-fn transport_name(transport: &TransportType) -> &'static str {
-    transport.name()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,13 +1167,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_update_cursors_and_rejects_invalid_pending_indices() {
+        let mut request = json!({"jsonrpc":"2.0", "id":1, "method":"debugger.getUpdates",
+            "params": {"sessionId":"session", "nextIndex":10, "pendingIndices":[0,4]}});
+        assert!(
+            matches!(parse_request(&request), Ok(ControlAction::GetUpdates {
+            session_id: Some(id), next_index: 10, pending_indices
+        }) if id == "session" && pending_indices == [0,4])
+        );
+        for invalid in [json!([-1]), json!([1.5]), json!(["1"]), json!({})] {
+            request["params"]["pendingIndices"] = invalid;
+            assert!(parse_request(&request).is_err());
+        }
+        request["params"] = json!([]);
+        assert!(
+            matches!(parse_request(&request), Ok(ControlAction::GetUpdates {
+            session_id: None, next_index: 0, pending_indices
+        }) if pending_indices.is_empty())
+        );
+    }
+
+    #[test]
     fn discovery_is_an_openrpc_document() {
         let document = discovery(8081);
 
         assert_eq!(document["openrpc"], "1.3.2");
         assert_eq!(document["servers"][0]["url"], "http://127.0.0.1:8081");
         assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(document["methods"].as_array().unwrap().len(), 26);
+        assert_eq!(document["methods"].as_array().unwrap().len(), 27);
         assert!(document["methods"]
             .as_array()
             .unwrap()

@@ -22,16 +22,15 @@ Read `getState.dataPlane` before acting:
 
 Drive the existing live process when its control endpoint responds. Do not start another debugger unless the user asks.
 
-Use any JSON-RPC client. This shell helper is enough:
+Use the debugger's generic JSON-RPC client:
 
 ```bash
 CONTROL_URL=http://127.0.0.1:8081
 rpc() {
   local method="$1" params="${2-}"
   if [ -z "$params" ]; then params='{}'; fi
-  curl -fsS "$CONTROL_URL" \
-    -H 'content-type: application/json' \
-    --data "$(printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":%s}' "$method" "$params")"
+  jsonrpc-debugger call --transport=http "$CONTROL_URL" \
+    "$(printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"%s\",\"params\":%s}' "$method" "$params")"
 }
 
 rpc rpc.discover
@@ -39,7 +38,7 @@ rpc debugger.getState
 rpc debugger.setFocus '{"panel":"history"}'
 ```
 
-Treat a JSON-RPC `error` envelope as failure even when HTTP returns 200. The runtime OpenRPC document returned by `rpc.discover` is the authority for methods and parameters.
+`call` prints the complete JSON-RPC response. Treat an `error` envelope as failure even when HTTP returns 200. The runtime OpenRPC document returned by `rpc.discover` is the authority for methods and parameters.
 
 ## Debug MCP From Either Side
 

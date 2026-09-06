@@ -425,19 +425,15 @@ async fn forward_http_request(
                                 // Show hex representation for binary data
                                 let bytes: Vec<u8> = response_text.bytes().take(50).collect();
                                 format!("Binary data: {:02x?}...", bytes)
-                            } else if response_text.trim().starts_with('{')
-                                || response_text.trim().starts_with('[')
-                            {
-                                // For JSON-like content, show more text
-                                if response_text.len() > 500 {
-                                    format!("{}...", &response_text[..500])
-                                } else {
-                                    response_text.clone()
-                                }
-                            } else if response_text.len() > 200 {
-                                format!("{}...", &response_text[..200])
                             } else {
-                                response_text.clone()
+                                let limit = if response_text.trim().starts_with('{')
+                                    || response_text.trim().starts_with('[')
+                                {
+                                    500
+                                } else {
+                                    200
+                                };
+                                response_preview(&response_text, limit)
                             };
 
                             // Determine the likely issue
@@ -617,6 +613,17 @@ fn stdio_error_response(request: &Value, message: &str) -> Value {
     }
 }
 
+fn response_preview(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
 fn should_forward_header(header_name: &str) -> bool {
     !matches!(
         header_name.to_lowercase().as_str(),
@@ -636,6 +643,32 @@ fn http_transport(body: &Value) -> TransportType {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn malformed_unicode_responses_produce_errors_without_panicking() {
+        for (prefix, limit) in [("x", 200), ("{", 500)] {
+            let text = format!("{}💡tail", prefix.repeat(limit - 1));
+            let expected = format!("{}...", prefix.repeat(limit - 1));
+            let route = warp::any().map(move || text.clone());
+            let (address, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+            let server = tokio::spawn(server);
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            forward_http_request(
+                warp::http::HeaderMap::new(),
+                json!({"jsonrpc":"2.0", "id":1, "method":"example/run"}),
+                format!("http://{address}"),
+                Client::new(),
+                sender,
+            )
+            .await
+            .unwrap();
+            let recorded = receiver.recv().await.unwrap();
+            let error = recorded.error.unwrap();
+            assert_eq!(error["code"], -32700);
+            assert_eq!(error["data"]["response_preview"], expected);
+            server.abort();
+        }
+    }
 
     #[test]
     fn batch_bodies_become_individual_messages() {
@@ -687,9 +720,9 @@ mod tests {
         for message in requests.into_iter().chain(responses) {
             app.add_message(message);
         }
-        assert_eq!(app.exchanges.len(), 2);
+        assert_eq!(app.exchanges().len(), 2);
         assert!(app
-            .exchanges
+            .exchanges()
             .iter()
             .all(|exchange| exchange.response.is_some()));
     }

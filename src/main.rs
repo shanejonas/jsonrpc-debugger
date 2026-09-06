@@ -28,7 +28,7 @@ mod ui;
 
 use app::{
     App, AppMode, EditorMode, EditorMotion, EditorOperator, EditorTarget, LineAnnotation, Overlay,
-    TextEditor,
+    SearchHit, TextEditor,
 };
 use control::{ControlAction, ControlCommand, ControlError, PendingDecision};
 use history::HistoryStore;
@@ -63,6 +63,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum TargetMode {
+    /// Call a JSON-RPC endpoint
+    Call {
+        /// JSON-RPC transport
+        #[arg(long, value_enum, default_value = "http")]
+        transport: CallTransport,
+
+        /// JSON-RPC endpoint
+        url: String,
+
+        /// Complete JSON-RPC request or batch
+        request: String,
+    },
+
     /// Drive a spawned JSON-RPC server through a local HTTP proxy
     Stdio {
         /// Message framing used on stdin and stdout
@@ -101,6 +114,11 @@ enum TargetMode {
 enum CliFraming {
     JsonLines,
     ContentLength,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CallTransport {
+    Http,
 }
 
 impl From<CliFraming> for app::Framing {
@@ -411,6 +429,11 @@ async fn handle_control_command(
     let result = match action {
         ControlAction::Discover => Ok(control::discovery(app.control_port)),
         ControlAction::GetState => Ok(control::state(app)),
+        ControlAction::GetUpdates {
+            session_id,
+            next_index,
+            pending_indices,
+        } => control::updates(app, session_id.as_deref(), next_index, pending_indices),
         ControlAction::WaitForChange { .. } => {
             unreachable!("wait commands are registered by run_app")
         }
@@ -518,7 +541,7 @@ async fn handle_control_command(
             }
         }
         ControlAction::SelectExchange { index } => {
-            if index >= app.exchanges.len() {
+            if index >= app.exchanges().len() {
                 Err(ControlError::invalid_params(format!(
                     "Exchange index {index} does not exist"
                 )))
@@ -705,15 +728,14 @@ fn center_detail_range(
     let visible_lines = ui::panel_visible_lines(terminal_area, app, panel).max(1);
     let annotations = app
         .visible_annotations(panel)
-        .filter(|annotation| {
-            annotation.start_line != annotation.end_line && annotation.end_line <= total_lines
-        })
+        .filter(|annotation| annotation.end_line <= total_lines)
         .collect::<Vec<_>>();
     let annotations_before = |line: usize| {
         annotations
             .iter()
             .filter(|annotation| annotation.end_line < line)
             .count()
+            * ui::ANNOTATION_CARD_HEIGHT
     };
     let range_start = start_line.saturating_sub(1) + annotations_before(start_line);
     let source_range_end = end_line.saturating_sub(1) + annotations_before(end_line);
@@ -723,10 +745,15 @@ fn center_detail_range(
                 .iter()
                 .filter(|annotation| annotation.end_line == end_line)
                 .position(|annotation| annotation.id == id)
-                .map(|position| end_line + annotations_before(end_line) + position)
+                .map(|position| {
+                    end_line
+                        + annotations_before(end_line)
+                        + position * ui::ANNOTATION_CARD_HEIGHT
+                        + ui::ANNOTATION_CARD_HEIGHT / 2
+                })
         })
         .unwrap_or(source_range_end);
-    let display_total = total_lines + annotations.len();
+    let display_total = total_lines + annotations.len() * ui::ANNOTATION_CARD_HEIGHT;
     let range_center = range_start + range_end.saturating_sub(range_start) / 2;
     let viewport_center = visible_lines.saturating_sub(1) / 2;
     let display_scroll = range_center
@@ -739,6 +766,7 @@ fn center_detail_range(
                     .iter()
                     .filter(|annotation| annotation.end_line <= *source)
                     .count()
+                    * ui::ANNOTATION_CARD_HEIGHT
                 <= display_scroll
         })
         .last()
@@ -813,7 +841,7 @@ fn detail_lines_at(
     tab: Option<app::DetailTab>,
 ) -> Result<Vec<String>, ControlError> {
     let exchange_index = exchange_index.unwrap_or(app.selected_exchange);
-    if exchange_index >= app.exchanges.len() {
+    if exchange_index >= app.exchanges().len() {
         return Err(ControlError::invalid_params(format!(
             "Exchange index {exchange_index} does not exist"
         )));
@@ -867,6 +895,95 @@ fn reveal_lines_at(
         None,
     );
     Ok(())
+}
+
+fn search_hits(app: &App, query: &str) -> Vec<SearchHit> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut hits = Vec::new();
+    for exchange_index in 0..app.exchanges().len() {
+        for panel in [app::Focus::RequestSection, app::Focus::ResponseSection] {
+            for tab in [app::DetailTab::Headers, app::DetailTab::Body] {
+                let Some(lines) = ui::detail_lines_text_at(app, panel, exchange_index, tab) else {
+                    continue;
+                };
+                hits.extend(lines.iter().enumerate().filter_map(|(index, line)| {
+                    line.to_lowercase().contains(&query).then_some(SearchHit {
+                        exchange_index,
+                        panel,
+                        tab,
+                        start_line: index + 1,
+                        end_line: index + 1,
+                    })
+                }));
+            }
+        }
+    }
+    hits.extend(app.annotations.iter().filter_map(|annotation| {
+        annotation
+            .message
+            .to_lowercase()
+            .contains(&query)
+            .then_some(SearchHit {
+                exchange_index: annotation.exchange_index,
+                panel: annotation.panel,
+                tab: annotation.tab,
+                start_line: annotation.start_line,
+                end_line: annotation.end_line,
+            })
+    }));
+    hits.sort_by_key(search_hit_order);
+    hits.dedup();
+    hits
+}
+
+fn search_hit_order(hit: &SearchHit) -> (usize, usize, usize, usize, usize) {
+    let panel = usize::from(hit.panel == app::Focus::ResponseSection);
+    let tab = usize::from(hit.tab == app::DetailTab::Body);
+    (hit.exchange_index, panel, tab, hit.start_line, hit.end_line)
+}
+
+fn apply_search(app: &mut App, area: ratatui::layout::Rect) {
+    let query = app.input_buffer.trim().to_string();
+    let hits = search_hits(app, &query);
+    let first = app.set_search_results(query.clone(), hits);
+    if let Some(hit) = first {
+        reveal_search_hit(app, area, hit);
+    } else if !query.is_empty() {
+        app.set_notice(format!("No matches for {query:?}"));
+    }
+}
+
+fn navigate_search(app: &mut App, area: ratatui::layout::Rect, next: bool) -> bool {
+    if !app.search_active() {
+        return false;
+    }
+    let hit = if next {
+        app.next_search_hit()
+    } else {
+        app.previous_search_hit()
+    };
+    if let Some(hit) = hit {
+        reveal_search_hit(app, area, hit);
+    }
+    true
+}
+
+fn reveal_search_hit(app: &mut App, area: ratatui::layout::Rect, hit: SearchHit) {
+    if let Err(error) = reveal_lines_at(
+        app,
+        area,
+        hit.panel,
+        Some(hit.exchange_index),
+        Some(hit.tab),
+        hit.start_line,
+        hit.end_line,
+    ) {
+        app.set_notice(format!("Error: {}", error.message));
+    }
 }
 
 fn annotate_visual_selection(
@@ -1113,6 +1230,28 @@ async fn main() -> Result<()> {
     }
 
     match &cli.mode {
+        Some(TargetMode::Call {
+            transport,
+            url,
+            request,
+        }) => {
+            let request: serde_json::Value = serde_json::from_str(request)
+                .map_err(|error| anyhow::anyhow!("invalid request JSON: {error}"))?;
+            let response: serde_json::Value = match transport {
+                CallTransport::Http => {
+                    reqwest::Client::new()
+                        .post(url)
+                        .json(&request)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(());
+        }
         Some(TargetMode::Wrap { framing, command }) => {
             if cli.target.is_some() {
                 anyhow::bail!("--target cannot be used with the wrap subcommand");
@@ -1163,7 +1302,9 @@ async fn main() -> Result<()> {
             app::TransportType::Http,
             None,
         ),
-        Some(TargetMode::Wrap { .. } | TargetMode::Attach { .. }) => unreachable!(),
+        Some(TargetMode::Call { .. } | TargetMode::Wrap { .. } | TargetMode::Attach { .. }) => {
+            unreachable!()
+        }
     };
     let proxy_config = app::ProxyConfig {
         listen_port: cli.port,
@@ -1376,11 +1517,9 @@ async fn run_transparent_wrap(
 
 async fn run_attached_tui(control_url: &str) -> Result<()> {
     let client = attach::ControlClient::new(control_url.to_string());
-    let state = client.state().await.map_err(anyhow::Error::msg)?;
-    let mut revision = state.revision;
     let mut app = App::new();
-    client
-        .snapshot(state)
+    let mut revision = client
+        .snapshot(&app)
         .await
         .map_err(anyhow::Error::msg)?
         .apply(&mut app)
@@ -1410,18 +1549,23 @@ async fn run_attached_app(
     revision: &mut u64,
 ) -> Result<()> {
     let mut last_refresh = Instant::now();
+    let mut should_draw = true;
+    let mut last_drawn_revision = app.revision();
     loop {
         if last_refresh.elapsed() >= std::time::Duration::from_millis(100) {
             match client.state().await {
-                Ok(state) if state.revision != *revision => {
-                    let next_revision = state.revision;
-                    match client.snapshot(state).await {
+                Ok(state)
+                    if state.revision != *revision
+                        || app.session.as_ref().map(|session| &session.id)
+                            != Some(&state.session.id) =>
+                {
+                    match client.snapshot(app).await {
                         Ok(snapshot) => {
-                            if let Err(error) = snapshot.apply(app) {
-                                app.set_notice(format!("Error: {error}"));
-                            } else {
-                                *revision = next_revision;
+                            match snapshot.apply(app) {
+                                Ok(next_revision) => *revision = next_revision,
+                                Err(error) => app.set_notice(format!("Error: {error}")),
                             }
+                            should_draw = true;
                         }
                         Err(error) => app.set_notice(format!("Error: {error}")),
                     }
@@ -1432,14 +1576,24 @@ async fn run_attached_app(
             last_refresh = Instant::now();
         }
 
-        app.clear_expired_notice();
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        should_draw |= app.clear_expired_notice();
+        should_draw |= app.revision() != last_drawn_revision;
+        if should_draw {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            last_drawn_revision = app.revision();
+            should_draw = false;
+        }
         if !event::poll(std::time::Duration::from_millis(50))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let input = event::read()?;
+        if matches!(input, Event::Resize(..)) {
+            should_draw = true;
+        }
+        let Event::Key(key) = input else {
             continue;
         };
+        should_draw = true;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
@@ -1506,10 +1660,10 @@ async fn run_attached_app(
             }
             continue;
         }
-        if app.input_mode == app::InputMode::FilteringRequests {
+        if app.input_mode == app::InputMode::Searching {
             match key.code {
-                KeyCode::Enter => app.apply_filter(),
-                KeyCode::Esc => app.cancel_filtering(),
+                KeyCode::Enter => apply_search(app, terminal.size()?),
+                KeyCode::Esc => app.cancel_search_input(),
                 KeyCode::Backspace => app.handle_backspace(),
                 KeyCode::Char(character) => app.handle_input_char(character),
                 _ => {}
@@ -1522,7 +1676,13 @@ async fn run_attached_app(
         }
 
         match key.code {
-            KeyCode::Esc => app.clear_line_selection(),
+            KeyCode::Esc => {
+                if app.search_active() {
+                    app.clear_search();
+                } else {
+                    app.clear_line_selection();
+                }
+            }
             KeyCode::Enter => {
                 if app.app_mode == AppMode::Normal && !enter_request_list(app) {
                     copy_focused_panel(terminal, app)?;
@@ -1609,12 +1769,16 @@ async fn run_attached_app(
                 }
             },
             KeyCode::Char('[') if app.app_mode == AppMode::Normal => {
-                app.focus_previous_annotation();
+                if !navigate_search(app, terminal.size()?, false) {
+                    app.focus_previous_annotation();
+                }
             }
             KeyCode::Char(']') if app.app_mode == AppMode::Normal => {
-                app.focus_next_annotation();
+                if !navigate_search(app, terminal.size()?, true) {
+                    app.focus_next_annotation();
+                }
             }
-            KeyCode::Char('/') => app.start_filtering_requests(),
+            KeyCode::Char('/') => app.start_searching(),
             KeyCode::Char('v') if app.app_mode == AppMode::Normal => toggle_visual_selection(app),
             KeyCode::Char('a') if !app.pending_requests.is_empty() => {
                 allow_attached_pending(app, client).await;
@@ -1927,13 +2091,13 @@ async fn run_app(
             if let Event::Key(key) = input_event {
                 // Handle input modes first
                 match app.input_mode {
-                    app::InputMode::FilteringRequests => {
+                    app::InputMode::Searching => {
                         match key.code {
                             KeyCode::Enter => {
-                                app.apply_filter();
+                                apply_search(&mut app, terminal.size()?);
                             }
                             KeyCode::Esc => {
-                                app.cancel_filtering();
+                                app.cancel_search_input();
                             }
                             KeyCode::Backspace => {
                                 app.handle_backspace();
@@ -2094,7 +2258,11 @@ async fn run_app(
 
                 match key.code {
                     KeyCode::Esc => {
-                        app.clear_line_selection();
+                        if app.search_active() {
+                            app.clear_search();
+                        } else {
+                            app.clear_line_selection();
+                        }
                     }
                     KeyCode::Enter => {
                         if app.app_mode == AppMode::Normal && !enter_request_list(&mut app) {
@@ -2243,13 +2411,17 @@ async fn run_app(
                         }
                     },
                     KeyCode::Char('[') if app.app_mode == AppMode::Normal => {
-                        app.focus_previous_annotation();
+                        if !navigate_search(&mut app, terminal.size()?, false) {
+                            app.focus_previous_annotation();
+                        }
                     }
                     KeyCode::Char(']') if app.app_mode == AppMode::Normal => {
-                        app.focus_next_annotation();
+                        if !navigate_search(&mut app, terminal.size()?, true) {
+                            app.focus_next_annotation();
+                        }
                     }
                     KeyCode::Char('/') => {
-                        app.start_filtering_requests();
+                        app.start_searching();
                     }
                     KeyCode::Char('v') if app.app_mode == AppMode::Normal => {
                         toggle_visual_selection(&mut app);
@@ -2716,7 +2888,7 @@ async fn handle_mouse_event(
 
     match action {
         ui::MouseAction::EditTarget => app.start_editing_target(),
-        ui::MouseAction::EditFilter => app.start_filtering_requests(),
+        ui::MouseAction::EditSearch => app.start_searching(),
         ui::MouseAction::SetProxyRunning(should_run) => {
             app.set_focus(app::Focus::StatusHeader);
             set_proxy_running(app, should_run, proxy_server, message_sender, proxy_state).await;
@@ -3130,6 +3302,89 @@ mod tests {
     }
 
     #[test]
+    fn search_finds_request_response_headers_and_annotations() {
+        let mut app = App::new();
+        let mut request = rpc_message(1, app::MessageDirection::Request);
+        request.method = Some("trace_needle".to_string());
+        request.headers = Some(std::collections::HashMap::from([(
+            "x-debug".to_string(),
+            "needle-header".to_string(),
+        )]));
+        app.add_message(request);
+
+        let mut response = rpc_message(1, app::MessageDirection::Response);
+        response.result = Some(serde_json::json!({"receipt": "needle-result"}));
+        app.add_message(response);
+        app.add_annotation(LineAnnotation {
+            id: "note".to_string(),
+            exchange_index: 0,
+            panel: app::Focus::ResponseSection,
+            tab: app::DetailTab::Body,
+            start_line: 2,
+            end_line: 2,
+            message: "Payout recipient".to_string(),
+            text: vec!["result".to_string()],
+        });
+
+        let hits = search_hits(&app, "NeEdLe");
+        assert!(hits.iter().any(|hit| {
+            hit.panel == app::Focus::RequestSection && hit.tab == app::DetailTab::Headers
+        }));
+        assert!(hits.iter().any(|hit| {
+            hit.panel == app::Focus::RequestSection && hit.tab == app::DetailTab::Body
+        }));
+        assert!(hits.iter().any(|hit| {
+            hit.panel == app::Focus::ResponseSection && hit.tab == app::DetailTab::Body
+        }));
+
+        assert_eq!(
+            search_hits(&app, "payout"),
+            vec![SearchHit {
+                exchange_index: 0,
+                panel: app::Focus::ResponseSection,
+                tab: app::DetailTab::Body,
+                start_line: 2,
+                end_line: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn search_reveals_matches_and_wraps_navigation() {
+        let mut app = App::new();
+        for id in 1..=2 {
+            let mut request = rpc_message(id, app::MessageDirection::Request);
+            request.params = Some(serde_json::json!({"value": format!("needle_{id}")}));
+            app.add_message(request);
+        }
+        app.input_buffer = "needle".to_string();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+
+        apply_search(&mut app, area);
+        assert_eq!(app.search_progress(), (1, 2));
+        assert_eq!(app.selected_exchange, 0);
+        assert!(app
+            .line_selection
+            .as_ref()
+            .unwrap()
+            .text
+            .join("\n")
+            .contains("needle_1"));
+
+        assert!(navigate_search(&mut app, area, true));
+        assert_eq!(app.search_progress(), (2, 2));
+        assert_eq!(app.selected_exchange, 1);
+
+        assert!(navigate_search(&mut app, area, true));
+        assert_eq!(app.search_progress(), (1, 2));
+        assert_eq!(app.selected_exchange, 0);
+
+        assert!(navigate_search(&mut app, area, false));
+        assert_eq!(app.search_progress(), (2, 2));
+        assert_eq!(app.selected_exchange, 1);
+    }
+
+    #[test]
     fn request_navigation_keys_work_from_details() {
         let mut app = App::new();
         app.add_message(rpc_message(1, app::MessageDirection::Request));
@@ -3187,14 +3442,14 @@ mod tests {
 
         assert!(record_new_messages(&mut app, &mut history));
         assert!(!record_new_messages(&mut app, &mut history));
-        assert_eq!(app.exchanges.len(), 2);
+        assert_eq!(app.exchanges().len(), 2);
         assert!(app
-            .exchanges
+            .exchanges()
             .iter()
             .all(|exchange| exchange.response.is_some()));
         let persisted = history.load_session(&session.id).unwrap().1;
-        assert_eq!(persisted.len(), app.exchanges.len());
-        for (persisted, displayed) in persisted.iter().zip(&app.exchanges) {
+        assert_eq!(persisted.len(), app.exchanges().len());
+        for (persisted, displayed) in persisted.iter().zip(app.exchanges()) {
             assert_eq!(persisted.id, displayed.id);
             assert_eq!(persisted.method, displayed.method);
             assert!(persisted.request.is_some());
@@ -3553,7 +3808,7 @@ mod tests {
 
         let display_scroll = app.response_details_scroll;
         let viewport_center = display_scroll + visible_lines.saturating_sub(1) / 2;
-        assert_eq!(viewport_center, 18);
+        assert_eq!(viewport_center, 19);
     }
 
     #[tokio::test]

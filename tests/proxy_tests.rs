@@ -5,17 +5,6 @@ use std::ffi::OsString;
 use tokio::sync::mpsc;
 
 #[tokio::test]
-async fn test_proxy_server_creation() {
-    let (sender, _receiver) = mpsc::unbounded_channel();
-
-    let _proxy = ProxyServer::new(8080, "https://mock.open-rpc.org".to_string(), sender);
-
-    // Just test that we can create the proxy server
-    // We can't easily test the actual server functionality without setting up a real target
-    // The constructor parameters are validated during creation
-}
-
-#[tokio::test]
 async fn proxy_bind_rejects_an_occupied_port() {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -296,8 +285,8 @@ fn test_message_channel_integration() {
     assert!(!app.check_for_new_messages());
 
     // Should have one exchange with our request
-    assert_eq!(app.exchanges.len(), 1);
-    let last_exchange = app.exchanges.last().unwrap();
+    assert_eq!(app.exchanges().len(), 1);
+    let last_exchange = app.exchanges().last().unwrap();
     assert_eq!(last_exchange.method, Some("test_method".to_string()));
     assert_eq!(
         last_exchange.id,
@@ -314,7 +303,7 @@ fn test_app_with_receiver() {
     let app = App::new_with_receiver(receiver);
 
     // Should start empty
-    assert!(app.exchanges.is_empty());
+    assert!(app.exchanges().is_empty());
     assert_eq!(app.selected_exchange, 0);
     assert!(app.is_running);
     assert!(app.message_receiver.is_some());
@@ -325,7 +314,7 @@ fn test_multiple_message_handling() {
     let (sender, receiver) = mpsc::unbounded_channel();
     let mut app = App::new_with_receiver(receiver);
 
-    let initial_count = app.exchanges.len();
+    let initial_count = app.exchanges().len();
 
     // Send multiple request messages
     for i in 1..=5 {
@@ -347,10 +336,10 @@ fn test_multiple_message_handling() {
     assert!(app.check_for_new_messages());
 
     // Should have all the new exchanges (one per request)
-    assert_eq!(app.exchanges.len(), initial_count + 5);
+    assert_eq!(app.exchanges().len(), initial_count + 5);
 
     // Check the last exchange
-    let last_exchange = app.exchanges.last().unwrap();
+    let last_exchange = app.exchanges().last().unwrap();
     assert_eq!(last_exchange.method, Some("method_5".to_string()));
     assert_eq!(
         last_exchange.id,

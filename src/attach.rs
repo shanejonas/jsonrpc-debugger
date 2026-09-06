@@ -3,7 +3,7 @@ use crate::{
         App, AppMode, Framing, JsonRpcMessage, MessageDirection, PendingRequest, ProxyConfig,
         SessionSummary, TransportType,
     },
-    control::{self, Session},
+    control::SessionExchange,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -30,10 +30,21 @@ pub struct RemoteState {
     pub session: SessionSummary,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub state: RemoteState,
-    pub session: Session,
+    reset: bool,
+    next_index: usize,
+    exchanges: Vec<RemoteExchange>,
     pending: Vec<RemotePending>,
+}
+
+#[derive(Deserialize)]
+struct RemoteExchange {
+    index: usize,
+    #[serde(flatten)]
+    exchange: SessionExchange,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,19 +69,16 @@ impl ControlClient {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn snapshot(&self, state: RemoteState) -> Result<Snapshot, String> {
-        if state.data_plane != "stdio" {
-            return Err("attach requires a transparent stdio wrapper".to_string());
+    pub async fn snapshot(&self, app: &App) -> Result<Snapshot, String> {
+        let mut params = json!({
+            "nextIndex": app.exchanges().len(),
+            "pendingIndices": app.pending_exchange_indices().collect::<Vec<_>>(),
+        });
+        if let Some(session) = &app.session {
+            params["sessionId"] = json!(session.id);
         }
-        let session = serde_json::from_value(self.call("debugger.exportSession", json!({})).await?)
-            .map_err(|error| error.to_string())?;
-        let pending = serde_json::from_value(self.call("debugger.getPending", json!({})).await?)
-            .map_err(|error| error.to_string())?;
-        Ok(Snapshot {
-            state,
-            session,
-            pending,
-        })
+        serde_json::from_value(self.call("debugger.getUpdates", params).await?)
+            .map_err(|error| error.to_string())
     }
 
     pub async fn set_paused(&self, paused: bool) -> Result<(), String> {
@@ -134,11 +142,37 @@ impl ControlClient {
 }
 
 impl Snapshot {
-    pub fn apply(self, app: &mut App) -> Result<(), String> {
+    pub fn apply(self, app: &mut App) -> Result<u64, String> {
+        if self.state.data_plane != "stdio" {
+            return Err("attach requires a transparent stdio wrapper".to_string());
+        }
         let transport = parse_transport(&self.state.transport)?;
         let mode = parse_mode(&self.state.mode)?;
-        let exchanges = control::replay_session(self.session).map_err(|error| error.message)?;
         let first_snapshot = app.session.is_none();
+        if !self.reset
+            && app.session.as_ref().map(|session| &session.id) != Some(&self.state.session.id)
+        {
+            return Err("incremental update belongs to a different session".to_string());
+        }
+        let mut next_index = if self.reset { 0 } else { app.exchanges().len() };
+        let mut previous = None;
+        let mut exchanges = Vec::with_capacity(self.exchanges.len());
+        for update in self.exchanges {
+            if update.index > next_index || previous.is_some_and(|index| update.index <= index) {
+                return Err(
+                    "exchange updates must be ordered and contiguous with local history"
+                        .to_string(),
+                );
+            }
+            if update.index == next_index {
+                next_index += 1;
+            }
+            previous = Some(update.index);
+            exchanges.push((update.index, update.exchange.try_into()?));
+        }
+        if next_index != self.next_index || next_index != self.state.session.exchange_count {
+            return Err("exchange update count does not match session".to_string());
+        }
 
         app.proxy_config = ProxyConfig {
             listen_port: self.state.proxy_port.unwrap_or_default(),
@@ -149,13 +183,24 @@ impl Snapshot {
         };
         app.control_port = self.state.control_port;
         app.is_running = self.state.running;
-        if first_snapshot {
-            app.activate_session(self.state.session, exchanges, Vec::new());
+        if self.reset {
+            app.activate_session(
+                self.state.session,
+                exchanges
+                    .into_iter()
+                    .map(|(_, exchange)| exchange)
+                    .collect(),
+                Vec::new(),
+            );
         } else {
-            let selected = app.selected_exchange.min(exchanges.len().saturating_sub(1));
-            app.exchanges = exchanges;
+            for (index, exchange) in exchanges {
+                if index < app.exchanges().len() {
+                    app.replace_exchange(index, exchange);
+                } else {
+                    app.push_exchange(exchange);
+                }
+            }
             app.session = Some(self.state.session);
-            app.selected_exchange = selected;
             app.mark_changed();
         }
         app.app_mode = mode;
@@ -170,7 +215,7 @@ impl Snapshot {
         if first_snapshot {
             app.set_notice("Attached; Ctrl-B p pauses client requests");
         }
-        Ok(())
+        Ok(self.state.revision)
     }
 }
 

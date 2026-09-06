@@ -6,7 +6,7 @@ fn test_app_new_creates_empty() {
     let app = App::new();
 
     // Should start empty
-    assert!(app.exchanges.is_empty());
+    assert!(app.exchanges().is_empty());
     assert_eq!(app.selected_exchange, 0);
     assert!(app.is_running);
     assert_eq!(app.proxy_config.listen_port, 8080);
@@ -16,7 +16,7 @@ fn test_app_new_creates_empty() {
 #[test]
 fn test_add_message() {
     let mut app = App::new();
-    let initial_count = app.exchanges.len();
+    let initial_count = app.exchanges().len();
 
     let test_message = JsonRpcMessage {
         id: Some(serde_json::Value::Number(serde_json::Number::from(999))),
@@ -32,8 +32,8 @@ fn test_add_message() {
 
     app.add_message(test_message);
 
-    assert_eq!(app.exchanges.len(), initial_count + 1);
-    let last_exchange = app.exchanges.last().unwrap();
+    assert_eq!(app.exchanges().len(), initial_count + 1);
+    let last_exchange = app.exchanges().last().unwrap();
     assert_eq!(last_exchange.method, Some("test_method".to_string()));
     assert_eq!(
         last_exchange.id,
@@ -58,7 +58,7 @@ fn idless_requests_are_notifications() {
         headers: None,
     });
 
-    assert!(app.exchanges[0].is_notification());
+    assert!(app.exchanges()[0].is_notification());
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn test_navigation() {
         app.add_message(test_message);
     }
 
-    let exchange_count = app.exchanges.len();
+    let exchange_count = app.exchanges().len();
 
     // Test selecting next
     app.select_next();
@@ -227,17 +227,17 @@ fn test_request_response_pairing() {
     app.add_message(error_response);
 
     // Verify we have 2 exchanges (request-response pairs)
-    assert_eq!(app.exchanges.len(), 2);
+    assert_eq!(app.exchanges().len(), 2);
 
     // Check first exchange is HTTP request-response pair
-    let first_exchange = &app.exchanges[0];
+    let first_exchange = &app.exchanges()[0];
     assert!(first_exchange.request.is_some());
     assert!(first_exchange.response.is_some());
     assert_eq!(first_exchange.method, Some("eth_getBalance".to_string()));
     assert!(matches!(first_exchange.transport, TransportType::Http));
 
     // Check second exchange is WebSocket request-response pair
-    let second_exchange = &app.exchanges[1];
+    let second_exchange = &app.exchanges()[1];
     assert!(second_exchange.request.is_some());
     assert!(second_exchange.response.is_some());
     assert_eq!(second_exchange.method, Some("eth_subscribe".to_string()));
@@ -253,172 +253,48 @@ fn test_request_response_pairing() {
 }
 
 #[test]
-fn test_json_rpc_message_creation() {
-    let message = JsonRpcMessage {
-        id: Some(serde_json::Value::Number(serde_json::Number::from(42))),
-        method: Some("test_method".to_string()),
-        params: Some(serde_json::json!({"param1": "value1"})),
-        result: None,
-        error: None,
-        timestamp: std::time::SystemTime::now(),
-        direction: MessageDirection::Request,
-        transport: TransportType::Http,
-        headers: None,
-    };
-
-    assert_eq!(
-        message.id,
-        Some(serde_json::Value::Number(serde_json::Number::from(42)))
-    );
-    assert_eq!(message.method, Some("test_method".to_string()));
-    assert!(matches!(message.direction, MessageDirection::Request));
-    assert!(matches!(message.transport, TransportType::Http));
-}
-
-#[test]
-fn test_proxy_config() {
-    let config = ProxyConfig {
-        listen_port: 9090,
-        target_url: "https://example.com".to_string(),
-        transport: TransportType::Http,
-        stdio: None,
-        transparent: false,
-    };
-
-    assert_eq!(config.listen_port, 9090);
-    assert_eq!(config.target_url, "https://example.com");
-    assert!(matches!(config.transport, TransportType::Http));
-}
-
-#[test]
-fn test_filtering_functionality() {
+fn search_mode_cycles_and_wraps_matches() {
     let mut app = App::new();
-
-    // Add test exchanges with different methods
-    let methods = [
-        "eth_getBalance",
-        "eth_sendTransaction",
-        "net_version",
-        "eth_blockNumber",
-    ];
-
-    for (i, method) in methods.iter().enumerate() {
-        let test_message = JsonRpcMessage {
-            id: Some(serde_json::Value::Number(serde_json::Number::from(
-                i as i64,
-            ))),
-            method: Some(method.to_string()),
-            params: Some(serde_json::json!({"test": format!("value_{}", i)})),
-            result: None,
-            error: None,
-            timestamp: std::time::SystemTime::now(),
-            direction: MessageDirection::Request,
-            transport: TransportType::Http,
-            headers: None,
-        };
-        app.add_message(test_message);
-    }
-
-    // Test initial state - no filter
-    assert_eq!(app.filter_text, "");
-    assert_eq!(app.exchanges.len(), 4);
-
-    // Test filter methods
-    app.start_filtering_requests();
-    assert_eq!(app.input_mode, InputMode::FilteringRequests);
-    assert_eq!(app.input_buffer, ""); // Should start empty
-
-    // Simulate typing "eth"
+    app.start_searching();
     app.handle_input_char('e');
     app.handle_input_char('t');
     app.handle_input_char('h');
+    assert_eq!(app.input_mode, InputMode::Searching);
     assert_eq!(app.input_buffer, "eth");
 
-    // Apply the filter
-    app.apply_filter();
-    assert_eq!(app.filter_text, "eth");
+    let first = SearchHit {
+        exchange_index: 0,
+        panel: Focus::RequestSection,
+        tab: DetailTab::Body,
+        start_line: 3,
+        end_line: 3,
+    };
+    let second = SearchHit {
+        exchange_index: 2,
+        panel: Focus::ResponseSection,
+        tab: DetailTab::Body,
+        start_line: 5,
+        end_line: 5,
+    };
+    assert_eq!(
+        app.set_search_results("eth".to_string(), vec![first, second]),
+        Some(first)
+    );
     assert_eq!(app.input_mode, InputMode::Normal);
-    assert_eq!(app.input_buffer, "");
+    assert!(app.search_active());
+    assert_eq!(app.search_progress(), (1, 2));
+    assert_eq!(app.next_search_hit(), Some(second));
+    assert_eq!(app.next_search_hit(), Some(first));
+    assert_eq!(app.previous_search_hit(), Some(second));
 
-    // Test that filtering logic would work (this tests the filter logic conceptually)
-    let filtered_count = app
-        .exchanges
-        .iter()
-        .filter(|exchange| {
-            if app.filter_text.is_empty() {
-                true
-            } else {
-                exchange
-                    .method
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains(&app.filter_text)
-            }
-        })
-        .count();
+    app.start_searching();
+    app.handle_input_char('x');
+    app.cancel_search_input();
+    assert_eq!(app.search_query, "eth");
 
-    // Should match 3 exchanges: eth_getBalance, eth_sendTransaction, eth_blockNumber
-    assert_eq!(filtered_count, 3);
-
-    // Test cancel filtering
-    app.start_filtering_requests();
-    app.handle_input_char('n');
-    app.handle_input_char('e');
-    app.handle_input_char('t');
-    app.cancel_filtering();
-    assert_eq!(app.filter_text, "eth"); // Should keep previous filter
-    assert_eq!(app.input_mode, InputMode::Normal);
-    assert_eq!(app.input_buffer, "");
-
-    // Test clearing filter
-    app.start_filtering_requests();
-    app.apply_filter(); // Apply empty filter
-    assert_eq!(app.filter_text, "");
-
-    // All exchanges should match when filter is empty
-    let all_count = app
-        .exchanges
-        .iter()
-        .filter(|exchange| {
-            if app.filter_text.is_empty() {
-                true
-            } else {
-                exchange
-                    .method
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains(&app.filter_text)
-            }
-        })
-        .count();
-    assert_eq!(all_count, 4);
-
-    // Test case-insensitive filtering (if implemented)
-    app.start_filtering_requests();
-    app.handle_input_char('E');
-    app.handle_input_char('T');
-    app.handle_input_char('H');
-    app.apply_filter();
-    assert_eq!(app.filter_text, "ETH");
-
-    // This would test case-insensitive matching if implemented
-    let case_insensitive_count = app
-        .exchanges
-        .iter()
-        .filter(|exchange| {
-            if app.filter_text.is_empty() {
-                true
-            } else {
-                exchange
-                    .method
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .contains(&app.filter_text.to_lowercase())
-            }
-        })
-        .count();
-    assert_eq!(case_insensitive_count, 3);
+    app.clear_search();
+    assert!(!app.search_active());
+    assert_eq!(app.search_progress(), (0, 0));
 }
 
 #[test]
@@ -1038,4 +914,92 @@ fn unpausing_with_pending_requests_keeps_them_visible() {
 
     app.toggle_pause_mode();
     assert_eq!(app.app_mode, AppMode::Paused);
+}
+
+fn pairing_message(id: Option<serde_json::Value>, direction: MessageDirection) -> JsonRpcMessage {
+    JsonRpcMessage {
+        id,
+        method: (direction == MessageDirection::Request).then(|| "example/run".to_string()),
+        params: None,
+        result: (direction == MessageDirection::Response).then(|| serde_json::json!("ok")),
+        error: None,
+        timestamp: std::time::SystemTime::now(),
+        direction,
+        transport: TransportType::Http,
+        headers: None,
+    }
+}
+
+#[test]
+fn pairs_duplicate_ids_newest_first_and_distinguishes_id_types() {
+    let mut app = App::new();
+    for id in [
+        serde_json::json!(7),
+        serde_json::json!("7"),
+        serde_json::json!(7),
+    ] {
+        app.add_message(pairing_message(Some(id), MessageDirection::Request));
+    }
+    app.add_message(pairing_message(
+        Some(serde_json::json!(7)),
+        MessageDirection::Response,
+    ));
+    assert!(app.exchanges()[2].response.is_some());
+    assert!(app.exchanges()[0].response.is_none());
+    app.add_message(pairing_message(
+        Some(serde_json::json!(7)),
+        MessageDirection::Response,
+    ));
+    assert!(app.exchanges()[0].response.is_some());
+    assert!(app.exchanges()[1].response.is_none());
+    app.add_message(pairing_message(
+        Some(serde_json::json!("7")),
+        MessageDirection::Response,
+    ));
+    assert!(app.exchanges()[1].response.is_some());
+    assert_eq!(app.pending_exchange_indices().count(), 0);
+}
+
+#[test]
+fn response_index_survives_import_and_session_changes() {
+    let mut source = App::new();
+    source.add_message(pairing_message(
+        Some(serde_json::json!(1)),
+        MessageDirection::Request,
+    ));
+    let mut app = App::new();
+    app.append_exchanges(source.exchanges().to_vec());
+    app.add_message(pairing_message(
+        Some(serde_json::json!(1)),
+        MessageDirection::Response,
+    ));
+    assert_eq!(app.exchanges().len(), 1);
+    assert!(app.exchanges()[0].response.is_some());
+
+    source.add_message(pairing_message(
+        Some(serde_json::json!(2)),
+        MessageDirection::Request,
+    ));
+    app.activate_session(
+        SessionSummary {
+            id: "new".into(),
+            name: "New".into(),
+            target: "test".into(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            exchange_count: 2,
+        },
+        source.exchanges().to_vec(),
+        Vec::new(),
+    );
+    app.add_message(pairing_message(
+        Some(serde_json::json!(2)),
+        MessageDirection::Response,
+    ));
+    assert!(app.exchanges()[1].response.is_some());
+    app.add_message(pairing_message(None, MessageDirection::Request));
+    app.add_message(pairing_message(None, MessageDirection::Response));
+    assert!(app.exchanges()[2].is_notification());
+    assert!(app.exchanges()[2].response.is_none());
+    assert!(app.exchanges()[3].request.is_none());
 }

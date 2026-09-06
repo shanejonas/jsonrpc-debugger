@@ -16,7 +16,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct HistoryStore {
     connection: Connection,
@@ -72,8 +72,7 @@ impl HistoryStore {
                 exchange_json TEXT NOT NULL,
                 UNIQUE(session_id, sequence)
             );
-            CREATE INDEX IF NOT EXISTS exchanges_session_sequence
-                ON exchanges(session_id, sequence);
+            DROP INDEX IF EXISTS exchanges_session_sequence;
             CREATE INDEX IF NOT EXISTS exchanges_pending_rpc_id
                 ON exchanges(rpc_id, complete, id DESC);
             CREATE TABLE IF NOT EXISTS annotations (
@@ -90,7 +89,7 @@ impl HistoryStore {
             );
             CREATE INDEX IF NOT EXISTS annotations_session_exchange
                 ON annotations(session_id, exchange_index, created_at_ms);
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             ",
         )?;
 
@@ -1039,6 +1038,52 @@ mod tests {
         assert!(empty_results.sessions.is_empty());
         assert!(empty_results.exchanges.is_empty());
         assert!(empty_results.annotations.is_empty());
+    }
+
+    #[test]
+    fn migrates_the_redundant_index_without_losing_history_or_uniqueness() {
+        let mut store = HistoryStore::in_memory().unwrap();
+        let session = store
+            .create_session(Some("migrate"), "http://node")
+            .unwrap();
+        store
+            .record_messages(&session.id, &[request(1), response(1), request(2)])
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE INDEX exchanges_session_sequence ON exchanges(session_id, sequence);
+             PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        let store = HistoryStore::from_connection(store.connection).unwrap();
+        assert_eq!(store.history(&session.id, 10, None).unwrap().len(), 2);
+        assert!(store.history(&session.id, 1, Some(1)).unwrap()[0]
+            .1
+            .response
+            .is_some());
+        let index_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='exchanges_session_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 0);
+        assert!(store
+            .connection
+            .execute(
+                "INSERT INTO exchanges (session_id, sequence, rpc_id, complete, exchange_json)
+             SELECT session_id, sequence, rpc_id, complete, exchange_json FROM exchanges LIMIT 1",
+                []
+            )
+            .is_err());
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

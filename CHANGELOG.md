@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-05
+
+### Added
+
+- `jsonrpc-debugger call --transport=http` sends a JSON-RPC request or batch and prints the complete response.
+- Session search covers request and response headers, bodies, and annotations, with match navigation and scrollbar markers.
+- `debugger.getUpdates` returns consistent incremental snapshots, including responses to older outstanding requests and resets when sessions change.
+- A dependency-free performance example measures queued response pairing and large-payload rendering.
+
+### Changed
+
+- Annotations render as bordered cards, with scrolling and selection aligned to their source lines.
+- Response pairing indexes pending requests and preserves newest-first matching for duplicate IDs.
+- Detail panels format each payload once per draw, and attached TUIs redraw only after changes or input.
+- Attach uses incremental updates and requires a wrapper with `debugger.getUpdates` support.
+- Rust library history is read through `App::exchanges()`; the unused `get_details_content_lines` method is removed. `ControlClient::snapshot` takes `&App`, and `Snapshot::apply` returns the remote revision.
+- History schema version 3 removes the redundant session/sequence index while retaining the unique constraint. Older binaries reject version 3 databases.
+- Remove assignment-only tests, the assertion-free proxy constructor test, and trivial transport-name wrappers.
+
+### Fixed
+
+- Malformed upstream responses containing Unicode at preview truncation boundaries return JSON-RPC errors without panicking.
+
 ## [0.5.0] - 2026-08-30
 
 ### Added

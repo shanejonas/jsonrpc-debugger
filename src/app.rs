@@ -160,7 +160,7 @@ fn json_rpc_message(
 pub enum InputMode {
     Normal,
     EditingTarget,
-    FilteringRequests,
+    Searching,
     AnnotatingSelection,
     NamingSession,
     RenamingSession,
@@ -206,6 +206,15 @@ pub struct LineSelection {
     pub start_line: usize,
     pub end_line: usize,
     pub text: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchHit {
+    pub exchange_index: usize,
+    pub panel: Focus,
+    pub tab: DetailTab,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -837,9 +846,13 @@ pub struct PendingRequest {
 
 #[allow(dead_code)]
 pub struct App {
-    pub exchanges: Vec<JsonRpcExchange>,
+    exchanges: Vec<JsonRpcExchange>,
+    pending_exchanges: HashMap<Option<serde_json::Value>, Vec<usize>>,
     pub selected_exchange: usize,
     pub filter_text: String,
+    pub search_query: String,
+    pub search_hits: Vec<SearchHit>,
+    pub selected_search_hit: usize,
     pub history_scroll: Option<usize>,
     pub details_scroll: usize,
     pub request_details_scroll: usize,
@@ -915,10 +928,6 @@ fn exchange_status(exchange: &JsonRpcExchange) -> &'static str {
     }
 }
 
-fn transport_name(transport: &TransportType) -> &'static str {
-    transport.label()
-}
-
 fn display_id(id: Option<&serde_json::Value>) -> String {
     match id {
         Some(serde_json::Value::String(value)) => value.clone(),
@@ -960,7 +969,7 @@ fn markdown_cell(value: &str) -> String {
 fn exchange_heading(title: &str, exchange: &JsonRpcExchange) -> String {
     format!(
         "# {title}\n\n- Transport: {}\n- Method: {}\n- ID: {}\n",
-        transport_name(&exchange.transport),
+        exchange.transport.label(),
         exchange.method.as_deref().unwrap_or("unknown"),
         display_id(exchange.id.as_ref()),
     )
@@ -1034,8 +1043,12 @@ impl App {
     pub fn new() -> Self {
         Self {
             exchanges: Vec::new(),
+            pending_exchanges: HashMap::new(),
             selected_exchange: 0,
             filter_text: String::new(),
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            selected_search_hit: 0,
             history_scroll: None,
             details_scroll: 0,
             request_details_scroll: 0,
@@ -1119,10 +1132,19 @@ impl App {
         exchanges: Vec<JsonRpcExchange>,
         annotations: Vec<LineAnnotation>,
     ) {
-        self.exchanges = exchanges;
+        self.exchanges.clear();
+        self.pending_exchanges.clear();
+        for exchange in exchanges {
+            self.push_exchange(exchange);
+        }
         self.selected_exchange = self.exchanges.len().saturating_sub(1);
         self.history_scroll = None;
         self.filter_text.clear();
+        self.search_query.clear();
+        self.search_hits.clear();
+        self.selected_search_hit = 0;
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
         self.session = Some(session);
         self.overlay = Overlay::None;
         self.line_selection = None;
@@ -1205,38 +1227,83 @@ impl App {
                 let exchange = JsonRpcExchange {
                     id: message.id.clone(),
                     method: message.method.clone(),
-                    request: Some(message.clone()),
                     response: None,
                     timestamp: message.timestamp,
                     transport: message.transport,
+                    request: Some(message),
                 };
-                self.exchanges.push(exchange);
+                self.push_exchange(exchange);
             }
             MessageDirection::Response => {
                 // Find matching request by ID and add response
-                if let Some(exchange) =
-                    self.exchanges.iter_mut().rev().find(|e| {
-                        !e.is_notification() && e.id == message.id && e.response.is_none()
-                    })
+                let index = self
+                    .pending_exchanges
+                    .get_mut(&message.id)
+                    .and_then(Vec::pop);
+                if self
+                    .pending_exchanges
+                    .get(&message.id)
+                    .is_some_and(Vec::is_empty)
                 {
-                    exchange.response = Some(message);
+                    self.pending_exchanges.remove(&message.id);
+                }
+                if let Some(index) = index {
+                    self.exchanges[index].response = Some(message);
                 } else {
                     // No matching request found, create exchange with just response
                     let exchange = JsonRpcExchange {
                         id: message.id.clone(),
                         method: None,
                         request: None,
-                        response: Some(message.clone()),
                         timestamp: message.timestamp,
                         transport: message.transport,
+                        response: Some(message),
                     };
-                    self.exchanges.push(exchange);
+                    self.push_exchange(exchange);
                 }
             }
         }
         if let Some(session) = &mut self.session {
             session.exchange_count = self.exchanges.len();
         }
+        self.mark_changed();
+    }
+
+    pub fn exchanges(&self) -> &[JsonRpcExchange] {
+        &self.exchanges
+    }
+
+    pub fn pending_exchange_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pending_exchanges.values().flatten().copied()
+    }
+
+    pub(crate) fn push_exchange(&mut self, exchange: JsonRpcExchange) {
+        if !exchange.is_notification() && exchange.response.is_none() {
+            self.pending_exchanges
+                .entry(exchange.id.clone())
+                .or_default()
+                .push(self.exchanges.len());
+        }
+        self.exchanges.push(exchange);
+    }
+
+    pub(crate) fn replace_exchange(&mut self, index: usize, exchange: JsonRpcExchange) {
+        let old_id = &self.exchanges[index].id;
+        if let Some(indices) = self.pending_exchanges.get_mut(old_id) {
+            indices.retain(|pending| *pending != index);
+            if indices.is_empty() {
+                self.pending_exchanges.remove(old_id);
+            }
+        }
+        if !exchange.is_notification() && exchange.response.is_none() {
+            let indices = self
+                .pending_exchanges
+                .entry(exchange.id.clone())
+                .or_default();
+            let position = indices.partition_point(|pending| *pending < index);
+            indices.insert(position, index);
+        }
+        self.exchanges[index] = exchange;
         self.mark_changed();
     }
 
@@ -1732,7 +1799,9 @@ impl App {
             return;
         }
 
-        self.exchanges.extend(exchanges);
+        for exchange in exchanges {
+            self.push_exchange(exchange);
+        }
         if let Some(session) = &mut self.session {
             session.exchange_count = self.exchanges.len();
         }
@@ -1792,7 +1861,7 @@ impl App {
             lines.push(format!(
                 "| {} | {} | {} | {} | {} |",
                 exchange_status(exchange),
-                transport_name(&exchange.transport),
+                exchange.transport.label(),
                 markdown_cell(exchange.method.as_deref().unwrap_or("unknown")),
                 markdown_cell(&display_id(exchange.id.as_ref())),
                 exchange_duration(exchange),
@@ -2049,23 +2118,79 @@ impl App {
         self.mark_changed();
     }
 
-    // Filtering requests methods
-    pub fn start_filtering_requests(&mut self) {
-        self.input_mode = InputMode::FilteringRequests;
+    pub fn start_searching(&mut self) {
+        if self.app_mode != AppMode::Normal {
+            return;
+        }
+        self.input_mode = InputMode::Searching;
         self.input_buffer.clear();
+        self.mark_changed();
     }
 
-    pub fn cancel_filtering(&mut self) {
-        self.input_mode = InputMode::Normal;
-        self.input_buffer.clear();
-    }
-
-    pub fn apply_filter(&mut self) {
-        self.filter_text = self.input_buffer.clone();
-        self.history_scroll = None;
+    pub fn cancel_search_input(&mut self) {
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.mark_changed();
+    }
+
+    pub fn set_search_results(&mut self, query: String, hits: Vec<SearchHit>) -> Option<SearchHit> {
+        self.search_query = query;
+        self.search_hits = hits;
+        self.selected_search_hit = 0;
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        self.line_selection = None;
+        self.visual_selection_active = false;
+        self.active_annotation_id = None;
+        self.mark_changed();
+        self.search_hits.first().copied()
+    }
+
+    pub fn search_active(&self) -> bool {
+        !self.search_query.is_empty()
+    }
+
+    pub fn search_progress(&self) -> (usize, usize) {
+        let total = self.search_hits.len();
+        let current = if total == 0 {
+            0
+        } else {
+            self.selected_search_hit + 1
+        };
+        (current, total)
+    }
+
+    pub fn next_search_hit(&mut self) -> Option<SearchHit> {
+        self.move_search_hit(true)
+    }
+
+    pub fn previous_search_hit(&mut self) -> Option<SearchHit> {
+        self.move_search_hit(false)
+    }
+
+    fn move_search_hit(&mut self, next: bool) -> Option<SearchHit> {
+        if self.search_hits.is_empty() {
+            return None;
+        }
+        self.selected_search_hit = if next {
+            (self.selected_search_hit + 1) % self.search_hits.len()
+        } else {
+            self.selected_search_hit
+                .checked_sub(1)
+                .unwrap_or(self.search_hits.len() - 1)
+        };
+        self.mark_changed();
+        self.search_hits.get(self.selected_search_hit).copied()
+    }
+
+    pub fn clear_search(&mut self) {
+        if !self.search_active() {
+            return;
+        }
+        self.search_query.clear();
+        self.search_hits.clear();
+        self.selected_search_hit = 0;
+        self.clear_line_selection();
     }
 
     // Get content lines for proper scrolling calculations
@@ -2154,110 +2279,6 @@ impl App {
     pub fn handle_backspace(&mut self) {
         if self.input_mode != InputMode::Normal {
             self.input_buffer.pop();
-        }
-    }
-
-    pub fn get_details_content_lines(&self) -> usize {
-        if let Some(exchange) = self.get_selected_exchange() {
-            let mut line_count = 1; // Transport line
-
-            if exchange.method.is_some() {
-                line_count += 1;
-            }
-            if exchange.id.is_some() {
-                line_count += 1;
-            }
-
-            // Request section
-            line_count += 1; // Blank line before section
-            line_count += 1; // Section header
-            line_count += 1; // Tabs line
-
-            if let Some(request) = &exchange.request {
-                match self.request_tab {
-                    0 => match &request.headers {
-                        Some(headers) if !headers.is_empty() => {
-                            line_count += headers.len();
-                        }
-                        Some(_) | None => {
-                            line_count += 1;
-                        }
-                    },
-                    _ => {
-                        let mut request_json = serde_json::Map::new();
-                        request_json.insert(
-                            "jsonrpc".to_string(),
-                            serde_json::Value::String("2.0".to_string()),
-                        );
-                        if let Some(id) = &request.id {
-                            request_json.insert("id".to_string(), id.clone());
-                        }
-                        if let Some(method) = &request.method {
-                            request_json.insert(
-                                "method".to_string(),
-                                serde_json::Value::String(method.clone()),
-                            );
-                        }
-                        if let Some(params) = &request.params {
-                            request_json.insert("params".to_string(), params.clone());
-                        }
-
-                        if let Ok(json_str) =
-                            serde_json::to_string_pretty(&serde_json::Value::Object(request_json))
-                        {
-                            line_count += json_str.lines().count();
-                        }
-                    }
-                }
-            } else {
-                line_count += 1;
-            }
-
-            // Response section
-            line_count += 1; // Blank line before section
-            line_count += 1; // Section header
-            line_count += 1; // Tabs line
-
-            if let Some(response) = &exchange.response {
-                match self.response_tab {
-                    0 => match &response.headers {
-                        Some(headers) if !headers.is_empty() => {
-                            line_count += headers.len();
-                        }
-                        Some(_) | None => {
-                            line_count += 1;
-                        }
-                    },
-                    _ => {
-                        let mut response_json = serde_json::Map::new();
-                        response_json.insert(
-                            "jsonrpc".to_string(),
-                            serde_json::Value::String("2.0".to_string()),
-                        );
-                        if let Some(id) = &response.id {
-                            response_json.insert("id".to_string(), id.clone());
-                        }
-                        if let Some(result) = &response.result {
-                            response_json.insert("result".to_string(), result.clone());
-                        }
-                        if let Some(error) = &response.error {
-                            response_json.insert("error".to_string(), error.clone());
-                        }
-
-                        if let Ok(json_str) =
-                            serde_json::to_string_pretty(&serde_json::Value::Object(response_json))
-                        {
-                            line_count += json_str.lines().count();
-                        }
-                    }
-                }
-            } else {
-                line_count += 1;
-            }
-
-            line_count
-        } else {
-            1
         }
     }
 

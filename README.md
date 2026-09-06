@@ -80,12 +80,13 @@ jsonrpc-debugger --skill
 Discover the live API:
 
 ```bash
-curl http://127.0.0.1:8081 \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"rpc.discover"}'
+jsonrpc-debugger call --transport=http http://127.0.0.1:8081 \
+  '{"jsonrpc":"2.0","id":1,"method":"rpc.discover","params":{}}'
 ```
 
 The complete API lives in [`openrpc.json`](openrpc.json).
+
+`debugger.getUpdates` returns an initial snapshot, then only new exchanges and responses that complete older requests. Pass the previous session ID, `nextIndex`, and outstanding `pendingIndices` on subsequent calls. Attach uses this method, so update the wrapper and attached TUI together.
 
 ## Develop
 
@@ -94,6 +95,14 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- --target http://localhost:8090
 ```
+
+Measure queued response pairing and large-payload rendering without adding benchmark dependencies:
+
+```bash
+cargo run --release --example performance --offline
+```
+
+Rust library callers read captured history through `App::exchanges()`. Use `add_message`, `append_exchanges`, or `activate_session` to change it while keeping request correlation consistent.
 
 ## License
 
